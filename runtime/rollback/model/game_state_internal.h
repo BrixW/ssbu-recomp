@@ -13,6 +13,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "../rollback.h"                  /* RbPad and the rest of the netcode contract */
 
 /* ---- what r1_state.c provides ------------------------------------------------------------------------------------------ */
 #define PG 4096                              /* the page size every table here is counted in */
@@ -69,5 +70,400 @@ void ls_range_event(uint64_t a, uint64_t n, int what);      /* memory changed wi
 void ls_report(void);                        /* end-of-run report of the learned set and the pool */
 uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeeping region, so it is saved with the rest; *n is its size */
 void ppool_init(void);                       /* sets up the presentation pool (once, from r1_init) */
+
+
+/* ---- includes the pieces need */
+#include <tlhelp32.h>
+
+/* ---- macros that used to sit in the middle of r1_state.c / r1_ring.c / rb_rollback.c */
+#define MAXR 8192
+#define FIB_BLOCK 0x500
+#define R1_CTR(w, a, b) do { if (g_r1_ctr < 0) g_r1_ctr = getenv("SSBU_UNWIND_TRACE") != NULL; if (g_r1_ctr) nnunwind_trace_note(w, (uint64_t)(a), (uint64_t)(b)); } while (0)
+#define AR_SIZE (32ull << 30)
+#define ARH ((ArHdr *)g_ar)
+#define RA0 (c->x[0])
+#define RA1 (c->x[1])
+#define RA2 (c->x[2])
+#define RG_MAXSLOT 16
+#define RG_FLAT 0u
+#define RG_DECOM 1u
+#define RG_POOL_MAX (1u << 20)                 /* 4 GB of 4 KB buffers (reserved, committed as used) */
+#define RG_ENT_RES (64ull << 20)               /* per slot: room for 8 M (id, old) pairs */
+#define RG_FP_RES (256ull << 20)               /* per slot: fibers' host stacks */
+#define RG_CB_RES (64ull << 20)                /* per slot: command-buffer recordings */
+#define RG_CBS_SIZE 144                        /* nvn_gl.c CbSave: CmdBuf *cb; CmdBuf copy (120: data, len, cap, ...); data; cap */
+#define RG_NST 65536
+#define RG_NL 4096
+#define RGPG_N 16384
+#define RGL_N ((int)(sizeof g_rgl_h / sizeof g_rgl_h[0]))
+#define RGP_N 4096
+#define RGP_NX 4
+#define RGS_SN 65536
+#define RGV_MAX (8u << 20)
+#define RGVD_MAX 8192
+#define RGV_NB 4096
+#define RBG_NT 200000
+
+/* ---- types shared by the pieces */
+typedef struct { uint8_t *a; uint8_t d[PG]; } EPage;
+
+typedef struct { uint64_t b; int lx, ly, rx, ry; } PadRec;
+
+typedef struct { uint64_t key; int sig, cnt; uint64_t len; } OsRec;
+
+typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; } Th;
+
+typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
+
+typedef struct { uint8_t *a; size_t n; uint8_t *learn; } Learn;
+
+typedef struct { uint8_t *a; size_t n; uint8_t *b; } Extra;
+
+typedef struct { LONG st; void *teb; void *pid, *tid; ULONG_PTR mask; LONG pri, bpri; } HsTbi;
+
+typedef struct { uint8_t *d; const uint8_t *s; } CopyJob;
+
+typedef struct { uint64_t rip, caller; char mod[48]; const char *thr; uint64_t gfn; int n; } Site;
+
+typedef struct {
+    long long frame;
+    uint32_t *ent; size_t nent, entcom;
+    Ctx ctx;
+    Th th[256]; int nth, ninfo;
+    Fib *fib; int nfib; uint8_t *fpool; size_t fpool_used, fpool_com;
+    int ncbs; uint8_t *cbs; uint8_t *cbd; size_t cbd_used, cbd_com;
+    size_t pages, xpages;
+} RgSlot;
+
+typedef struct { uint64_t blk; long long n[3]; } RgPageCount;
+
+typedef struct { uint64_t cfa; uint64_t jb; } RgCatch;
+
+typedef struct { uint64_t a; int grp; uint64_t ret; ImportFn orig; long long n[2], sk; double ms[2]; } RgsLite;
+
+typedef struct { uint64_t key; long long n[2]; double incl[2], excl[2]; int dmin; } RgpE;
+
+typedef struct { uint64_t fn; long long self[2][6], incl[2][6]; } RgsS;
+
+typedef struct { uint64_t bump, committed; uint64_t head[48]; uint64_t allocs, frees; } ArHdr;
+
+
+/* ---- variables one piece defines and another uses (the piece that defines each is named) */
+extern long long g_r1_fls_stale;    /* model/threads.c */
+extern DWORD g_r1_fls_idx;    /* model/threads.c */
+extern void (*g_r1_fiber_born)(void *);    /* model/tracking_experiments/write_marks.c */
+extern int g_r1_keep_fibers;    /* model/game_state.c */
+extern int g_cycle;    /* model/game_state.c */
+extern int g_phase;    /* model/game_state.c */
+extern long long g_ff;    /* model/game_state.c */
+extern uint8_t * g_heap_base[8];    /* model/game_state.c */
+extern int g_nheap;    /* model/game_state.c */
+extern Ctx g_ctx_save;    /* model/game_state.c */
+extern int g_nborn;    /* model/game_state.c */
+extern char g_born[2048];    /* model/game_state.c */
+extern uint64_t g_catch_addr;    /* model/game_state.c */
+extern int g_fcheck;    /* model/game_state.c */
+extern int g_fast;    /* model/game_state.c */
+extern int g_learn;    /* model/game_state.c */
+extern size_t g_ne;    /* model/game_state.c */
+extern size_t g_ecap;    /* model/game_state.c */
+extern EPage *g_e;    /* model/game_state.c */
+extern uint8_t *g_ar;    /* model/memory_map.c */
+extern int g_rs_drop;    /* model/memory_map.c */
+extern double g_save_avail_mb;    /* model/memory_map.c */
+extern double g_save_need_mb;    /* model/memory_map.c */
+extern OsRec *g_os;    /* model/threads.c */
+extern int g_nos;    /* model/threads.c */
+extern long long g_th_audio_other;    /* model/threads.c */
+extern int g_nth;    /* model/threads.c */
+extern int g_ninfo;    /* model/threads.c */
+extern int g_th_mismatch;    /* model/threads.c */
+extern int g_park_ms;    /* model/threads.c */
+extern Th g_th[256];    /* model/threads.c */
+extern int g_th_running;    /* model/threads.c */
+extern int g_fib_new;    /* model/threads.c */
+extern int g_nfib;    /* model/threads.c */
+extern int g_fib_diff;    /* model/threads.c */
+extern int g_fib_running;    /* model/threads.c */
+extern int g_fib_bad;    /* model/threads.c */
+extern int g_fib_same;    /* model/threads.c */
+extern Fib g_fib[1024];    /* model/threads.c */
+extern size_t g_fpool_cap;    /* model/threads.c */
+extern size_t g_fpool_used;    /* model/threads.c */
+extern uint8_t *g_fpool;    /* model/threads.c */
+extern size_t g_fib_bytes;    /* model/threads.c */
+extern long long g_fib_live_seen;    /* model/threads.c */
+extern long long g_fib_live_skip;    /* model/threads.c */
+extern int g_nlive;    /* model/threads.c */
+extern uint64_t g_live_rsp[512];    /* model/threads.c */
+extern long long g_live_asked;    /* model/threads.c */
+extern int g_live_cache;    /* model/threads.c */
+extern long long g_live_cached;    /* model/threads.c */
+extern long long g_fib_teb_running;    /* model/threads.c */
+extern int g_r1_ctr;    /* model/threads.c */
+extern int g_busy_log;    /* model/threads.c */
+extern int g_wait_idle;    /* model/threads.c */
+extern int g_mark;    /* model/full_save.c */
+extern int g_ra;    /* model/full_save.c */
+extern int g_save_failed;    /* model/full_save.c */
+extern size_t g_ra_cb_bytes;    /* model/full_save.c */
+extern size_t g_learn_pages;    /* model/full_save.c */
+extern int g_nl;    /* model/full_save.c */
+extern Learn g_l[8192];    /* model/full_save.c */
+extern size_t g_async_cap;    /* model/tracking_experiments/fast_save.c */
+extern uint8_t **g_async;    /* model/tracking_experiments/fast_save.c */
+extern size_t g_nfp;    /* model/tracking_experiments/fast_save.c */
+extern int g_prot;    /* model/tracking_experiments/write_marks.c */
+extern int g_mcheck;    /* model/tracking_experiments/write_marks.c */
+extern int g_prot_on;    /* model/tracking_experiments/write_marks.c */
+extern Ctx g_mctx;    /* model/tracking_experiments/write_marks.c */
+extern uint8_t *g_sh1;    /* model/tracking_experiments/write_marks.c */
+extern uint8_t *g_sh2c;    /* model/tracking_experiments/write_marks.c */
+extern uint8_t *g_sh2;    /* model/tracking_experiments/write_marks.c */
+extern uint8_t *g_sh1c;    /* model/tracking_experiments/write_marks.c */
+extern size_t g_xbytes;    /* model/tracking_experiments/write_marks.c */
+extern Extra g_x[8192];    /* model/tracking_experiments/write_marks.c */
+extern int g_nx;    /* model/tracking_experiments/write_marks.c */
+extern size_t g_pg_r[4096];    /* model/tracking_experiments/write_marks.c */
+extern size_t g_pg_s[4096];    /* model/tracking_experiments/write_marks.c */
+extern double g_ms_s[4096];    /* model/tracking_experiments/write_marks.c */
+extern int g_nmr;    /* model/tracking_experiments/write_marks.c */
+extern int g_nms;    /* model/tracking_experiments/write_marks.c */
+extern double g_ms_scan[4096];    /* model/tracking_experiments/write_marks.c */
+extern double g_ms_r[4096];    /* model/tracking_experiments/write_marks.c */
+extern long long g_miss_remarked;    /* model/tracking_experiments/write_marks.c */
+extern int g_miss_cycles;    /* model/tracking_experiments/write_marks.c */
+extern long long g_miss_total;    /* model/tracking_experiments/write_marks.c */
+extern long long g_hs_pages;    /* model/tracking_experiments/write_marks.c */
+extern long long g_hs_ranges;    /* model/tracking_experiments/write_marks.c */
+extern long long g_hs_fibers_later;    /* model/tracking_experiments/write_marks.c */
+extern uint64_t *g_bf_hi;    /* model/tracking_experiments/write_marks.c */
+extern uint64_t *g_bf_lo;    /* model/tracking_experiments/write_marks.c */
+extern SRWLOCK g_bf_lock;    /* model/tracking_experiments/write_marks.c */
+extern size_t g_nbf;    /* model/tracking_experiments/write_marks.c */
+extern size_t g_blk2_n;    /* model/tracking_experiments/write_marks.c */
+extern size_t g_blk1_n;    /* model/tracking_experiments/write_marks.c */
+extern volatile LONG g_blk1_dirty;    /* model/tracking_experiments/write_marks.c */
+extern uint32_t *g_blk1_list;    /* model/tracking_experiments/write_marks.c */
+extern uint32_t *g_blk2_list;    /* model/tracking_experiments/write_marks.c */
+extern int g_full_sweep;    /* model/tracking_experiments/write_marks.c */
+extern uint8_t *g_blk1;    /* model/tracking_experiments/write_marks.c */
+extern int g_cp_cond;    /* model/tracking_experiments/write_marks.c */
+extern volatile long long g_cp_wrote[9];    /* model/tracking_experiments/write_marks.c */
+extern int g_cp_defer;    /* model/tracking_experiments/write_marks.c */
+extern int g_ra_after_quiet;    /* model/runahead.c */
+extern int g_ra_ready;    /* model/runahead.c */
+extern int g_ra_phase;    /* model/runahead.c */
+extern int g_ra_off;    /* model/runahead.c */
+extern double g_rap[3][4];    /* model/runahead.c */
+extern long long g_rapn[3];    /* model/runahead.c */
+extern double g_t_poll;    /* model/runahead.c */
+extern volatile int g_ra_wd_pause;    /* model/runahead.c */
+extern volatile int g_ra_wd_base;    /* model/runahead.c */
+extern const char *g_ra_busy;    /* model/runahead.c */
+extern double g_ra_t_mark;    /* model/runahead.c */
+extern PadRec g_ra_pad;    /* model/runahead.c */
+extern int g_hp_on;    /* model/runahead.c */
+extern int g_ra_busy_fibers;    /* model/runahead.c */
+extern volatile LONG g_ra_wh_on;    /* model/runahead.c */
+extern long long g_ra_wd_fired;    /* model/runahead.c */
+extern int g_rg_nomem;    /* model/snapshot_ring.c */
+extern int g_rg_count;    /* model/snapshot_ring.c */
+extern int g_rg_ready;    /* model/snapshot_ring.c */
+extern uint32_t *g_rg_idx;    /* model/snapshot_ring.c */
+extern size_t g_rg_n1;    /* model/snapshot_ring.c */
+extern size_t g_rg_nx;    /* model/snapshot_ring.c */
+extern size_t g_rg_n2;    /* model/snapshot_ring.c */
+extern uint32_t g_rg_bump;    /* model/snapshot_ring.c */
+extern uint32_t g_rg_nfree;    /* model/snapshot_ring.c */
+extern int g_rg_keep;    /* model/snapshot_ring.c */
+extern int g_rg_keep_on;    /* model/snapshot_ring.c */
+extern long long g_rg_kept_same;    /* model/snapshot_ring.c */
+extern long long g_rg_kept_n;    /* model/snapshot_ring.c */
+extern long long g_rg_loads;    /* model/snapshot_ring.c */
+extern long long g_rg_overflow;    /* model/snapshot_ring.c */
+extern long long g_rg_cap_fail;    /* model/snapshot_ring.c */
+extern long long g_rg_caps;    /* model/snapshot_ring.c */
+extern double g_rg_last[2];    /* model/snapshot_ring.c */
+extern long long g_rgv_target;    /* model/snapshot_ring.c */
+extern int g_rgs_on;    /* model/snapshot_ring.c */
+extern size_t *g_rgc_pg;    /* model/snapshot_ring.c */
+extern int g_rgc_n;    /* model/snapshot_ring.c */
+extern double * g_rgc[5];    /* model/snapshot_ring.c */
+extern size_t *g_rgc_xp;    /* model/snapshot_ring.c */
+extern double g_rgl[16][4096][3];    /* model/snapshot_ring.c */
+extern int g_rgl_n[16];    /* model/snapshot_ring.c */
+extern size_t g_rgl_pg[16][4096];    /* model/snapshot_ring.c */
+extern long long g_rg_skip_full;    /* model/snapshot_ring.c */
+extern long long g_rg_freed_slots;    /* model/snapshot_ring.c */
+extern int g_rg_poolfix;    /* model/snapshot_ring.c */
+extern long long g_rg_need;    /* model/snapshot_ring.c */
+extern int g_rg_short;    /* model/snapshot_ring.c */
+extern long long g_rg_short_n;    /* model/snapshot_ring.c */
+extern long long g_rg_tp_refused;    /* model/snapshot_ring.c */
+extern int g_rgs_left;    /* model/snapshot_ring.c */
+extern long long g_rgpg_caps[3];    /* model/snapshot_ring.c */
+extern int g_rgpg_on;    /* model/snapshot_ring.c */
+extern RgPageCount g_rgpg[16384];    /* model/snapshot_ring.c */
+extern long long g_rgc_dropped;    /* model/snapshot_ring.c */
+extern long long g_rgc_loads_changed;    /* model/snapshot_ring.c */
+extern long long g_rgc_kept;    /* model/snapshot_ring.c */
+extern long long g_rgc_dead;    /* model/snapshot_ring.c */
+extern long long g_rg_refused;    /* model/snapshot_ring.c */
+extern long long g_rg_ldpg;    /* model/snapshot_ring.c */
+extern int g_rgs_lastlite;    /* debug/ring_simulation.c */
+extern int g_rgs_warm;    /* debug/ring_simulation.c */
+extern int g_rgs_skip;    /* debug/ring_simulation.c */
+extern int g_rgs_k;    /* debug/ring_simulation.c */
+extern int g_rgs_n;    /* debug/ring_simulation.c */
+extern long long g_rgs_next;    /* debug/ring_simulation.c */
+extern int g_rgs_lite;    /* debug/ring_simulation.c */
+extern volatile int g_rgp_seg;    /* debug/ring_simulation.c */
+
+/* ---- functions one piece defines and another calls */
+void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));    /* model/game_state.c */
+void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stack_size, void *fiber));    /* model/threads.c */
+void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);    /* model/threads.c */
+void os_r1_fiber_get(uint64_t key, uint64_t v[6]);    /* model/threads.c */
+void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);    /* model/threads.c */
+DWORD os_r1_fiber_tid(uint64_t key);    /* model/threads.c */
+void *os_r1_fiber_fls(uint64_t key);    /* model/threads.c */
+void os_r1_fiber_put_fls(uint64_t key, void *fiber, void *fls);    /* model/threads.c */
+void *nnunwind_catch_table(size_t *bytes);    /* model/threads.c */
+void *fighter_host_fls_slot(void);    /* model/threads.c */
+void nvn_gl_r1_cb_area(void **cbs, void **ncbs, void **all);    /* model/threads.c */
+void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb);    /* model/threads.c */
+size_t nvn_r1_cb_save(void);    /* model/full_save.c */
+void nvn_r1_cb_restore(void);    /* model/full_save.c */
+uint64_t hook_address(const char *name);    /* model/runahead.c */
+int hook_install_name(const char *name, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);    /* model/runahead.c */
+int rbn_on(void);    /* controller/rollback_controller.c */
+void rbn_init(void);    /* controller/rollback_controller.c */
+void rbn_start(long long f0);    /* controller/rollback_controller.c */
+int rbn_started(void);    /* controller/rollback_controller.c */
+int rbn_local_player(void);    /* controller/rollback_controller.c */
+int rbn_ahead(void);    /* controller/rollback_controller.c */
+void rbn_local_pad(long long f, RbPad now);    /* controller/rollback_controller.c */
+RbPad rbn_pad(int player, long long f);    /* controller/rollback_controller.c */
+void rbn_drain(long long cur);    /* controller/rollback_controller.c */
+int rbn_take_mismatch(void);    /* controller/rollback_controller.c */
+long long rbn_confirmed(void);    /* controller/rollback_controller.c */
+int rbn_peer_gone(void);    /* controller/rollback_controller.c */
+void rbn_pass_hash(long long f);    /* controller/rollback_controller.c */
+void rbn_finalize(long long cur);    /* controller/rollback_controller.c */
+double rbn_pace_extra(long long f);    /* controller/rollback_controller.c */
+void rbn_report(FILE *o, long long frames);    /* controller/rollback_controller.c */
+int rbn_delay(void);    /* controller/rollback_controller.c */
+int rbn_rtt_ms(void);    /* controller/rollback_controller.c */
+double rbn_offset_ms(void);    /* controller/rollback_controller.c */
+void rbn_resend(void);    /* controller/rollback_controller.c */
+void rbn_status(char *out, size_t n);    /* controller/rollback_controller.c */
+void rbn_hello(void);    /* controller/rollback_controller.c */
+int rbn_peer_started(void);    /* controller/rollback_controller.c */
+void rbn_choose_delay(void);    /* controller/rollback_controller.c */
+int rbn_match_cancelled(void);    /* controller/rollback_controller.c */
+void rbn_match_reset(void);    /* controller/rollback_controller.c */
+int rbn_match_number(void);    /* controller/rollback_controller.c */
+void rbn_set_lockstep(int on);    /* controller/rollback_controller.c */
+int rbn_loop(void);    /* controller/rollback_controller.c */
+void input_mark(const char *what);    /* controller/rollback_controller.c */
+void rbn_put_mismatch(int m);    /* controller/rollback_controller.c */
+void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb);    /* model/snapshot_ring.c */
+void nnunwind_catch_free(unsigned i);    /* model/snapshot_ring.c */
+uint64_t guest_function_of(uint64_t rip);    /* debug/ring_simulation.c */
+int ra_wanted(void);    /* model/game_state.c */
+int r1_on(void);    /* model/game_state.c */
+int rw(DWORD p);    /* model/memory_map.c */
+void *rs_alloc(size_t n);    /* model/memory_map.c */
+void rs_free(void *p);    /* model/memory_map.c */
+int rb_test_nomem(void);    /* model/memory_map.c */
+void collect(Ctx *c);    /* model/memory_map.c */
+void os_cb(uint64_t key, int sig, int cnt, uint64_t len, uint64_t thread, uint64_t stack, uint64_t size);    /* model/threads.c */
+int cmp_os(const void *x, const void *y);    /* model/threads.c */
+void os_compare(const char *when);    /* model/threads.c */
+int waiting_import(const char *s);    /* model/threads.c */
+void park(int restore_mode);    /* model/threads.c */
+void slow_report(const char *when);    /* model/threads.c */
+void unpark(void);    /* model/threads.c */
+void restore_thread_regs(void);    /* model/threads.c */
+void park_report(const char *when);    /* model/threads.c */
+uint64_t map_sym(const char *want);    /* model/threads.c */
+void fls_index_find(void);    /* model/threads.c */
+int rest_stack(uint64_t a);    /* model/threads.c */
+void fibers_restore_all(void);    /* model/threads.c */
+int fibers_idle(void);    /* model/threads.c */
+void park_quiet(int restore_mode);    /* model/threads.c */
+void fibers_save(void);    /* model/threads.c */
+void fibers_restore(void);    /* model/threads.c */
+void fibers_report(void);    /* model/threads.c */
+void save(Ctx *c);    /* model/full_save.c */
+const char *where(uint8_t *a);    /* model/full_save.c */
+void stop_born_threads(void);    /* model/full_save.c */
+void restore(Ctx *c);    /* model/full_save.c */
+void verify(void);    /* model/full_save.c */
+void release(void);    /* model/full_save.c */
+void async_add(uint8_t *a);    /* model/tracking_experiments/fast_save.c */
+void async_learn(void);    /* model/tracking_experiments/fast_save.c */
+void fast_build(void);    /* model/tracking_experiments/fast_save.c */
+void fast_save(Ctx *c);    /* model/tracking_experiments/fast_save.c */
+void fast_restore(Ctx *c);    /* model/tracking_experiments/fast_save.c */
+int cmp_d(const void *a, const void *b);    /* model/tracking_experiments/fast_save.c */
+void fast_report(void);    /* model/tracking_experiments/fast_save.c */
+void fast_check(void);    /* model/tracking_experiments/fast_save.c */
+int mark_bind(void);    /* model/tracking_experiments/write_marks.c */
+uint8_t *in_shadow(uint8_t *a, uint8_t **cmap, size_t *pi);    /* model/tracking_experiments/write_marks.c */
+int sh_commit(uint8_t *sh, uint8_t *cmap, size_t pi);    /* model/tracking_experiments/write_marks.c */
+void r1_host_stack_note(uint64_t lo, uint64_t hi);    /* model/tracking_experiments/write_marks.c */
+void hs_exclude_all(void);    /* model/tracking_experiments/write_marks.c */
+int mark_setup(void);    /* model/tracking_experiments/write_marks.c */
+void blk1_add(size_t p0, size_t p1);    /* model/tracking_experiments/write_marks.c */
+void blk1_rebuild(void);    /* model/tracking_experiments/write_marks.c */
+void blk1_init(void);    /* model/tracking_experiments/write_marks.c */
+void cp_add_range(uint8_t *d, const uint8_t *s, size_t n);    /* model/tracking_experiments/write_marks.c */
+void cp_init(void);    /* model/tracking_experiments/write_marks.c */
+size_t mark_sweep(int dir);    /* model/tracking_experiments/write_marks.c */
+void mark_save(Ctx *c);    /* model/tracking_experiments/write_marks.c */
+void mark_restore(Ctx *c);    /* model/tracking_experiments/write_marks.c */
+int win_index(uint8_t *a, uint8_t **map, size_t *pi);    /* model/tracking_experiments/write_protection.c */
+LONG CALLBACK prot_veh(EXCEPTION_POINTERS *e);    /* model/tracking_experiments/write_protection.c */
+void prot_all(int on);    /* model/tracking_experiments/write_protection.c */
+void prot_open(uint64_t a, uint64_t n);    /* model/tracking_experiments/write_protection.c */
+void prot_report(void);    /* model/tracking_experiments/write_protection.c */
+void mark_report(void);    /* model/tracking_experiments/write_protection.c */
+LONG CALLBACK r1_veh(EXCEPTION_POINTERS *e);    /* model/tracking_experiments/write_protection.c */
+const char *g_ra_busy_first_save(void);    /* model/runahead.c */
+int ra_fight_on(void);    /* model/runahead.c */
+void r1_hold_prof_report(void);    /* model/runahead.c */
+void ra_hold_restore(void);    /* model/runahead.c */
+int ra_fibers_quiet(void);    /* model/runahead.c */
+int ra_hold_quiet(double limit);    /* model/runahead.c */
+void ra_frame_end(double te);    /* model/runahead.c */
+void ra_init(void);    /* model/runahead.c */
+int is_nosim(uint8_t *a);    /* model/guest_heap.c */
+int rbg_noring_now(void);    /* controller/rollback_controller.c */
+int rbg_on(void);    /* controller/rollback_controller.c */
+void rbg_step(Ctx *c);    /* controller/rollback_controller.c */
+void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry);    /* controller/rollback_controller.c */
+void rbg_fight_off(void);    /* controller/rollback_controller.c */
+void rbg_report(void);    /* controller/rollback_controller.c */
+RgSlot *rg_slot(int i);    /* model/snapshot_ring.c */
+void r1_ring_let_go(void);    /* model/snapshot_ring.c */
+int r1_ring_hold(void);    /* model/snapshot_ring.c */
+long long r1_ring_oldest(void);    /* model/snapshot_ring.c */
+void r1_ring_release(void);    /* model/snapshot_ring.c */
+void rg_meta_prof_report(void);    /* model/snapshot_ring.c */
+int r1_ring_capture(long long frame, Ctx *c);    /* model/snapshot_ring.c */
+int r1_ring_rebase(long long frame, Ctx *c);    /* model/snapshot_ring.c */
+int r1_ring_load(long long frame, Ctx *c);    /* model/snapshot_ring.c */
+ULONG64 rgs_cyc_now(void);    /* debug/ring_simulation.c */
+void rgs_step(Ctx *c);    /* debug/ring_simulation.c */
+void rgp_wait_note(uint64_t lr, double dt);    /* debug/ring_simulation.c */
+void rgs_lite_init(void);    /* debug/ring_simulation.c */
+void rgv_before(int si, long long target);    /* debug/ring_simulation.c */
+void rgv_after(void);    /* debug/ring_simulation.c */
+int rgs_skip_now(void);    /* debug/ring_simulation.c */
+int rgs_poll(void);    /* debug/ring_simulation.c */
+void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry);    /* debug/ring_simulation.c */
+void rgs_report(void);    /* debug/ring_simulation.c */
 
 #endif

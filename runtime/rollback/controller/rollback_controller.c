@@ -13,6 +13,7 @@
  *    wait), and for the other player when it is more than SSBU_RB_NET_AHEAD frames behind.
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
+#include "../model/game_state_internal.h"
 #include "../rollback.h"
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
@@ -27,8 +28,8 @@ void rbn_set_lockstep(int on); int rbn_loop(void);      /* (hs13) */
  * its frame has arrived (delay-based; the input delay is chosen for that: rb_net.c lockstep), so no frame ever runs on a
  * guess and the two games stay identical; the other game may still roll back. SSBU_RB_NET_TEST_NOMEM forces it (test). */
 static int g_rbg_noring; static long long g_rbg_noring_matches;
-static int rbg_noring_now(void) { return g_rbg_noring; }
-int r1_ring_rebase(long long frame, Ctx *c);            /* r1_ring.c (hs12) */
+int rbg_noring_now(void) { return g_rbg_noring; }
+            /* r1_ring.c (hs12) */
 void input_mark(const char *what);                      /* nnhid.c: the input sequence can wait for it (@match1on, @match1over, ...) */
 /* (hs12) matches in one session: 0 = between matches, 1 = an online match runs (its base state made), 2 = a match that was
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
@@ -40,11 +41,11 @@ static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
  * and the passes before it get no pad (as frames 1..delay on the other game). SSBU_RB_NET_BASEFIX=0: the old way (test). */
 static long long g_rbg_ff_first = -1; static int g_rbg_basefix = -1;
 static int g_rbg = -1;
-static int rbg_on(void) { if (g_rbg < 0) g_rbg = rbn_on() > 0; return g_rbg; }
+int rbg_on(void) { if (g_rbg < 0) g_rbg = rbn_on() > 0; return g_rbg; }
 static long long g_rbg_rb, g_rbg_k[RG_MAXSLOT + 2], g_rbg_rerun, g_rbg_miss, g_rbg_stalls, g_rbg_capfail, g_rbg_capskip, g_rbg_lastlocal, g_rbg_real, g_rbg_gone;
 static double g_rbg_stall_ms, g_rbg_load_ms, g_rbg_tick0, g_rbg_next, g_rbg_last_go;
 static volatile LONG g_rbg_last_k, g_rbg_max_k;
-#define RBG_NT 200000
+
 static float *g_rbg_work, *g_rbg_gap, *g_rbg_wcyc; static ULONG64 g_rbg_cyc_go; static unsigned char *g_rbg_wk; static int g_rbg_nw, g_rbg_ng, g_rbg_pace = -1, g_rbg_tick_k;
 static HANDLE g_rbg_timer;
 /* (hs10) the task workers at the safe point H2: r1_state.c holds them from the kick H1 to H2, so at H2 the kick's jobs are
@@ -305,7 +306,7 @@ static void rbt_body(void) {
     r1_wrote((uint64_t)(uintptr_t)probe & ~0xfffull, 0x1000); g_rbt_marks++;
     rbg_step_body(g_rbt_c);
 }
-static void rbg_step(Ctx *c) {
+void rbg_step(Ctx *c) {
     if (g_rbt < 0) {
         const char *e = getenv("SSBU_RB_NET_TEST_STK"); g_rbt = e && atoi(e) > 0;
         for (uint64_t a = 0x7180000000ull; g_rbt && !g_rbt_stk && a < 0x7300000000ull; a += 0x10000000ull)
@@ -329,7 +330,7 @@ static void rbg_step(Ctx *c) {
     tib->StackBase = ob; tib->StackLimit = ol;
 }
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
-static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
+void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_rbg_in_match == 2 && (id == 0 || id == 1)) {  /* (hs12) a match that was not agreed: this PC's player 1 pauses, then holds L + R + A (the game's own way out of a match), again every 4 s */
         /* (debug_mode.c makes it Final Destination with one stock) player 1 walks off the left edge for 20 s, which ends the
          * match the game's own way (results, then the stage select and the character select: run hw2 showed that pause +
@@ -366,10 +367,10 @@ static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     RbPad p = rbn_pad(id, f);
     *b = p.buttons; *lx = p.lx; *ly = p.ly; *rx = p.rx; *ry = p.ry;
 }
-static void rbg_report(void);
+
 /* (hs12) r1_ring.c rgs_step, every safe point while no fight is on: the end of a match (once): its report, the ring
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
-static void rbg_fight_off(void) {
+void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
@@ -395,7 +396,7 @@ static void rbg_dist(const char *what, const float *v, int n, const unsigned cha
         LOG("r1: RB NET TIMING %s: %d, mean %.2f median %.2f p90 %.2f p99 %.2f max %.2f ms; over 16.67 ms: %.0f (%.2f%%)\n", what, m, s / m, w[m / 2], w[m * 9 / 10], w[m * 99 / 100], w[m - 1], over, 100.0 * over / m); }
     free(w);
 }
-static void rbg_report(void) {
+void rbg_report(void) {
     if (g_rbg <= 0 || (!g_rg_ready && !g_rbg_noring) || !g_rbg_real) return;
     if (g_rbg_noring) LOG("r1: RB NET report: this match ran WITHOUT rollback (not enough memory for the ring: %s); matches without the ring so far %lld\n", g_rg_nomem == 2 ? "broken for the session" : "base not made", g_rbg_noring_matches);
     LOG("r1: RB NET report: %lld real frames, %lld rollbacks, %lld frames run again (k: 1 %lld, 2 %lld, 3 %lld, 4 %lld, 5 %lld, 6 %lld, 7 %lld, more %lld); rollbacks impossible (state not in the ring) %lld\n",

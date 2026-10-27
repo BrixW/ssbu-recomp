@@ -35,7 +35,7 @@ PLAT_FLAGS += MACOS_MIN
 PLAT_FLAGS += ['-mcx16'] if TARGET_LINUX else []
 CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'nnpad_gca.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
-                'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'rollback/model/game_state.c', 'rollback/model/page_tracker_learned.c',
+                'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'rollback/model/game_state.c', 'rollback/model/page_tracker_learned.c', 'rollback/model/memory_map.c', 'rollback/model/threads.c', 'rollback/model/full_save.c', 'rollback/model/tracking_experiments/fast_save.c', 'rollback/model/tracking_experiments/write_marks.c', 'rollback/model/tracking_experiments/write_protection.c', 'rollback/model/runahead.c', 'rollback/model/guest_heap.c', 'rollback/model/snapshot_ring.c', 'rollback/debug/ring_simulation.c', 'rollback/controller/rollback_controller.c',
                 'loose_host.c', 'osk.c', 'nnldn.c', 'net_relay.c', 'rollback/services/net_session.c', 'rollback/model/input_history.c', 'rollback/services/wire_format.c', 'rollback/services/clock_sync.c']    # the new fighters' file layer (loose_files.c): off unless SSBU_CHARACTERS / SSBU_LOOSE_FILES is set
 # nnldn.c / net_relay.c: online play over the game's Local Wireless (plan/phases/N3_local_wireless_online.md), off unless SSBU_ONLINE
 # (taken only when present: a tree without the online files, e.g. a public one before they are published, still links)
@@ -196,7 +196,7 @@ if TARGET_POSIX:
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
     # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
     # (net_relay.c: Winsock extensions, COM UPnP; net_off.c answers "off", as with SSBU_ONLINE unset)
-    HOST_SOURCES = [n for n in HOST_SOURCES if n not in ('net_relay.c', 'rollback/model/page_tracker_learned.c')] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']      # rb_learned.c: Windows only, like the state save it belongs to (r1_state.c is stubs here)
+    HOST_SOURCES = [n for n in HOST_SOURCES if n not in ('net_relay.c', 'rollback/model/page_tracker_learned.c', 'rollback/controller/rollback_controller.c') and not n.startswith(('rollback/model/', 'rollback/debug/')) or n in ('rollback/model/game_state.c', 'rollback/model/input_history.c')] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']      # rb_learned.c: Windows only, like the state save it belongs to (r1_state.c is stubs here)
     LIBS = pkg('--libs') + ['-lGL', '-lm', '-ldl', '-lpthread']      # libGL: the OpenGL front end is linked (not used)
     if TARGET_MACOS:                                     # OpenGL is a system framework; dl / pthread are in libSystem
         LIBS = pkg('--libs') + ['-framework', 'OpenGL', '-lm']
