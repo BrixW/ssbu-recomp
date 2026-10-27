@@ -57,11 +57,8 @@ extern int g_r1_keep_fibers;
 
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));     /* os_threads.c */
 
-Rng g_r[MAXR];
-int g_nr;
 int g_on = -1, g_n, g_k, g_p, g_c, g_cycle, g_phase;        /* phase 0 idle, 1 first pass, 2 re-run, 3 done */
 long long g_ff, g_target;
-uint8_t *g_heap_base[8]; int g_nheap;
 Ctx g_ctx_save;
 static double g_qpf;
 double now_ms(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / g_qpf; }

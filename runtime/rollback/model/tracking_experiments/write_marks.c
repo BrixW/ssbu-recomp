@@ -135,14 +135,14 @@ static void mark_undo(void) {
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
 int mark_setup(void) {
     size_t big = 0; uint8_t *base = NULL;
-    for (int i = 0; i < g_nheap; i++) {
-        MEMORY_BASIC_INFORMATION m; uint8_t *p = g_heap_base[i];
-        while (VirtualQuery(p, &m, sizeof m) && m.AllocationBase == g_heap_base[i]) p = (uint8_t *)m.BaseAddress + m.RegionSize;
-        if ((size_t)(p - g_heap_base[i]) > big && g_heap_base[i] != g_ar) { big = (size_t)(p - g_heap_base[i]); base = g_heap_base[i]; }
+    for (int i = 0; i < g_memory_map.heap_count; i++) {
+        MEMORY_BASIC_INFORMATION m; uint8_t *p = g_memory_map.heap_base[i];
+        while (VirtualQuery(p, &m, sizeof m) && m.AllocationBase == g_memory_map.heap_base[i]) p = (uint8_t *)m.BaseAddress + m.RegionSize;
+        if ((size_t)(p - g_memory_map.heap_base[i]) > big && g_memory_map.heap_base[i] != g_ar) { big = (size_t)(p - g_memory_map.heap_base[i]); base = g_memory_map.heap_base[i]; }
     }
     g_win1 = base; g_wn1 = big;
     g_mctx = g_ctx_save;                               /* main's registers of this (full) save */
-    for (int i = 0; i < g_nheap; i++) LOG("r1: MARK: reservation >= 16 GB at %p%s\n", (void *)g_heap_base[i], g_heap_base[i] == base ? " (window 1)" : g_heap_base[i] == g_ar ? " (malloc arena)" : " (NOT a window: its pages are extras)");
+    for (int i = 0; i < g_memory_map.heap_count; i++) LOG("r1: MARK: reservation >= 16 GB at %p%s\n", (void *)g_memory_map.heap_base[i], g_memory_map.heap_base[i] == base ? " (window 1)" : g_memory_map.heap_base[i] == g_ar ? " (malloc arena)" : " (NOT a window: its pages are extras)");
     g_sh1 = VirtualAlloc(NULL, g_wn1, MEM_RESERVE, PAGE_NOACCESS); g_sh1c = calloc(g_wn1 >> 12, 1);
     g_dc = calloc(g_wn1 >> 12, 1); g_ns1 = calloc(g_wn1 >> 12, 1); g_ns2 = calloc(WN2 >> 12, 1);
     g_sh2 = VirtualAlloc(NULL, WN2, MEM_RESERVE, PAGE_NOACCESS); g_sh2c = calloc(WN2 >> 12, 1);
@@ -150,8 +150,8 @@ int mark_setup(void) {
     hs_exclude_all();
     g_nx = 0; g_xbytes = 0;
     size_t shb = 0;
-    for (int i = 0; i < g_nr; i++) {                    /* the extras: the runs of pages outside both windows */
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {                    /* the extras: the runs of pages outside both windows */
+        Rng *r = &g_memory_map.ranges[i];
         for (size_t p = 0; p < r->n / PG; p++) {
             uint8_t *cm; size_t pi;
             if (in_shadow(r->a + p * PG, &cm, &pi)) continue;
@@ -167,8 +167,8 @@ int mark_setup(void) {
     }
     {   /* the bytes of the save point into the shadow and the extras; with g_rs_drop the copy of the full save is given back 1 MB at a time behind */
         int cx = 0; size_t xo = 0; long long dropped = 0;
-        for (int i = 0; i < g_nr; i++) {
-            Rng *r = &g_r[i]; size_t np = r->n / PG, d0 = 0;
+        for (int i = 0; i < g_memory_map.range_count; i++) {
+            Rng *r = &g_memory_map.ranges[i]; size_t np = r->n / PG, d0 = 0;
             for (size_t p = 0; p < np; p++) {
                 uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
                 if (sh) {
@@ -233,10 +233,10 @@ void blk1_init(void) {                           /* mark_setup, threads held */
     {   /* window 2 (image + modules, 8 GB): the 64-page blocks of the first save's ranges there (nothing is committed there in a fight) */
         size_t nb2 = (size_t)(WN2 >> 18); uint8_t *b2 = calloc(nb2, 1); size_t k = 0;
         if (!b2) { free(b); return; }
-        for (int i = 0; i < g_nr; i++) {
-            uintptr_t a = (uintptr_t)g_r[i].a;
+        for (int i = 0; i < g_memory_map.range_count; i++) {
+            uintptr_t a = (uintptr_t)g_memory_map.ranges[i].a;
             if (a < WIN2 || a >= WIN2 + WN2) continue;
-            for (size_t q = (size_t)((a - WIN2) >> 18); q <= (size_t)((a + g_r[i].n - 1 - WIN2) >> 18) && q < nb2; q++) b2[q] = 1;
+            for (size_t q = (size_t)((a - WIN2) >> 18); q <= (size_t)((a + g_memory_map.ranges[i].n - 1 - WIN2) >> 18) && q < nb2; q++) b2[q] = 1;
         }
         for (size_t q = 0; q < nb2; q++) k += b2[q];
         g_blk2_list = malloc((k + 1) * sizeof *g_blk2_list); g_blk2_n = 0;
@@ -245,7 +245,7 @@ void blk1_init(void) {                           /* mark_setup, threads held */
         for (size_t q = 0; q < nb2; q++) if (b2[q]) g_blk2_list[g_blk2_n++] = (uint32_t)q;
         free(b2);
     }
-    for (int i = 0; i < g_nr; i++) if (g_r[i].a >= g_win1 && g_r[i].a < g_win1 + g_wn1) blk1_add((size_t)(g_r[i].a - g_win1) >> 12, (size_t)(g_r[i].a + g_r[i].n - g_win1) >> 12);
+    for (int i = 0; i < g_memory_map.range_count; i++) if (g_memory_map.ranges[i].a >= g_win1 && g_memory_map.ranges[i].a < g_win1 + g_wn1) blk1_add((size_t)(g_memory_map.ranges[i].a - g_win1) >> 12, (size_t)(g_memory_map.ranges[i].a + g_memory_map.ranges[i].n - g_win1) >> 12);
 }
 /* Round 5 (cheaper copy, run-ahead only): the pages a sweep finds are copied by the main thread and SSBU_RUNAHEAD_COPY_THREADS
  * helper threads (default 2; 0 = the main thread alone), in equal shares. The extras go the same way (cp_add_range). */
@@ -309,7 +309,7 @@ size_t mark_sweep(int dir) {
 void mark_save(Ctx *c) {
     if (g_mcheck) {                                     /* the full snapshot of the check is taken INSIDE the same hold (round 4) */
         collect(c);
-        for (int i = 0; i < g_nr; i++) g_r[i].s = rs_alloc(g_r[i].n);
+        for (int i = 0; i < g_memory_map.range_count; i++) g_memory_map.ranges[i].s = rs_alloc(g_memory_map.ranges[i].n);
     }
     double t0 = now_ms();
     park(0);
@@ -317,7 +317,7 @@ void mark_save(Ctx *c) {
     if (g_cycle < 6) slow_report("at the save");
     size_t n = mark_sweep(0);
     double t2 = now_ms();
-    if (g_mcheck) for (int i = 0; i < g_nr; i++) memcpy(g_r[i].s, g_r[i].a, g_r[i].n);
+    if (g_mcheck) for (int i = 0; i < g_memory_map.range_count; i++) memcpy(g_memory_map.ranges[i].s, g_memory_map.ranges[i].a, g_memory_map.ranges[i].n);
     for (int i = 0; i < g_nx; i++) memcpy(g_x[i].b, g_x[i].a, g_x[i].n);
     /* (the catch table is one of the extras) */
     fibers_save();
@@ -330,8 +330,8 @@ void mark_save(Ctx *c) {
 }
 static void mark_check(void) {                         /* threads still held */
     size_t miss = 0; int shown = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         MEMORY_BASIC_INFORMATION m;
         if (!VirtualQuery(r->a, &m, sizeof m) || m.State != MEM_COMMIT || (uint8_t *)m.BaseAddress + m.RegionSize < r->a + r->n) continue;
         for (size_t p = 0; p < r->n / PG; p++)

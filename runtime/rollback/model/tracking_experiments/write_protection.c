@@ -44,14 +44,14 @@ LONG CALLBACK prot_veh(EXCEPTION_POINTERS *e) {
 }
 void prot_all(int on) {                          /* the committed RW parts of the saved ranges inside the windows */
     double t0 = now_ms(); size_t n = 0;
-    for (int i = 0; i < g_nr; i++) {
+    for (int i = 0; i < g_memory_map.range_count; i++) {
         uint8_t *map; size_t pi;
-        if (!win_index(g_r[i].a, &map, &pi)) continue;
+        if (!win_index(g_memory_map.ranges[i].a, &map, &pi)) continue;
         MEMORY_BASIC_INFORMATION mq;
-        for (uint8_t *p = g_r[i].a; p < g_r[i].a + g_r[i].n && VirtualQuery(p, &mq, sizeof mq); p = (uint8_t *)mq.BaseAddress + mq.RegionSize) {
+        for (uint8_t *p = g_memory_map.ranges[i].a; p < g_memory_map.ranges[i].a + g_memory_map.ranges[i].n && VirtualQuery(p, &mq, sizeof mq); p = (uint8_t *)mq.BaseAddress + mq.RegionSize) {
             uint8_t *x = (uint8_t *)mq.BaseAddress, *y = x + mq.RegionSize;
-            if (x < g_r[i].a) x = g_r[i].a;
-            if (y > g_r[i].a + g_r[i].n) y = g_r[i].a + g_r[i].n;
+            if (x < g_memory_map.ranges[i].a) x = g_memory_map.ranges[i].a;
+            if (y > g_memory_map.ranges[i].a + g_memory_map.ranges[i].n) y = g_memory_map.ranges[i].a + g_memory_map.ranges[i].n;
             if (mq.State != MEM_COMMIT) continue;
             if (on && (mq.Protect & 0xff) != PAGE_READWRITE) continue;
             DWORD old; VirtualProtect(x, (size_t)(y - x), on ? PAGE_READONLY : PAGE_READWRITE, &old); n += (size_t)(y - x);

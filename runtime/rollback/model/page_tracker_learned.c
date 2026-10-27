@@ -46,7 +46,7 @@
 /* ================================================================ PART 1: THE LEARNED SET
  * What this file needs from r1_state.c and r1_ring.c, and what it gives them, is listed in r1_internal.h:
  *   r1_state.c  PG, WIN2 / WN2, g_win1 / g_wn1 (the windows), g_ns1 / g_ns2 (not-simulation maps), g_dc (decommitted flags),
- *               g_r / g_nr (the ranges r1 saves), pm1 pm2 plo1 pn1 pn2 and r1_m1 r1_m2 r1_lo1 r1_n1 r1_n2 (the mark maps),
+ *               g_memory_map.ranges / g_memory_map.range_count (the ranges r1 saves), pm1 pm2 plo1 pn1 pn2 and r1_m1 r1_m2 r1_lo1 r1_n1 r1_n2 (the mark maps),
  *               cp_add / cp_run / g_ncj / g_cp_cmp (the parallel page compare), g_audio_free, is_async, now_ms, LOG
  *   r1_ring.c   rg_current_slot_pages (pages recorded so far by the capture in progress), rg_src / rg_addr (a page's newest ring
  *               value / its address), rgs_wanted
@@ -177,13 +177,13 @@ static void ls_protect_id_range(size_t a, size_t b) {
     for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_page_address(i), PG, PAGE_READONLY, &old)) { g_ls_page_state[i] = 1; g_ls_prot_pages++; } else g_ls_protfail++; }
 }
 /* At a new base, with the guest threads held: empties the learned set and makes every committed read-write simulation page
- * of both windows read-only (state 1), going by the ranges r1 collected (g_r). Pages marked not-simulation are left
+ * of both windows read-only (state 1), going by the ranges r1 collected (g_memory_map.ranges). Pages marked not-simulation are left
  * alone. Sets g_ls_active. */
 static void ls_protect_all_pages(void) {
     double t0 = now_ms(); long long before = g_ls_prot_pages;
     memset((void *)g_ls_page_state, 0, g_ls_total_pages); g_ls_learned_count = 0; g_ls_list_overflow = 0;
-    for (int i = 0; i < g_nr; i++) {
-        size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        size_t id0, idn; uint8_t *a = g_memory_map.ranges[i].a; size_t np = g_memory_map.ranges[i].n / PG;
         if (!ls_page_id(a, &id0) || !ls_page_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;      /* not (wholly) in one window */
         size_t run = id0;
         for (size_t id = id0; id < id0 + np; id++) if (ls_page_is_not_simulation(id)) { ls_protect_id_range(run, id); run = id + 1; }

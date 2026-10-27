@@ -436,8 +436,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         for (size_t p = 0; p < r->n / PG; p++) {
             uint8_t *a = r->a + p * PG, *cm; size_t pi;
             uint8_t *sh = in_shadow(a, &cm, &pi);

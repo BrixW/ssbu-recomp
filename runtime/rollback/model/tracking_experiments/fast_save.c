@@ -22,13 +22,13 @@ void async_add(uint8_t *a) {
 }
 int is_async(uint8_t *a) { if (g_use_async < 0) g_use_async = getenv("SSBU_R1_FAST_ASYNC") != NULL || g_audio_free; return g_use_async && g_nasync && bsearch(&a, g_async, g_nasync, sizeof *g_async, cmp_ptr) != NULL; }
 void async_learn(void) {               /* main held 30 ms, the others running: what do they write? (ranges collected, buffers allocated) */
-    for (int i = 0; i < g_nr; i++) memcpy(g_r[i].s, g_r[i].a, g_r[i].n);
+    for (int i = 0; i < g_memory_map.range_count; i++) memcpy(g_memory_map.ranges[i].s, g_memory_map.ranges[i].a, g_memory_map.ranges[i].n);
     Sleep(30);
     size_t added = 0;
-    for (int i = 0; i < g_nr; i++)
-        for (size_t p = 0; p < g_r[i].n / PG; p++)
-            if (memcmp(g_r[i].a + p * PG, g_r[i].s + p * PG, PG)) {
-                uint8_t *a = g_r[i].a + p * PG;
+    for (int i = 0; i < g_memory_map.range_count; i++)
+        for (size_t p = 0; p < g_memory_map.ranges[i].n / PG; p++)
+            if (memcmp(g_memory_map.ranges[i].a + p * PG, g_memory_map.ranges[i].s + p * PG, PG)) {
+                uint8_t *a = g_memory_map.ranges[i].a + p * PG;
                 if (is_async(a)) continue;
                 if (g_nasync >= g_async_cap) { g_async_cap = g_async_cap ? g_async_cap * 2 : 4096; g_async = realloc(g_async, g_async_cap * sizeof *g_async); }
                 g_async[g_nasync++] = a; added++;
@@ -94,8 +94,8 @@ void fast_report(void) {
 /* SSBU_R1_FAST_CHECK: after a fast restore, the full snapshot taken at the same save says which pages the set missed */
 static void fast_check(void) {
     size_t miss = 0; int shown = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         MEMORY_BASIC_INFORMATION m;
         if (!VirtualQuery(r->a, &m, sizeof m) || m.State != MEM_COMMIT || (uint8_t *)m.BaseAddress + m.RegionSize < r->a + r->n) continue;
         for (size_t p = 0; p < r->n / PG; p++)

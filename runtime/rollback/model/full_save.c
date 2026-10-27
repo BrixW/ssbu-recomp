@@ -16,7 +16,7 @@ void save(Ctx *c) {
     g_saved_bytes = 0;
     {   /* (hs13) the commit this needs, checked first: the copy below (decommitted again while the shadow takes it when
          * g_rs_drop) + the shadow (as much again) + the ring's maps and pool; 1 GB more is left for the game and the driver */
-        size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n;
+        size_t tot = 0; for (int i = 0; i < g_memory_map.range_count; i++) tot += g_memory_map.ranges[i].n;
         MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
         double need = (g_rs_drop ? 1.0 : 2.0) * tot / 1048576.0 + 512.0, avail = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPageFile / 1048576.0 : 1e12;
         g_save_need_mb = need; g_save_avail_mb = avail;
@@ -26,12 +26,12 @@ void save(Ctx *c) {
         }
     }
     {   int bad = 0;
-        for (int i = 0; i < g_nr && !bad; i++) {
-            Rng *r = &g_r[i];
-            r->s = (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
+        for (int i = 0; i < g_memory_map.range_count && !bad; i++) {
+            Rng *r = &g_memory_map.ranges[i];
+            r->s = (rb_test_nomem() == 2 && i == g_memory_map.range_count / 2) ? NULL : rs_alloc(r->n);
             r->dirty = calloc(r->n / PG, 1);
             r->async = calloc(r->n / PG, 1);
-            if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
+            if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_memory_map.range_count, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
         }
         if (!bad && !g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
         if (!bad && g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { bad = 1; LOG("r1: FULL SAVE NOT MADE: list allocation FAILED\n"); } }   /* no allocation while threads are held */
@@ -42,7 +42,7 @@ void save(Ctx *c) {
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now (busy: %s)\n", g_ra_busy_first_save()); g_save_failed = 1; return; } } else park_quiet(0);
     fibers_save();
     double t1b = now_ms();
-    for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
+    for (int i = 0; i < g_memory_map.range_count; i++) { memcpy(g_memory_map.ranges[i].s, g_memory_map.ranges[i].a, g_memory_map.ranges[i].n); g_saved_bytes += g_memory_map.ranges[i].n; }
     double t2 = now_ms();
     {   /* pages the OTHER threads write while main is held here (audio, vsync counter, loaders, render threads): they are
          * not the simulation's; they are left out of restore and verify. SSBU_R1_PAUSE=<ms> (default 50, 0 = none) */
@@ -50,8 +50,8 @@ void save(Ctx *c) {
         size_t np = 0; int shown = 0;
         if (pause > 0) {
             Sleep((DWORD)pause);
-            for (int i = 0; i < g_nr; i++) {
-                Rng *r = &g_r[i];
+            for (int i = 0; i < g_memory_map.range_count; i++) {
+                Rng *r = &g_memory_map.ranges[i];
                 for (size_t p = 0; p < r->n / PG; p++)
                     if (memcmp(r->a + p * PG, r->s + p * PG, PG)) {
                         r->async[p] = 1; np++; if (g_audio_free) async_add(r->a + p * PG);
@@ -70,9 +70,9 @@ void save(Ctx *c) {
     }
     g_ctx_save = *c;
     g_nos = 0; os_r1_objs(os_cb); qsort(g_os, (size_t)g_nos, sizeof *g_os, cmp_os);
-    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)\n", g_cycle, g_ff, g_nr, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0);
+    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)\n", g_cycle, g_ff, g_memory_map.range_count, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0);
     if (g_cycle == 0) {
-        for (int i = 0; i < g_nr; i++) if (g_r[i].n >= (4u << 20)) LOG("r1:   range %s + %.1f MB\n", where(g_r[i].a), g_r[i].n / 1048576.0);
+        for (int i = 0; i < g_memory_map.range_count; i++) if (g_memory_map.ranges[i].n >= (4u << 20)) LOG("r1:   range %s + %.1f MB\n", where(g_memory_map.ranges[i].a), g_memory_map.ranges[i].n / 1048576.0);
         park_report("at the save");
         LOG("r1: %d fibers at the save:\n", g_nfib); fibers_report();
     }
@@ -85,8 +85,8 @@ static double learned_copy_ms(int restore_dir) {
     static uint8_t *buf; static size_t cap;
     if (cap < g_learn_pages * PG) { free(buf); cap = g_learn_pages * PG + (64u << 20); buf = malloc(cap); }
     double t0 = now_ms(); size_t o = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         if (!r->learn) continue;
         for (size_t p = 0; p < r->n / PG; p++) if (r->learn[p]) {
             if (restore_dir) memcpy(buf + o, r->a + p * PG, PG); else memcpy(buf + o, r->a + p * PG, PG);
@@ -99,8 +99,8 @@ static double learned_copy_ms(int restore_dir) {
 Learn g_l[MAXR]; int g_nl;
 static void learn_merge(void) {
     g_learn_pages = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         int j; for (j = 0; j < g_nl; j++) if (g_l[j].a == r->a && g_l[j].n == r->n) break;
         if (j == g_nl && g_nl < MAXR) { g_l[g_nl].a = r->a; g_l[g_nl].n = r->n; g_l[g_nl].learn = calloc(r->n / PG, 1); g_nl++; }
         if (j < g_nl) { for (size_t p = 0; p < r->n / PG; p++) g_l[j].learn[p] |= r->dirty[p]; r->learn = g_l[j].learn; }
@@ -111,8 +111,8 @@ const char *where(uint8_t *a) {
     static char b[96];
     if ((uintptr_t)a >= 0x7100000000ull && (uintptr_t)a < 0x7107500000ull) snprintf(b, sizeof b, "main+%llx", (unsigned long long)((uintptr_t)a - 0x7100000000ull));
     else if ((uintptr_t)a >= 0x7200000000ull && (uintptr_t)a < 0x7300000000ull) snprintf(b, sizeof b, "module area+%llx", (unsigned long long)((uintptr_t)a - 0x7200000000ull));
-    else { int h = -1; for (int i = 0; i < g_nheap; i++) if (a >= g_heap_base[i] && a < g_heap_base[i] + (64ull << 30)) h = i;
-           if (h >= 0) snprintf(b, sizeof b, "region%d+%llx", h, (unsigned long long)(a - g_heap_base[h])); else snprintf(b, sizeof b, "stack/tls %p", (void *)a); }
+    else { int h = -1; for (int i = 0; i < g_memory_map.heap_count; i++) if (a >= g_memory_map.heap_base[i] && a < g_memory_map.heap_base[i] + (64ull << 30)) h = i;
+           if (h >= 0) snprintf(b, sizeof b, "region%d+%llx", h, (unsigned long long)(a - g_memory_map.heap_base[h])); else snprintf(b, sizeof b, "stack/tls %p", (void *)a); }
     return b;
 }
 
@@ -132,8 +132,8 @@ void restore(Ctx *c) {
     double t0 = now_ms();
     g_ne = 0;
     size_t pages = 0, ranges_hit = 0, ranges_hit_bytes = 0, skipped = 0;
-    for (int i = 0; i < g_nr; i++) {
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
         MEMORY_BASIC_INFORMATION m;
         if (!VirtualQuery(r->a, &m, sizeof m) || m.State != MEM_COMMIT || (uint8_t *)m.BaseAddress + m.RegionSize < r->a + r->n) { skipped++; if (!VirtualAlloc(r->a, r->n, MEM_COMMIT, PAGE_READWRITE)) continue; }   /* decommitted by the game in the window: committed again, its bytes come back below */
         size_t hit = 0;
@@ -160,7 +160,7 @@ void restore(Ctx *c) {
     LOG("r1: fibers at the restore: %d at their save-point state (registers restored), %d not, %d new\n", g_fib_same, g_fib_diff, g_fib_new);
     learn_merge();
     LOG("r1: cycle %d RESTORE at fight frame %lld: %zu pages changed (%.1f MB) in %zu of %d ranges (those ranges %.1f MB); compare + copy back %.2f ms; %zu ranges partly decommitted in the window (committed again)\n",
-        g_cycle, g_ff, pages, pages * PG / 1048576.0, ranges_hit, g_nr, ranges_hit_bytes / 1048576.0, t1 - t0, skipped);
+        g_cycle, g_ff, pages, pages * PG / 1048576.0, ranges_hit, g_memory_map.range_count, ranges_hit_bytes / 1048576.0, t1 - t0, skipped);
     {   /* where the changed pages are: one line per contiguous group (first 40) */
         int shown = 0;
         for (size_t i = 0; i < g_ne && shown < 40; ) {
@@ -186,8 +186,8 @@ void verify(void) {
             }
         }
     }
-    for (int i = 0; i < g_nr; i++) {                   /* pages the re-run changed but the first pass did not */
-        Rng *r = &g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {                   /* pages the re-run changed but the first pass did not */
+        Rng *r = &g_memory_map.ranges[i];
         MEMORY_BASIC_INFORMATION m;
         if (!VirtualQuery(r->a, &m, sizeof m) || m.State != MEM_COMMIT || (uint8_t *)m.BaseAddress + m.RegionSize < r->a + r->n) continue;
         for (size_t p = 0; p < r->n / PG; p++)
@@ -200,5 +200,5 @@ void verify(void) {
         g_cycle, g_ff, bad, g_ne, extra, now_ms() - t0);
     os_compare("at the end of the re-run");
 }
-void release(void) { for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); g_r[i].dirty = NULL; free(g_r[i].async); g_r[i].async = NULL; } }
+void release(void) { for (int i = 0; i < g_memory_map.range_count; i++) { rs_free(g_memory_map.ranges[i].s); g_memory_map.ranges[i].s = NULL; free(g_memory_map.ranges[i].dirty); g_memory_map.ranges[i].dirty = NULL; free(g_memory_map.ranges[i].async); g_memory_map.ranges[i].async = NULL; } }
 

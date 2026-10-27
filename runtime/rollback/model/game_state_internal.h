@@ -24,8 +24,16 @@ extern FILE *g_log;                          /* the r1 log file */
 
 /* A run of guest memory the save covers (a, n bytes), with its copy in the shadow (s) and per-page flags. */
 typedef struct { uint8_t *a; size_t n; uint8_t *s; uint8_t *dirty; uint8_t *learn; uint8_t *async; } Rng;   /* dirty / learn: one byte per page */
-extern Rng g_r[];                            /* the ranges r1 saves ... */
-extern int g_nr;                             /* ... and how many of them there are */
+/* The memory map (memory_map.c): every range of guest memory the save covers, and the big address regions the game reserved.
+ * Only memory_map.c changes it; everyone else reads it. */
+#define MAXR 8192                         /* most ranges the map can hold */
+typedef struct {
+    Rng ranges[MAXR];                        /* the ranges the save covers, sorted by address, no overlaps */
+    int range_count;                         /* how many entries of ranges[] are in use */
+    uint8_t *heap_base[8];                   /* start of each address region of 16 GB or more that the game reserved (its heap) */
+    int heap_count;                          /* how many entries of heap_base[] are in use */
+} MemoryMap;
+extern MemoryMap g_memory_map;
 
 extern uint8_t *g_win1;                      /* window 1: where the game's big address region starts ... */
 extern uint64_t g_wn1;                       /* ... and its size in bytes */
@@ -76,7 +84,6 @@ void ppool_init(void);                       /* sets up the presentation pool (o
 #include <tlhelp32.h>
 
 /* ---- macros that used to sit in the middle of r1_state.c / r1_ring.c / rb_rollback.c */
-#define MAXR 8192
 #define FIB_BLOCK 0x500
 #define R1_CTR(w, a, b) do { if (g_r1_ctr < 0) g_r1_ctr = getenv("SSBU_UNWIND_TRACE") != NULL; if (g_r1_ctr) nnunwind_trace_note(w, (uint64_t)(a), (uint64_t)(b)); } while (0)
 #define AR_SIZE (32ull << 30)
@@ -154,8 +161,6 @@ extern void (*g_r1_fiber_born)(void *);    /* model/tracking_experiments/write_m
 extern int g_cycle;    /* model/game_state.c */
 extern int g_phase;    /* model/game_state.c */
 extern long long g_ff;    /* model/game_state.c */
-extern uint8_t * g_heap_base[8];    /* model/game_state.c */
-extern int g_nheap;    /* model/game_state.c */
 extern Ctx g_ctx_save;    /* model/game_state.c */
 extern int g_nborn;    /* model/game_state.c */
 extern char g_born[2048];    /* model/game_state.c */

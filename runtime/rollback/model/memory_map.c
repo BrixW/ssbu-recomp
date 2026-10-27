@@ -3,11 +3,13 @@
  * Split out of r1_state.c; what it shares with the other rollback files is declared in game_state_internal.h. */
 #include "game_state_internal.h"
 
+MemoryMap g_memory_map;                      /* the one memory map (see MemoryMap in game_state_internal.h) */
+
 /* ---------------------------------------------------------------- the ranges */
 static void add_range(uint8_t *a, size_t n) {
-    if (g_nr >= MAXR) return;
-    if (g_nr && g_r[g_nr - 1].a + g_r[g_nr - 1].n == a) { g_r[g_nr - 1].n += n; return; }
-    g_r[g_nr].a = a; g_r[g_nr].n = n; g_nr++;
+    if (g_memory_map.range_count >= MAXR) return;
+    if (g_memory_map.range_count && g_memory_map.ranges[g_memory_map.range_count - 1].a + g_memory_map.ranges[g_memory_map.range_count - 1].n == a) { g_memory_map.ranges[g_memory_map.range_count - 1].n += n; return; }
+    g_memory_map.ranges[g_memory_map.range_count].a = a; g_memory_map.ranges[g_memory_map.range_count].n = n; g_memory_map.range_count++;
 }
 int rw(DWORD p) { return (p & 0xff) == PAGE_READWRITE || (p & 0xff) == PAGE_EXECUTE_READWRITE; }
 /* the committed read-write parts of [lo, hi) */
@@ -34,13 +36,13 @@ static void find_heaps(void) {             /* once: the reservations of >= 16 GB
     uint8_t *cur = NULL; size_t span = 0;
     for (uint8_t *p = (uint8_t *)0x10000; (uintptr_t)p < 0x7FFFFFFF0000ull && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
         if (m.AllocationBase != cur) {
-            if (cur && span >= (16ull << 30) && g_nheap < 8) g_heap_base[g_nheap++] = cur;
+            if (cur && span >= (16ull << 30) && g_memory_map.heap_count < 8) g_memory_map.heap_base[g_memory_map.heap_count++] = cur;
             cur = (uint8_t *)m.AllocationBase; span = 0;
         }
         if (cur) span += m.RegionSize;
     }
-    if (cur && span >= (16ull << 30) && g_nheap < 8) g_heap_base[g_nheap++] = cur;
-    for (int i = 0; i < g_nheap; i++) LOG("r1: game address region %d at %p\n", i, (void *)g_heap_base[i]);
+    if (cur && span >= (16ull << 30) && g_memory_map.heap_count < 8) g_memory_map.heap_base[g_memory_map.heap_count++] = cur;
+    for (int i = 0; i < g_memory_map.heap_count; i++) LOG("r1: game address region %d at %p\n", i, (void *)g_memory_map.heap_base[i]);
 }
 static uint64_t g_ex[512][2]; static int g_nex;                       /* other guest threads' stacks: never saved / restored */
 static void ex_cb(uint64_t key, int sig, int cnt, uint64_t len, uint64_t thread, uint64_t stack, uint64_t size) {
@@ -84,18 +86,18 @@ static int g_rb_test_nomem = -1;                        /* SSBU_RB_NET_TEST_NOME
 int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; } return g_rb_test_nomem; }
 double g_save_need_mb, g_save_avail_mb;          /* the last commit check (MB) */
 void collect(Ctx *c) {
-    for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
-    g_nr = 0;
-    if (!g_nheap) find_heaps();
-    for (int i = 0; i < g_nheap; i++) add_alloc(g_heap_base[i]);
+    for (int i = 0; i < g_memory_map.range_count; i++) { rs_free(g_memory_map.ranges[i].s); g_memory_map.ranges[i].s = NULL; free(g_memory_map.ranges[i].dirty); free(g_memory_map.ranges[i].async); }
+    g_memory_map.range_count = 0;
+    if (!g_memory_map.heap_count) find_heaps();
+    for (int i = 0; i < g_memory_map.heap_count; i++) add_alloc(g_memory_map.heap_base[i]);
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
     add_fighter_dlls();
     { size_t pmn; uint8_t *pm = ppool_bookkeeping(&pmn); if (pm && pmn) add_span(pm, pm + pmn); }      /* R4: the presentation pool's bookkeeping (rb_learned.c) */
     if (g_catch_addr && !getenv("SSBU_R1_NO_CATCH")) {     /* nnunwind.c: the catch frames (guest CFA -> host jmp_buf) */
-        size_t before = 0, after = 0; for (int i = 0; i < g_nr; i++) before += g_r[i].n;
+        size_t before = 0, after = 0; for (int i = 0; i < g_memory_map.range_count; i++) before += g_memory_map.ranges[i].n;
         size_t cn = 8192 * 16; { const char *e = getenv("SSBU_R1_TEST_CATCH_KB"); if (e && atoi(e) > 0 && (size_t)atoi(e) * 1024 < cn) cn = (size_t)atoi(e) * 1024; }   /* (hs15, TEST ONLY) only that much of the table in the state: the pp3h crash on purpose */
         add_span((uint8_t *)(uintptr_t)g_catch_addr, (uint8_t *)(uintptr_t)g_catch_addr + cn);
-        for (int i = 0; i < g_nr; i++) after += g_r[i].n;
+        for (int i = 0; i < g_memory_map.range_count; i++) after += g_memory_map.ranges[i].n;
         static int said; if (!said++ || after - before < 8192 * 16) LOG("r1: the catch table (%u KB) is in the state with %.1f KB%s\n", 8192 * 16 / 1024, (after - before) / 1024.0, after - before < 8192 * 16 ? ": NOT ALL OF IT (pages never written are copy-on-write; hs15)" : "");
     }
     if (g_ar) add_alloc(g_ar);
@@ -103,29 +105,29 @@ void collect(Ctx *c) {
     add_alloc((void *)(uintptr_t)c->tpidr);
     Ctx *tc; const char *nm; HANDLE h;
     for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) if (tc->tpidr) add_alloc((void *)(uintptr_t)tc->tpidr);
-    qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
+    qsort(g_memory_map.ranges, (size_t)g_memory_map.range_count, sizeof g_memory_map.ranges[0], cmp_rng);
     int o = 0;                                        /* drop duplicates (two threads in one block) */
-    for (int i = 0; i < g_nr; i++) {
-        if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) continue;
-        g_r[o++] = g_r[i];
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        if (o && g_memory_map.ranges[i].a < g_memory_map.ranges[o - 1].a + g_memory_map.ranges[o - 1].n) continue;
+        g_memory_map.ranges[o++] = g_memory_map.ranges[i];
     }
-    g_nr = o;
+    g_memory_map.range_count = o;
     if (!getenv("SSBU_R1_CUT_STACKS")) return;
     g_nex = 0; os_r1_objs(ex_cb);
     for (int e = 0; e < g_nex; e++) {                 /* cut [lo, hi) out of every range */
         uint8_t *lo = (uint8_t *)(uintptr_t)g_ex[e][0], *hi = (uint8_t *)(uintptr_t)g_ex[e][1];
-        for (int i = 0; i < g_nr; i++) {
-            Rng *r = &g_r[i]; uint8_t *a = r->a, *b = r->a + r->n;
+        for (int i = 0; i < g_memory_map.range_count; i++) {
+            Rng *r = &g_memory_map.ranges[i]; uint8_t *a = r->a, *b = r->a + r->n;
             if (hi <= a || lo >= b) continue;
-            if (lo > a && hi < b && g_nr < MAXR) {     /* split */
-                memmove(&g_r[i + 2], &g_r[i + 1], (size_t)(g_nr - i - 1) * sizeof g_r[0]); g_nr++;
-                g_r[i + 1].a = hi; g_r[i + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a);
+            if (lo > a && hi < b && g_memory_map.range_count < MAXR) {     /* split */
+                memmove(&g_memory_map.ranges[i + 2], &g_memory_map.ranges[i + 1], (size_t)(g_memory_map.range_count - i - 1) * sizeof g_memory_map.ranges[0]); g_memory_map.range_count++;
+                g_memory_map.ranges[i + 1].a = hi; g_memory_map.ranges[i + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a);
             } else if (lo <= a && hi >= b) { r->n = 0; }
             else if (lo <= a) { r->a = hi; r->n = (size_t)(b - hi); }
             else r->n = (size_t)(lo - a);
         }
     }
-    int o2 = 0; for (int i = 0; i < g_nr; i++) if (g_r[i].n) g_r[o2++] = g_r[i];
-    g_nr = o2;
+    int o2 = 0; for (int i = 0; i < g_memory_map.range_count; i++) if (g_memory_map.ranges[i].n) g_memory_map.ranges[o2++] = g_memory_map.ranges[i];
+    g_memory_map.range_count = o2;
 }
 
