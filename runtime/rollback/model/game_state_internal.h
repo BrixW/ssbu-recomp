@@ -59,6 +59,7 @@ int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);            
 
 /* ---- what r1_ring.c provides ------------------------------------------------------------------------------------------- */
 int rgs_wanted(void);                        /* 1 when the ring is wanted (online rollback, or the SSBU_RB_SIM test) */
+extern uint8_t **g_rg_xa;                  /* extras page e (in the order of g_x): its address */
 uint8_t *rg_addr(uint32_t id);               /* address of the page with ring id `id` (window 1, window 2, then the extras) */
 uint8_t *rg_src(uint32_t id);                /* the bytes of that page at the newest capture (NULL = zero page, (uint8_t *)1 = decommitted) */
 long long rg_current_slot_pages(void);       /* pages the capture in progress has recorded so far (0 when none is in progress) */
@@ -77,7 +78,14 @@ void ls_fight_over(void);                    /* the fight ended: make every page
 void ls_range_event(uint64_t a, uint64_t n, int what);      /* memory changed without a page fault: 0 host write, 1 decommit, 2 commit */
 void ls_report(void);                        /* end-of-run report of the learned set and the pool */
 uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeeping region, so it is saved with the rest; *n is its size */
-void ppool_init(void);                       /* sets up the presentation pool (once, from r1_init) */
+void ppool_init(void);
+/* The extras' learned set (page_tracker_learned.c, "LS-X"): the ring asks which extras pages need comparing, and tells the set how each compare ended. */
+extern long long g_xls_caps, g_xls_jobs, g_xls_loads, g_xls_loadpages;      /* statistics: captures, pages compared, loads, pages loaded */
+int xls_skip(size_t e);                      /* 1 when extras page e was not written since the base, so it is neither compared nor loaded */
+void xls_decay(const uint32_t *xjob, const uint8_t *xdiff, size_t nxj);      /* after a capture's compare: pages that stopped changing leave the set */
+void xww_poll(void);                         /* ask the OS which extras pages were written since the last poll (SSBU_LS_X_WW=1) */
+extern volatile LONG64 g_cp_fault;           /* page jobs skipped because the page was gone (write_marks.c) */
+extern int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *);      /* compare one page through a pointer so a fault is caught by __try (write_marks.c) */                       /* sets up the presentation pool (once, from r1_init) */
 
 
 /* ---- includes the pieces need */

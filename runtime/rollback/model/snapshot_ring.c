@@ -43,7 +43,7 @@ int g_rg_nomem;
 static RgSlot *g_rg; int g_rg_cap, g_rg_head, g_rg_count, g_rg_ready, g_rg_depth = 7;
 uint32_t *g_rg_idx; static uint8_t *g_rg_touch; static uint32_t *g_rg_tl; static size_t g_rg_ntl, g_rg_tlcap;
 size_t g_rg_n1, g_rg_n2, g_rg_nx;               /* page counts: window 1, window 2, extras */
-static uint8_t **g_rg_xa, **g_rg_xb;                   /* extras page e: its address, its flat (first save) bytes */
+uint8_t **g_rg_xa; static uint8_t **g_rg_xb;                   /* extras page e: its address, its flat (first save) bytes */
 static uint8_t *g_rg_pool; uint32_t g_rg_bump, g_rg_pcom, *g_rg_free, g_rg_nfree;
 static uint8_t *g_rg_cbs; static int *g_rg_ncbs; static int g_rg_cb_ok = -1;
 static double g_rg_park_ms = 30;
@@ -357,14 +357,22 @@ int r1_ring_capture(long long frame, Ctx *c) {
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     g_rg_cur = s; g_rg_fail_now = 0;
     static uint8_t *xdiff; static size_t xdn; if (xdn < g_rg_nx + 1) { free(xdiff); xdn = g_rg_nx + 1; xdiff = calloc(xdn, 1); }   /* (hs12: the extras can change at a rebase) */
-    for (size_t e = 0; e < g_rg_nx; e++) cp_add(g_rg_xa[e], rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e)));      /* (round 3) extras compared by main + the copy threads */
+    static uint32_t *xjob; static size_t xjn; size_t nxj = 0;
+    if (xjn < g_rg_nx + 1) { free(xjob); xjn = g_rg_nx + 1; xjob = malloc(xjn * sizeof *xjob); }
+    xww_poll();                                           /* (LS-X-WW) the pages the OS saw written since the last poll join the set */
+    for (size_t e = 0; e < g_rg_nx; e++) {      /* (round 3) extras compared by main + the copy threads: not the pages of the extras' learned set that were never written (rb_learned.c, LS-X), nor a page not committed now; xjob[q] = the extras page of compare job q */
+        if (xls_skip(e)) continue;
+        xjob[nxj++] = (uint32_t)e; cp_add(g_rg_xa[e], rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e)));
+    }
+    g_xls_caps++; g_xls_jobs += (long long)nxj;
     g_cp_cmp = xdiff; cp_run(); g_cp_cmp = NULL;
+    xls_decay(xjob, xdiff, nxj);                          /* (LS-X) learned pages that stopped changing go read-only again */
     if (g_rgpg_on < 0) g_rgpg_on = getenv("SSBU_RB_SIM_PAGES") != NULL;
     g_rgpg_kind = g_ra_phase != 2 ? 0 : g_rgs_left > 1 ? 1 : 2; g_rgpg_caps[g_rgpg_kind]++;
     if (g_ls_active) ls_capture_pages(rg_cap_page); else rg_sweep(rg_cap_page);      /* R4: the learned set (rb_learned.c) instead of the marks */
-    for (size_t e = 0; e < g_rg_nx && !g_rg_fail_now; e++) {             /* extras: the pages that differ from their newest value */
-        uint32_t id = (uint32_t)(g_rg_n1 + g_rg_n2 + e);
-        if (!xdiff[e]) continue;
+    for (size_t q = 0; q < nxj && !g_rg_fail_now; q++) {                /* extras: the pages that differ from their newest value */
+        size_t e = xjob[q]; uint32_t id = (uint32_t)(g_rg_n1 + g_rg_n2 + e);
+        if (!xdiff[q]) continue;
         uint32_t nb = rg_pool_get_cap();
         if (!nb || !rg_push(s, id, g_rg_idx[id])) { if (nb) rg_pool_put(nb); g_rg_fail_now = 1; break; }
         cp_add(rg_pool_ptr(nb), g_rg_xa[e]); g_rg_idx[id] = nb; s->xpages++;
@@ -613,7 +621,10 @@ int r1_ring_load(long long frame, Ctx *c) {
     }
     g_rg_count = si + 1;
     if (g_ls_active) ls_for_each_learned_page(rg_load_page); else rg_sweep(rg_load_page);      /* written since the newest capture (R4: the learned set) */
-    for (size_t e = 0; e < g_rg_nx; e++) rg_touch((uint32_t)(g_rg_n1 + g_rg_n2 + e));
+    {   size_t nl = 0;
+        xww_poll();                                       /* (LS-X-WW) written since the newest capture */
+        for (size_t e = 0; e < g_rg_nx; e++) { if (xls_skip(e)) continue; rg_touch((uint32_t)(g_rg_n1 + g_rg_n2 + e)); nl++; }      /* (LS-X: an extras page never written since the base still holds its value at every state) */
+        g_xls_loads++; g_xls_loadpages += (long long)nl; }
     size_t pages = g_rg_ntl; g_rg_ldpg += (long long)pages;
     for (size_t n = 0; n < g_rg_ntl; n++) {               /* each page once, from its value at `frame` */
         uint32_t id = g_rg_tl[n]; g_rg_touch[id] = 0;

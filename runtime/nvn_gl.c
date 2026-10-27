@@ -708,6 +708,7 @@ static uint64_t mem_hash(const uint8_t *p, size_t n, int full) {
  * of its pages with the stamp it saw last. Memory that is not write-watched (the image's own data, host heap) is hashed
  * as before. SSBU_NO_WRITEWATCH=1 restores the old behaviour everywhere. Render thread only. */
 #define WW_SLOTS (1u << 20)
+void r1_ww_note(void *const *pages, size_t cnt); void r1_ww_note_range(const void *p, size_t n); int r1_ww_taken(const void *p, size_t n);      /* rb_learned.c (LS-X-WW): the ring asks the OS the same question */
 static struct { uint64_t page; uint64_t stamp; } *g_ww_tab;
 static uint64_t g_ww_stamp, g_ww_used, g_ww_floor;       /* g_ww_floor: stamp given to every page when the table had to be emptied */
 static int g_ww_off = -1;
@@ -729,6 +730,7 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     DWORD gran = 0;
     if (g_ww_off < 0) { g_ww_off = getenv("SSBU_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
     if (g_ww_off || !n || GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
+    if (count == 16384) r1_ww_note_range(p, n); else if (count) r1_ww_note(pages, count);      /* the rollback ring (rb_learned.c, LS-X-WW) asks the OS the same question: it must see these pages too */
     uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12, newest = g_ww_floor ? g_ww_floor : 1;
     if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; newest = g_ww_floor; }      /* forget: everything counts as written once */
     if (count) {
@@ -738,6 +740,7 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
             for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
         } else for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
     }
+    if (r1_ww_taken(p, n)) { uint64_t stamp = ++g_ww_stamp; for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp; }      /* the ring's poll reset write bits of this range that this function has not seen */
     for (uint64_t pg = first; pg <= last; pg++) { uint64_t *s = ww_slot(pg, 0); if (s && *s > newest) newest = *s; }
     return newest;
 }

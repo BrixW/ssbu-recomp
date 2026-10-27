@@ -161,11 +161,264 @@ static int ls_open_page(size_t id, EXCEPTION_POINTERS *e) {
         }
     }
 }
+/* ---- THE EXTRAS' LEARNED SET (SSBU_LS_X=0: off). The extras (r1_ring.c: the committed ranges outside both windows) used to be
+ * compared with their newest ring value in EVERY capture and copied back whole in every load. Measured 2026-10-27 on a Ryzen 9
+ * 7900X: 1.86 GB of extras = 68 ms per capture and ~120 ms per load, so a fight ran at 6-12 fps, while only ~1000 extras pages
+ * (4 MB) change per tick; the ranges of 1 MB or more (3 of them hold 1.3 GB) are now handled like the windows' pages: read-only at
+ * the base, the first write faults into ls_write_fault_handler, the page becomes writable for good and is "learned"; a capture compares, and a load
+ * restores, only the learned pages (and every page of a smaller range, and of a range page that was not read-write at the base).
+ * g_xst[e] per extras page e (the index r1_ring.c uses: pages of g_x in order): 0 always compared, 1 read-only (not written since
+ * the base: it still holds its value in the flat base copy = in every state of the ring), 2 learned, 3 being opened. */
+#define XLS_MIN (1u << 20)
+typedef struct { uint8_t *a; size_t n, e0; int ww; } XlsR;
+static XlsR g_xr[512]; static int g_nxr; static size_t g_xn;
+static volatile uint8_t *g_xst; static size_t g_xst_cap;
+static uint8_t *g_xcnt; static size_t g_xcnt_cap;
+static int g_xww_on = -1, g_xww_act; static volatile uint8_t *g_xwd, *g_xnv; static size_t g_xw_cap;      /* LS-X-WW (below): mailboxes per extras page */
+static void xww_decay(const uint32_t *xjob, const uint8_t *xdiff, size_t nxj);                      /* per extras page: captures in a row without a change (xls_decay) */
+static volatile LONG64 g_xls_faults, g_xls_stuck; static long long g_xls_prot_pages; long long g_xls_caps, g_xls_jobs, g_xls_loads, g_xls_loadpages; static int g_xls_on = -1, g_xls_active;
+static int xls_enabled(void) { if (g_xls_on < 0) { const char *e = getenv("SSBU_LS_X"); g_xls_on = !(e && e[0] == '0'); } return g_xls_on; }
+static int xls_cmp_xr(const void *p, const void *q) { const XlsR *a = p, *b = q; return a->a < b->a ? -1 : a->a > b->a; }
+static int xls_find(const uint8_t *a, size_t *e) {
+    int lo = 0, hi = g_nxr - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) >> 1; const XlsR *r = &g_xr[m];
+        if (a < r->a) hi = m - 1; else if (a >= r->a + r->n) lo = m + 1; else { *e = r->e0 + (size_t)(a - r->a) / PG; return 1; }
+    }
+    return 0;
+}
+int xls_skip(size_t e) { return g_xls_active && e < g_xn && g_xst[e] == 1; }      /* not written since the base: neither compared nor loaded */
+static int xls_open(size_t e, uint8_t *pg, EXCEPTION_POINTERS *ev) {      /* the page writable for good, learned; 0 = not ours */
+    if (e >= g_xn) return 0;
+    ULONGLONG t0 = 0;
+    for (;;) {
+        uint8_t s = g_xst[e];
+        if (s == 0) return 0;
+        if (s == 2) { DWORD old; return VirtualProtect(pg, PG, PAGE_READWRITE, &old) ? 1 : 0; }
+        if (s == 4) {                                    /* the decay is comparing this page (read-only): the write wins, the page is learned again; the decay's last step (4 -> 1) then fails and leaves it */
+            if (__sync_bool_compare_and_swap(&g_xst[e], (uint8_t)4, (uint8_t)2)) { DWORD old; return VirtualProtect(pg, PG, PAGE_READWRITE, &old) ? 1 : 0; }
+            continue;
+        }
+        if (s == 3) {                                    /* another thread is opening it (a few microseconds). A bounded wait: a thread that spins here may hold a lock the owner needs */
+            if (!t0) t0 = GetTickCount64();
+            else if (GetTickCount64() - t0 > 20) { DWORD old; g_xls_stuck++; int ok = VirtualProtect(pg, PG, PAGE_READWRITE, &old) != 0; g_xst[e] = 2; return ok; }
+            YieldProcessor(); continue;
+        }
+        if (__sync_bool_compare_and_swap(&g_xst[e], (uint8_t)1, (uint8_t)3)) {
+            DWORD old; int ok = VirtualProtect(pg, PG, PAGE_READWRITE, &old) != 0;
+            if (g_xcnt && e < g_xcnt_cap) g_xcnt[e] = 0;
+            MemoryBarrier(); g_xst[e] = 2;
+            if (ev && ok) InterlockedIncrement64(&g_xls_faults);
+            return ok;
+        }
+    }
+}
+static void xls_off(void) {                              /* the fight is over (or a new base): every page still read-only writable again */
+    if (!g_xls_active) return;
+    g_xls_active = 0; g_xww_act = 0;
+    long long n = 0, learned = 0;
+    for (int i = 0; i < g_nxr; i++) {
+        const XlsR *r = &g_xr[i]; size_t np = r->n / PG;
+        if (r->ww) { for (size_t j = 0; j < np; j++) learned += g_xst[r->e0 + j] == 2; continue; }      /* (write-watched: never made read-only) */
+        for (size_t j = 0; j < np;) {
+            if (g_xst[r->e0 + j] != 1) { if (g_xst[r->e0 + j] == 2) learned++; j++; continue; }
+            size_t k = j; while (k < np && g_xst[r->e0 + k] == 1) k++;
+            DWORD old;
+            if (VirtualProtect(r->a + j * PG, (k - j) * PG, PAGE_READWRITE, &old)) n += (long long)(k - j);
+            else for (size_t q = j; q < k; q++) if (VirtualProtect(r->a + q * PG, PG, PAGE_READWRITE, &old)) n++;
+            j = k;
+        }
+    }
+    memset((void *)g_xst, 0, g_xn);
+    if (g_xls_stuck) LOG("r1: LS-X: %lld page opens gave up waiting for another thread's open (20 ms)\n", (long long)g_xls_stuck);
+    if (g_cp_fault) LOG("r1: LS-X: %lld page jobs skipped so far because the page was gone (decommitted by the game after the extras were listed)\n", (long long)g_cp_fault);
+    LOG("r1: LS-X: fight over: %lld extras pages writable again; %lld were learned; faults %lld; per capture %.0f extras pages compared (%lld captures), per load %.0f restored (%lld loads)\n",
+        n, learned, (long long)g_xls_faults, g_xls_caps ? (double)g_xls_jobs / g_xls_caps : 0.0, g_xls_caps, g_xls_loads ? (double)g_xls_loadpages / g_xls_loads : 0.0, g_xls_loads);
+}
+static void xls_protect(void) {                          /* threads held, the base's flat copies made: the big extras ranges read-only (g_x, g_nx: r1_state.c) */
+    if (!xls_enabled()) return;
+    xls_off();                                           /* (a base made again inside a fight: the old protection is given back first) */
+    double t0 = now_ms();
+    g_nxr = 0; size_t e0 = 0;
+    for (int i = 0; i < g_nx; i++) {
+        if (g_x[i].n >= XLS_MIN && g_nxr < 512) { g_xr[g_nxr].a = g_x[i].a; g_xr[g_nxr].n = g_x[i].n; g_xr[g_nxr].e0 = e0; g_xr[g_nxr].ww = 0; g_nxr++; }
+        e0 += g_x[i].n / PG;
+    }
+    g_xn = e0;
+    if (g_xst_cap < g_xn + 1) { free((void *)g_xst); g_xst_cap = g_xn + 1; g_xst = calloc(g_xst_cap, 1); if (!g_xst) { g_xst_cap = 0; g_xn = 0; g_nxr = 0; LOG("r1: LS-X: allocation FAILED: the extras are compared whole\n"); return; } }
+    memset((void *)g_xst, 0, g_xst_cap);
+    if (g_xcnt) memset(g_xcnt, 0, g_xcnt_cap);
+    qsort(g_xr, (size_t)g_nxr, sizeof g_xr[0], xls_cmp_xr);
+    long long pages = 0; int nww = 0;
+    if (g_xww_on < 0) { const char *e = getenv("SSBU_LS_X_WW"); g_xww_on = e && e[0] && e[0] != '0'; }
+    if (g_xww_on && g_xw_cap < g_xn + 1) {              /* mailboxes: grown, never freed (other threads may still hold the old pointer) */
+        g_xwd = calloc(g_xn + 1, 1); g_xnv = calloc(g_xn + 1, 1); g_xw_cap = (g_xwd && g_xnv) ? g_xn + 1 : 0;
+        if (!g_xw_cap) { g_xww_on = 0; LOG("r1: LS-X-WW: allocation FAILED: write watch not used\n"); }
+    }
+    for (int i = 0; i < g_nxr; i++) {
+        uint8_t *p = g_xr[i].a, *end = p + g_xr[i].n;
+        if (g_xww_on) { PVOID tl[1]; ULONG_PTR tn = 1; DWORD gr; if (GetWriteWatch(0, p, g_xr[i].n, tl, &tn, &gr) == 0) { g_xr[i].ww = 1; nww++; } }      /* a range inside a MEM_WRITE_WATCH reservation: the OS says which pages were written */
+        while (p < end) {
+            MEMORY_BASIC_INFORMATION m; if (!VirtualQuery(p, &m, sizeof m)) break;
+            uint8_t *q = (uint8_t *)m.BaseAddress + m.RegionSize; if (q <= p) q = p + PG; if (q > end) q = end;
+            if (m.State == MEM_COMMIT && m.Protect == PAGE_READWRITE) {
+                DWORD old;
+                if (g_xr[i].ww || VirtualProtect(p, (size_t)(q - p), PAGE_READONLY, &old)) {
+                    for (uint8_t *a = p; a < q; a += PG) g_xst[g_xr[i].e0 + (size_t)(a - g_xr[i].a) / PG] = 1;
+                    pages += (long long)((q - p) / PG);
+                }
+            }
+            p = q;
+        }
+    }
+    g_xls_prot_pages += pages; g_xls_caps = g_xls_jobs = g_xls_loads = g_xls_loadpages = 0; g_xls_faults = 0;
+    g_xls_active = 1;
+    if (g_xww_on && nww) { g_xww_act = 1; xww_poll(); }       /* the pages written since the OS's last answer (also the texture code's) count as written */
+    if (g_xww_on) LOG("r1: LS-X-WW: %d of %d extras ranges are write-watched (no page made read-only there)\n", nww, g_nxr);
+    LOG("r1: LS-X: %d extras ranges of %u KB or more tracked: %lld pages (%.1f MB) of %zu extras pages made read-only in %.1f ms\n", g_nxr, XLS_MIN >> 10, pages, pages * (double)PG / 1048576.0, g_xn, now_ms() - t0);
+}
+static void xls_range_page(uint64_t p, int what) {       /* ls_range_event for an address outside the windows: 0 a host write, 1 decommit, 2 commit */
+    size_t e; if (g_nxr <= 0 || !xls_find((const uint8_t *)(uintptr_t)p, &e) || e >= g_xn) return;
+    if (g_xww_act && g_xwd && e < g_xw_cap) { g_xwd[e] = 1; return; }      /* (the OS does not report a decommit / commit: the page counts as written at the next poll) */
+    uint8_t s = g_xst[e];
+    if (what == 0 || what == 1) { if (s == 1 || s == 3 || s == 4) xls_open(e, (uint8_t *)(uintptr_t)p, NULL); }
+    else if (s == 1 && g_xls_active) { DWORD old; VirtualProtect((void *)(uintptr_t)p, PG, PAGE_READONLY, &old); }      /* (a commit over committed pages makes them read-write again) */
+}
+/* LS-X decay (SSBU_LS_X_DECAY=<n>, default 24, 0 = off): a learned page that did not change in n consecutive captures goes read-only
+ * again (its next write faults and brings it back), so the set follows the pages the fight writes NOW and not every page it ever
+ * wrote (loading a fighter or a stage writes ~150 k extras pages once; kept learned, they cost 22 ms of compare in every capture).
+ * n must exceed the ring's depth (8 states): a state that can still be loaded then has the page's present value. After the page is
+ * protected it is compared once more (a host thread may have written it between the capture's compare and the protect): a page
+ * that differs stays learned. Called with the guest threads held, right after the capture's compare (xdiff[q] for xjob[q]). */
+static int g_xls_decay = -1; static long long g_xls_decayed, g_xls_redo;
+void xls_decay(const uint32_t *xjob, const uint8_t *xdiff, size_t nxj) {
+    if (g_xls_decay < 0) { const char *e = getenv("SSBU_LS_X_DECAY"); g_xls_decay = e ? atoi(e) : 24; if (g_xls_decay > 250) g_xls_decay = 250; }
+    if (g_xls_decay <= 0 || !g_xls_active || !g_xst) return;
+    if (g_xww_act) { xww_decay(xjob, xdiff, nxj); return; }
+    if (g_xcnt_cap < g_xn + 1) { free(g_xcnt); g_xcnt_cap = g_xn + 1; g_xcnt = calloc(g_xcnt_cap, 1); if (!g_xcnt) { g_xcnt_cap = 0; return; } }
+    static uint32_t *cl; static size_t clcap;
+    if (clcap < nxj + 1) { free(cl); clcap = nxj + 1; cl = malloc(clcap * sizeof *cl); if (!cl) { clcap = 0; return; } }
+    size_t n = 0, learned = 0;
+    for (size_t q = 0; q < nxj; q++) {
+        size_t e = xjob[q]; if (e >= g_xn || g_xst[e] != 2) continue;
+        learned++;
+        if (xdiff[q]) g_xcnt[e] = 0; else if (++g_xcnt[e] >= g_xls_decay) cl[n++] = (uint32_t)e;
+    }
+    long long done = 0;
+    for (size_t i = 0; i < n;) {
+        size_t j = i; while (j + 1 < n && cl[j + 1] == cl[j] + 1 && g_rg_xa[cl[j + 1]] == g_rg_xa[cl[j]] + PG) j++;
+        DWORD old; size_t claimed = 0;
+        /* Each page is claimed first (state 2 -> 4, "being compared"). A thread that writes it meanwhile faults into xls_open, which turns it back into
+         * a learned page (4 -> 2) and makes it writable WITHOUT waiting for this function: the last step here, 4 -> 1, then fails and the page stays
+         * learned. Without the claim, a write that lands between the protect and the state change was served as "learned already" (page made
+         * writable) and the state then became 1: a page writable AND skipped for ever, a write that no capture sees. (A first version made the
+         * writers wait for the claim, as for state 3; a thread that waits in a fault handler can hold a lock the owner needs, so it does not.) */
+        for (size_t k = i; k <= j; k++, claimed++) if (!__sync_bool_compare_and_swap(&g_xst[cl[k]], (uint8_t)2, (uint8_t)4)) break;
+        if (claimed == j - i + 1 && VirtualProtect(g_rg_xa[cl[i]], (j - i + 1) * PG, PAGE_READONLY, &old)) {
+            for (size_t k = i; k <= j; k++) {
+                size_t e = cl[k]; const uint8_t *src = rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e));
+                int differs = 0;
+                if (src && src != (uint8_t *)1) { __try { differs = cp_f_cmp(g_rg_xa[e], src); } __except (EXCEPTION_EXECUTE_HANDLER) { differs = 1; } }
+                if (differs) { __sync_bool_compare_and_swap(&g_xst[e], (uint8_t)4, (uint8_t)2); VirtualProtect(g_rg_xa[e], PG, PAGE_READWRITE, &old); g_xcnt[e] = 0; g_xls_redo++; }
+                else if (__sync_bool_compare_and_swap(&g_xst[e], (uint8_t)4, (uint8_t)1)) { g_xcnt[e] = 0; done++; }
+                else g_xcnt[e] = 0;                         /* (a writer made it learned meanwhile) */
+            }
+        } else for (size_t k = i; k < i + claimed; k++) { g_xcnt[cl[k]] = 0; __sync_bool_compare_and_swap(&g_xst[cl[k]], (uint8_t)4, (uint8_t)2); }      /* (not claimed, or a page of the run is not read-write now): tried again after n more captures */
+        i = j + 1;
+    }
+    g_xls_decayed += done;
+    if (g_xls_caps % 300 == 1) { size_t st2 = 0; for (size_t e = 0; e < g_xn; e++) st2 += g_xst[e] == 2;
+        LOG("r1: LS-X: capture %lld: %zu extras pages compared (%zu learned in the set, %zu in all), %lld read-only again so far (%lld changed meanwhile), faults %lld\n", g_xls_caps, nxj, learned, st2, g_xls_decayed, g_xls_redo, (long long)g_xls_faults);
+    }
+}
+/* ---- LS-X-WW (SSBU_LS_X_WW=1): the same set, but the OS says which extras pages were written (GetWriteWatch) instead of a page fault.
+ * The game's big reservations are made with MEM_WRITE_WATCH (nnsdk.c, os_AllocateAddressRegion); a range inside one is "ww" here and
+ * no page of it is ever made read-only. Measured (a stand-alone test, 2 GB region): a query + reset costs ~1.6 ms with 1000 pages
+ * written per tick, and it reports the kernel's writes too (ReadFile, recvfrom, WSARecv); it does NOT report a decommit / commit
+ * of a page (the zero-filled page is different), which the ls_range_event hooks cover through the mailbox g_xwd.
+ * States: 1 = not written within the window (skipped), 2 = in the set; 1 -> 2 only in xww_poll, 2 -> 1 only in xww_decay (both on the
+ * capture / load thread, guest threads held), so no state needs an atomic step. Other threads only set a mailbox byte.
+ * Two users ask the OS the same question and each question RESETS the answer: nvn_gl.c's texture stamps (render thread) and this
+ * poll. So every answer goes to both: the poll sets g_xnv[e] (read by nvn_gl.c through r1_ww_taken), and nvn_gl.c's answers are
+ * given to r1_ww_note / r1_ww_note_range (set g_xwd[e], read by the next poll). */
+static long long g_xww_polls, g_xww_pages, g_xww_mail, g_xww_fail; static double g_xww_ms, g_xww_msmax;
+void xww_poll(void) {
+    if (!g_xww_act || !g_xst || !g_xwd) return;
+    double t0 = now_ms();
+    static PVOID *list; if (!list) { list = malloc((size_t)65536 * sizeof *list); if (!list) return; }
+    for (int i = 0; i < g_nxr; i++) {
+        const XlsR *r = &g_xr[i]; if (!r->ww) continue;
+        uint8_t *p = r->a; size_t left = r->n;
+        while (left) {
+            ULONG_PTR cnt = 65536; DWORD gr;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, p, left, list, &cnt, &gr)) { g_xww_fail++; break; }
+            for (ULONG_PTR k = 0; k < cnt; k++) {
+                size_t e = r->e0 + (size_t)((uint8_t *)list[k] - r->a) / PG;
+                if (e >= g_xn) continue;
+                if (g_xst[e] == 1) g_xst[e] = 2;
+                if (g_xcnt && e < g_xcnt_cap) g_xcnt[e] = 0;
+                g_xnv[e] = 1;
+            }
+            g_xww_pages += (long long)cnt;
+            if (cnt < 65536) break;
+            uint8_t *last = (uint8_t *)list[cnt - 1] + PG; left -= (size_t)(last - p); p = last;
+        }
+    }
+    uint64_t *w = (uint64_t *)g_xwd; size_t nw = g_xn / 8;
+    for (size_t k = 0; k <= nw; k++) {
+        if (k < nw && !w[k]) continue;
+        size_t b0 = k * 8, b1 = k < nw ? b0 + 8 : g_xn;
+        for (size_t e = b0; e < b1; e++) if (g_xwd[e]) {
+            g_xwd[e] = 0; g_xww_mail++;
+            if (g_xst[e] == 1) g_xst[e] = 2;
+            if (g_xcnt && e < g_xcnt_cap) g_xcnt[e] = 0;
+        }
+    }
+    double ms = now_ms() - t0; g_xww_polls++; g_xww_ms += ms; if (ms > g_xww_msmax) g_xww_msmax = ms;
+}
+static void xww_decay(const uint32_t *xjob, const uint8_t *xdiff, size_t nxj) {
+    if (g_xcnt_cap < g_xn + 1) { free(g_xcnt); g_xcnt_cap = g_xn + 1; g_xcnt = calloc(g_xcnt_cap, 1); if (!g_xcnt) { g_xcnt_cap = 0; return; } }
+    size_t learned = 0; long long done = 0;
+    for (size_t q = 0; q < nxj; q++) {
+        size_t e = xjob[q]; if (e >= g_xn || g_xst[e] != 2) continue;
+        learned++;
+        if (xdiff[q]) g_xcnt[e] = 0; else if (++g_xcnt[e] >= g_xls_decay) { g_xst[e] = 1; g_xcnt[e] = 0; done++; }
+    }
+    g_xls_decayed += done;
+    if (g_xls_caps % 300 == 1)
+        LOG("r1: LS-X-WW: capture %lld: %zu extras pages compared (%zu in the set), %lld dropped from the set so far; %lld polls, %.2f ms mean (max %.2f), %lld pages from the OS, %lld from the mailbox, %lld query failures\n",
+            g_xls_caps, nxj, learned, g_xls_decayed, g_xww_polls, g_xww_polls ? g_xww_ms / g_xww_polls : 0.0, g_xww_msmax, g_xww_pages, g_xww_mail, g_xww_fail);
+}
+/* called by nvn_gl.c (render thread) with the pages ITS GetWriteWatch(RESET) answered, so this poll does not lose them */
+void r1_ww_note(void *const *pages, size_t cnt) {
+    if (!g_xww_act || !g_xwd) return;
+    for (size_t k = 0; k < cnt; k++) { size_t e; if (xls_find((const uint8_t *)pages[k], &e) && e < g_xw_cap) g_xwd[e] = 1; }
+}
+void r1_ww_note_range(const void *p, size_t n) {         /* ... or a whole range (its list overflowed and it reset the range) */
+    if (!g_xww_act || !g_xwd) return;
+    for (uintptr_t a = (uintptr_t)p & ~(uintptr_t)(PG - 1); a < (uintptr_t)p + n; a += PG) { size_t e; if (xls_find((const uint8_t *)a, &e) && e < g_xw_cap) g_xwd[e] = 1; }
+}
+/* 1 when this poll reset a write bit of a page of [p, p+n) that nvn_gl.c has not seen (it then stamps the range as written) */
+int r1_ww_taken(const void *p, size_t n) {
+    if (!g_xww_act || !g_xnv) return 0;
+    int hit = 0;
+    for (uintptr_t a = (uintptr_t)p & ~(uintptr_t)(PG - 1); a < (uintptr_t)p + n; a += PG) {
+        size_t e; if (!xls_find((const uint8_t *)a, &e) || e >= g_xw_cap) continue;
+        if (g_xnv[e]) { g_xnv[e] = 0; hit = 1; }
+    }
+    return hit;
+}
 /* Vectored exception handler, first in the chain. Handles only a write access violation (ExceptionInformation[0] == 1) on
  * a tracked window page: opens the page and resumes the instruction. Every other exception goes on to the next handler. */
 static LONG CALLBACK ls_write_fault_handler(EXCEPTION_POINTERS *e) {
     if (!g_ls_page_state || e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    size_t id; if (!ls_page_id((const uint8_t *)(uintptr_t)e->ExceptionRecord->ExceptionInformation[1], &id)) return EXCEPTION_CONTINUE_SEARCH;
+    const uint8_t *fa = (const uint8_t *)(uintptr_t)e->ExceptionRecord->ExceptionInformation[1];
+    size_t id; if (!ls_page_id(fa, &id)) {
+        /* (not gated by g_xls_active: xls_off clears it FIRST and then makes the pages writable one run at a time, while the guest threads run: a
+         * write to a page still read-only in that window was "not ours" and killed the game, 2026-10-27, game DLL write fault at the end of a fight) */
+        size_t xe; if (g_nxr > 0 && xls_find(fa, &xe)) return xls_open(xe, (uint8_t *)((uintptr_t)fa & ~(uintptr_t)(PG - 1)), e) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     return ls_open_page(id, e) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 /* Makes page ids [a, b) read-only and sets their state to 1. One VirtualProtect call when they are contiguous in memory,
@@ -190,6 +443,7 @@ static void ls_protect_all_pages(void) {
         ls_protect_id_range(run, id0 + np);
     }
     g_ls_prot_ms += now_ms() - t0; g_ls_bases++; g_ls_active = 1; g_ls_fight_over_done = 0;
+    xls_protect();                                       /* the big extras ranges too (SSBU_LS_X=0: they are compared whole as before) */
     LOG("r1: LS: %lld pages (%.1f MB) made read-only in %.1f ms; learned set emptied\n", g_ls_prot_pages - before, (g_ls_prot_pages - before) * (double)PG / 1048576.0, now_ms() - t0);
 }
 /* Called when r1's first full save (the base) is made, threads still held. The first time: allocates the state table and
@@ -295,6 +549,7 @@ void ls_new_base(void) {
 void ls_fight_over(void) {
     if (!g_ls_page_state || g_ls_fight_over_done) return;
     g_ls_active = 0; g_ls_fight_over_done = 1;
+    xls_off();
     double t0 = now_ms(); long long n = 0;
     for (size_t a = 0; a < g_ls_total_pages;) {
         if (g_ls_page_state[a] != 1) { a++; continue; }
@@ -317,7 +572,7 @@ void ls_range_event(uint64_t a, uint64_t n, int what) {
     if (!g_ls_page_state || !n || !g_ls_active) return;
     size_t run = (size_t)-1, id = 0;
     for (uint64_t p = a & ~(uint64_t)(PG - 1); p < a + n; p += PG) {
-        if (!ls_page_id((const uint8_t *)(uintptr_t)p, &id)) continue;
+        if (!ls_page_id((const uint8_t *)(uintptr_t)p, &id)) { xls_range_page(p, what); continue; }
         if (ls_page_is_not_simulation(id)) continue;
         if (what == 0) { if (g_ls_page_state[id] == 1 || g_ls_page_state[id] == 3) { ls_open_page(id, NULL); InterlockedIncrement64(&g_ls_wrote_open); } }
         else if (what == 1) { if (g_ls_page_state[id] == 1) ls_open_page(id, NULL); else if (g_ls_page_state[id] == 0) { g_ls_page_state[id] = 2; ls_list_append(id); } InterlockedIncrement64(&g_ls_dec_learn); }

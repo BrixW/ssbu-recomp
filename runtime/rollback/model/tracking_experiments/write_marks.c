@@ -264,14 +264,14 @@ int g_cp_cond; volatile long long g_cp_wrote[9];
  * the first capture's compare (joiner of a Local Wireless room match). The job is skipped instead (its compare reads "equal", its restore is
  * not done: the page is gone) and counted in g_cp_fault. A guard per page costs nothing when no page faults (x64 SEH is table driven); a VirtualQuery
  * per region before every capture did the same check and cost 26 ms per capture once the extras were fragmented (measured, Ryzen 9 7900X). */
-static volatile LONG64 g_cp_fault;
+volatile LONG64 g_cp_fault;
 /* The page operations go through a volatile function pointer: clang 9 builds the __try's scope table only from calls that may throw, and treats memcpy / memcmp
  * (builtins, nounwind) as unable to, so a fault inside them was NOT caught (found 2026-10-27: a write fault in memcpy killed the game through the unhandled-exception
  * report, while the reads in memcmp were caught). A call through a pointer the compiler cannot see through is covered. */
 static int cp_op_cmp(uint8_t *d, const uint8_t *s) { return memcmp(d, s, PG) != 0; }
 static int cp_op_copy(uint8_t *d, const uint8_t *s) { memcpy(d, s, PG); return 1; }
 static int cp_op_cond(uint8_t *d, const uint8_t *s) { if (memcmp(d, s, PG)) { memcpy(d, s, PG); return 1; } return 0; }
-static int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *) = cp_op_cmp;
+int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *) = cp_op_cmp;
 static int (*volatile cp_f_copy)(uint8_t *, const uint8_t *) = cp_op_copy;
 static int (*volatile cp_f_cond)(uint8_t *, const uint8_t *) = cp_op_cond;
 static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
