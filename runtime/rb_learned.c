@@ -1,7 +1,7 @@
 /* Track R4 (plan/phases/R4_state_map.md sections 6-9): THE LEARNED-SET SAVE. The snapshot ring (r1_ring.c) on the NORMAL game
  * build (ssbu_game_eh_o1.dll + the normal script modules + ssbu_native.exe): no second, "marked" compile of the game DLL and of
- * the modules is needed for rollback. Included by r1_ring.c; it uses the statics of r1_state.c / r1_ring.c (windows, shadow,
- * not-simulation maps, the ring's page ids). No game content in this file: only addresses of the game's allocator entry points
+ * the modules is needed for rollback. Its own translation unit: what it shares with r1_state.c / r1_ring.c (windows, not-simulation
+ * maps, the ring's page ids) is declared in r1_internal.h. No game content in this file: only addresses of the game's allocator entry points
  * and of three allocation sites (13.0.4 addresses, through GA(); hostrt.c maps them to 13.0.5).
  *
  * When: whenever the ring is wanted (SSBU_RB_NET online rollback / its loop test, SSBU_RB_SIM) and NO game DLL with store marks
@@ -35,16 +35,24 @@
  *   ls_capture_pages / ls_for_each_learned_page instead of rg_sweep when g_ls_active, ls_after_capture; r1_ring_rebase -> ls_new_base(); rgs_step (fight
  *   over) -> ls_fight_over(); r1_on_commit / r1_on_decommit / r1_wrote -> ls_range_event; ra_init: g_mark = mark_bind() || ls_use_exe_maps();
  *   r1_init -> ppool_init(); collect() -> ppool_bookkeeping; rgs_report -> ls_report(). */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <windows.h>
+#include "runtime.h"
+#include "hostrt.h"
+#include "r1_internal.h"
 /* ================================================================ PART 1: THE LEARNED SET
- * What this file needs from the rest of the translation unit (r1_ring.c includes it, r1_state.c includes r1_ring.c):
- *   r1_state.c  PG (page size 4096), WIN2 / WN2 (base and size of window 2), g_win1 / g_wn1 (window 1), g_ns1 / g_ns2 (not-simulation
- *               maps), g_dc (decommitted flags of window 1), g_r / g_nr (the ranges r1 saves), pm1 pm2 plo1 pn1 pn2 and r1_m1 r1_m2 r1_lo1
- *               r1_n1 r1_n2 (the mark maps), cp_add / cp_run / g_ncj / g_cp_cmp (the parallel page compare), g_audio_free, is_async,
- *               now_ms, LOG
- *   r1_ring.c   g_rg_cur (the slot being filled), rg_src / rg_addr (a page's newest ring value / its address), rgs_wanted
+ * What this file needs from r1_state.c and r1_ring.c, and what it gives them, is listed in r1_internal.h:
+ *   r1_state.c  PG, WIN2 / WN2, g_win1 / g_wn1 (the windows), g_ns1 / g_ns2 (not-simulation maps), g_dc (decommitted flags),
+ *               g_r / g_nr (the ranges r1 saves), pm1 pm2 plo1 pn1 pn2 and r1_m1 r1_m2 r1_lo1 r1_n1 r1_n2 (the mark maps),
+ *               cp_add / cp_run / g_ncj / g_cp_cmp (the parallel page compare), g_audio_free, is_async, now_ms, LOG
+ *   r1_ring.c   rg_current_slot_pages (pages recorded so far by the capture in progress), rg_src / rg_addr (a page's newest ring
+ *               value / its address), rgs_wanted
  *   hostrt.h    Ctx, ImportFn, GA, hook_install, guest_thread_info */
 static int g_ls_enabled = -1;                  /* tri-state: -1 not decided yet, 0 off, 1 on (ls_enabled) */
-static int g_ls_active;                        /* 1 from a base until the fight is over: pages are protected and the set is being built */
+int g_ls_active;                        /* 1 from a base until the fight is over: pages are protected and the set is being built */
 static int g_ls_compare_before_copy;           /* SSBU_LS_CMP (default 1): a capture compares each learned page with its newest value first */
 static int g_ls_fight_over_done;               /* ls_fight_over already ran for this fight */
 static volatile uint8_t *g_ls_page_state;      /* per page id (window 1 pages, then window 2 pages): 0 not tracked, 1 read-only, 2 learned, 3 being opened */
@@ -57,7 +65,7 @@ static volatile LONG g_ls_list_overflow;       /* pages that could not be added 
 static volatile LONG64 g_ls_faults, g_ls_fault_mod[5], g_ls_wrote_open, g_ls_dec_learn, g_ls_commit_prot, g_ls_spin, g_ls_refault, g_ls_protfail;
 static long long g_ls_prot_pages, g_ls_bases, g_ls_unprot_pages, g_ls_capture_count, g_ls_cap_pages, g_ls_cap_same; static double g_ls_prot_ms, g_ls_cmp_ms;
 static HMODULE g_ls_game_module, g_ls_exe_module;      /* module handles, to tell which module a faulting instruction is in */
-static volatile LONG64 g_read_retry;                    /* nnfs.c read_at: reads repeated after ERROR_NOACCESS (r1_read_retry_note) */
+volatile LONG64 g_read_retry;                    /* nnfs.c read_at: reads repeated after ERROR_NOACCESS (r1_read_retry_note) */
 typedef struct { uint64_t off; char mod[40]; long long n; } LsWriter;      /* a writer outside the game code: module, offset, first writes counted */
 static LsWriter g_ls_writers[64]; static int g_ls_nwriters; static SRWLOCK g_ls_writers_lock = SRWLOCK_INIT;
 /* Returns 1 when a game DLL that carries store marks is loaded (ssbu_game_r1.dll of older installs, the study's
@@ -83,7 +91,7 @@ static int ls_enabled(void) {
 /* When the learned set is on, points the mark-map pointers (pm1, pm2, plo1, pn1, pn2) at this exe's own variables
  * (r1_m1 ...). Nothing marks those but host code, so the ring relies on the learned page set instead of on marks.
  * Returns 1 when the learned set is on, 0 otherwise. */
-static int ls_use_exe_maps(void) {
+int ls_use_exe_maps(void) {
     if (!ls_enabled()) return 0;
     pm1 = &r1_m1; pm2 = &r1_m2; plo1 = &r1_lo1; pn1 = &r1_n1; pn2 = &r1_n2;
     LOG("r1: LS: the game DLL has no marks: the ring runs on the learned page set (page protection), maps of the exe\n");
@@ -188,7 +196,7 @@ static void ls_protect_all_pages(void) {
  * the list, reads the options (SSBU_LS_CMP, default on; SSBU_LS_DECAY), looks up the game DLL's and the exe's module
  * handles and installs ls_write_fault_handler. Every time: ls_protect_all_pages. Does nothing when the learned set is off
  * or a marked game DLL is loaded. */
-static void ls_start_after_base(void) {
+void ls_start_after_base(void) {
     if (!ls_enabled() || pm1 != &r1_m1) return;               /* (a marked game DLL is loaded: the marks are used) */
     g_ls_win1_pages = (size_t)(g_wn1 >> 12); g_ls_total_pages = g_ls_win1_pages + (size_t)(WN2 >> 12);
     if (!g_ls_page_state) {
@@ -208,7 +216,7 @@ static void ls_start_after_base(void) {
 /* Threads held. Calls fn(id, in_window2, index_in_window) for every page of the learned set except pages marked
  * not-simulation and (with SSBU_R1_AUDIO_FREE) asynchronous pages. The ring uses it in a load (restore every learned page)
  * and in a capture that does not compare first. */
-static void ls_for_each_learned_page(void (*fn)(uint32_t id, int w, size_t j)) {
+void ls_for_each_learned_page(void (*fn)(uint32_t id, int w, size_t j)) {
     LONG n = g_ls_learned_count; if (n > g_ls_learned_capacity) n = g_ls_learned_capacity;
     for (LONG k = 0; k < n; k++) {
         uint32_t v = g_ls_learned_ids[k]; if (!v) continue;     /* (being added right now by a host thread: the next capture has it) */
@@ -246,9 +254,9 @@ static void ls_decay_pass(void) {
  * (the default), every learned page is queued for a parallel compare with its newest ring value (cp_add; a page that is
  * zero or decommitted is taken as it is) and fn gets only the pages that changed; a changed page's capture number is
  * refreshed so the decay keeps it in the set. */
-static void ls_capture_pages(void (*fn)(uint32_t id, int w, size_t j)) {
+void ls_capture_pages(void (*fn)(uint32_t id, int w, size_t j)) {
     g_ls_capture_count++;
-    if (!g_ls_compare_before_copy) { long long b = g_rg_cur ? (long long)g_rg_cur->pages : 0; ls_for_each_learned_page(fn); if (g_rg_cur) g_ls_cap_pages += (long long)g_rg_cur->pages - b; return; }
+    if (!g_ls_compare_before_copy) { long long b = rg_current_slot_pages(); ls_for_each_learned_page(fn); g_ls_cap_pages += rg_current_slot_pages() - b; return; }
     double t0 = now_ms();
     if (g_ls_cmp_capacity < (size_t)g_ls_learned_count + 1024) { g_ls_cmp_capacity = (size_t)g_ls_learned_count * 2 + 65536; free(g_ls_cmp_ids); free(g_ls_cmp_list_index); free(g_ls_cmp_changed); g_ls_cmp_ids = malloc(g_ls_cmp_capacity * 4); g_ls_cmp_list_index = malloc(g_ls_cmp_capacity * 4); g_ls_cmp_changed = malloc(g_ls_cmp_capacity); }
     g_ls_cmp_count = 0; g_ncj = 0;
@@ -274,17 +282,17 @@ static void ls_capture_pages(void (*fn)(uint32_t id, int w, size_t j)) {
     }
 }
 /* Called after a capture's copies, threads held: runs the decay every g_ls_decay_every captures. */
-static void ls_after_capture(void) {
+void ls_after_capture(void) {
     if (g_ls_active && g_ls_decay_every > 0 && g_ls_capture_count % g_ls_decay_every == 0) ls_decay_pass();
 }
 /* A new base inside a fight (r1_ring_rebase, threads held): protects everything again with an empty learned set. */
-static void ls_new_base(void) {
+void ls_new_base(void) {
     if (!g_ls_page_state) return;
     ls_protect_all_pages();
 }
 /* The fight ended: every page still read-only is made writable again (menus and loading need no protection) and its state
  * goes back to 0. Logs the totals once per fight; does nothing when already done. */
-static void ls_fight_over(void) {
+void ls_fight_over(void) {
     if (!g_ls_page_state || g_ls_fight_over_done) return;
     g_ls_active = 0; g_ls_fight_over_done = 1;
     double t0 = now_ms(); long long n = 0;
@@ -305,7 +313,7 @@ static void ls_fight_over(void) {
  * guest memory through the kernel (file reads, which cannot fault): read-only pages are opened. 1: a decommit: the pages
  * become learned (the ring records "decommitted"). 2: a commit during the fight: new pages go read-only unless they are
  * learned. Addresses outside both windows and not-simulation pages are ignored. */
-static void ls_range_event(uint64_t a, uint64_t n, int what) {
+void ls_range_event(uint64_t a, uint64_t n, int what) {
     if (!g_ls_page_state || !n || !g_ls_active) return;
     size_t run = (size_t)-1, id = 0;
     for (uint64_t p = a & ~(uint64_t)(PG - 1); p < a + n; p += PG) {
@@ -345,7 +353,7 @@ static long long g_ppool_blocks_made, g_ppool_bytes, g_ppool_frees, g_ppool_doub
 static uint64_t g_ppool_sites[PPOOL_MAX_SITES][2]; static int g_ppool_nsites; static long long g_ppool_site_hits[PPOOL_MAX_SITES], g_ppool_site_double_frees[PPOOL_MAX_SITES];
 /* The pool's bookkeeping region (PPoolMeta) and its size rounded up to whole pages, so r1 copies it as an extra with the rest
  * of the state. Size 0 and NULL when there is no pool. */
-static uint8_t *ppool_bookkeeping(size_t *n) { *n = g_ppool_meta ? (sizeof(PPoolMeta) + PG - 1) & ~(size_t)(PG - 1) : 0; return (uint8_t *)g_ppool_meta; }
+uint8_t *ppool_bookkeeping(size_t *n) { *n = g_ppool_meta ? (sizeof(PPoolMeta) + PG - 1) & ~(size_t)(PG - 1) : 0; return (uint8_t *)g_ppool_meta; }
 /* 1 when address `p` lies inside the pool's reservation. */
 static int ppool_contains(uint64_t p) { return g_ppool_blocks && p >= (uint64_t)(uintptr_t)g_ppool_blocks && p < (uint64_t)(uintptr_t)g_ppool_blocks + PPOOL_RESERVE; }
 /* Lock held. A block of `n` bytes aligned to `align` from the pool, or 0 when there is no room (the caller then asks
@@ -491,7 +499,7 @@ static void ppool_hook_malloc_size(Ctx *c, void *u) {
  * the list of routed sites (the built-in rt_big3, or the file named by SSBU_LS_ROUTE, for tests), reserves the blocks'
  * region (never saved) and the bookkeeping region (saved with the state), allocates the block-to-site table and installs
  * the five jemalloc hooks. */
-static void ppool_init(void) {
+void ppool_init(void) {
     const char *fn = getenv("SSBU_LS_ROUTE");
     if (!ls_enabled() || (fn && (!*fn || !strcmp(fn, "0")))) return;
     if (fn) {                                            /* (test) a site file instead of the built-in list */
@@ -527,7 +535,7 @@ static void ppool_init(void) {
 }
 /* End-of-run report of the learned set and of the pool: counts, first-write faults by module, decay, capture costs and
  * pool use per site. Prints nothing when neither was used. */
-static void ls_report(void) {
+void ls_report(void) {
     if (!g_ls_page_state && !g_ppool_nsites) return;
     if (g_ls_page_state) {
         LOG("r1: LS report: bases %lld (%.1f ms protecting), pages made read-only %lld, writable again at fight ends %lld; learned set %ld pages (%.1f MB; list overflow %ld); first-write faults %lld: game DLL %lld, script modules %lld, exe %lld, other %lld, unknown %lld; repeated faults %lld, busy waits %lld, protect failures %lld; kernel-write opens (r1_wrote) %lld, decommits learned %lld, commits made read-only %lld; file reads repeated after ERROR_NOACCESS %lld\n",

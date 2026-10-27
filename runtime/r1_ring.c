@@ -106,13 +106,13 @@ static uint32_t rg_pool_get(void) {
 }
 static void rg_pool_put(uint32_t i) { if (i >= 2) g_rg_free[g_rg_nfree++] = i; }
 static uint8_t *rg_pool_ptr(uint32_t i) { return g_rg_pool + (size_t)(i - 2) * PG; }
-static uint8_t *rg_addr(uint32_t id) {
+uint8_t *rg_addr(uint32_t id) {
     if (id < g_rg_n1) return g_win1 + (size_t)id * PG;
     if (id < g_rg_n1 + g_rg_n2) return (uint8_t *)(uintptr_t)WIN2 + (size_t)(id - g_rg_n1) * PG;
     return g_rg_xa[id - g_rg_n1 - g_rg_n2];
 }
 /* the bytes of page `id` as recorded at the newest capture (NULL = zero page, (uint8_t *)1 = decommitted) */
-static uint8_t *rg_src(uint32_t id) {
+uint8_t *rg_src(uint32_t id) {
     uint32_t v = g_rg_idx[id];
     if (v >= 2) return rg_pool_ptr(v);
     if (v == RG_DECOM) return (uint8_t *)1;
@@ -155,7 +155,9 @@ static void rg_sweep(void (*fn)(uint32_t id, int w, size_t j)) {
     }
 }
 static RgSlot *g_rg_cur; static int g_rg_fail_now; static int g_rgs_left;
-#include "rb_learned.c"                              /* R4: the learned-set save (the ring on the normal, unmarked game build) */
+/* Pages the capture in progress has recorded so far (0 when none is in progress). rb_learned.c uses it to count the pages it adds. */
+long long rg_current_slot_pages(void) { return g_rg_cur ? (long long)g_rg_cur->pages : 0; }
+/* R4: the learned-set save (the ring on the normal, unmarked game build) is rb_learned.c, its own translation unit (r1_internal.h) */
 /* (R2 round 3) SSBU_RB_SIM_PAGES=1: the captured pages counted per 1 MB block and pass kind (0 real, 1 re-run with the skips, 2 the
  * last re-run pass): which memory a frame writes, and which of it only the presentation writes (absent from the skipped passes). */
 static int g_rgpg_on = -1; static int g_rgpg_kind; static long long g_rgpg_caps[3];
@@ -664,7 +666,7 @@ static double g_rgs_pass_t0, g_rgs_pass[2]; static long long g_rgs_npass[2];
 static double g_rgs_pl[2], g_rgs_plv[2][RG_NST / 4]; static long long g_rgs_npl[2]; static int g_rgs_nplv[2];      /* (round 3) re-run passes: 0 = skipped ones (not the last), 1 = the last one */
 static double g_rgs_pass_v[2][RG_NST / 4]; static int g_rgs_pass_nv[2];
 static int rbg_on(void); static void rbg_step(Ctx *c); static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry); static void rbg_report(void); static void rbg_fight_off(void);   /* R3: rb_rollback.c */
-static int rgs_wanted(void) {
+int rgs_wanted(void) {
     if (g_rgs_on < 0 && rbg_on()) { g_rgs_on = 1; g_rgs_n = 1 << 30; return 1; }      /* R3 online rollback (SSBU_RB_NET): the ring driven by the input queues */
     if (g_rgs_on < 0) { const char *e = getenv("SSBU_RB_SIM"); g_rgs_on = e && e[0] && e[0] != '0'; if (g_rgs_on) sscanf(e, "%d,%d,%d", &g_rgs_n, &g_rgs_k, &g_rgs_warm); if (g_rgs_k < 1) g_rgs_k = 1; if (g_rgs_k > RG_MAXSLOT - 1) g_rgs_k = RG_MAXSLOT - 1; if (g_rgs_n < 1) g_rgs_n = 1; }
     return g_rgs_on;

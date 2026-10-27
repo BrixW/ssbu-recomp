@@ -51,31 +51,27 @@ void r1_register_heap(void) { r1_on(); }
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "r1_internal.h"                         /* what rb_learned.c (its own translation unit) shares with this file */
 
 
-int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);
-int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));     /* os_threads.c */
 
-#define PG 4096
 #define MAXR 8192
-typedef struct { uint8_t *a; size_t n; uint8_t *s; uint8_t *dirty; uint8_t *learn; uint8_t *async; } Rng;   /* dirty / learn: one byte per page */
-static Rng g_r[MAXR];
-static int g_nr;
+Rng g_r[MAXR];
+int g_nr;
 static int g_on = -1, g_n, g_k, g_p, g_c, g_cycle, g_phase;        /* phase 0 idle, 1 first pass, 2 re-run, 3 done */
 static long long g_ff, g_target;
 static uint8_t *g_heap_base[8]; static int g_nheap;
 static Ctx g_ctx_save;
 static double g_qpf;
-static double now_ms(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / g_qpf; }
-static FILE *g_log;
+double now_ms(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / g_qpf; }
+FILE *g_log;
 static char g_born[2048]; static int g_nborn;
 static uint64_t g_catch_addr;
 __declspec(dllexport) uint8_t *r1_m1, *r1_m2;          /* the exe's own copy (r1src\sdklift_gen.c built with R1_MARK) */
 __declspec(dllexport) uint64_t r1_lo1, r1_n1, r1_n2;
 static int g_fast = -1, g_learn = 5, g_fcheck;
 static void async_learn(void); static void fast_report(void); static void fast_check(void); static void mark_report(void);
-#define LOG(...) do { fprintf(g_log, __VA_ARGS__); fflush(g_log); } while (0)
 
 /* end-of-first-pass copies of the pages the first pass changed */
 typedef struct { uint8_t *a; uint8_t d[PG]; } EPage;
@@ -89,7 +85,7 @@ static long long g_pass_frames;
 
 /* run-ahead (round 5): SSBU_RUNAHEAD=1 (or graphics.ini `runahead = on`, gfx_options.c); default OFF.
  * R2 (r1_ring.c): SSBU_RB_SIM (the snapshot ring's rollback simulation) uses the same machinery; default OFF. */
-static int rgs_wanted(void); static void rgs_step(Ctx *c); static int rgs_poll(void); static void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry); static int rgs_skip_now(void); static void rgs_report(void); static void rgp_wait_note(uint64_t lr, double dt);
+static void rgs_step(Ctx *c); static int rgs_poll(void); static void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry); static int rgs_skip_now(void); static void rgs_report(void); static void rgp_wait_note(uint64_t lr, double dt);
 static int ra_wanted(void) {
     static int w = -1;
     if (w < 0) { const char *e = getenv("SSBU_RUNAHEAD"); int gfx_runahead(void); w = rgs_wanted() || (e ? (e[0] && e[0] != '0') : gfx_runahead()); }
@@ -194,7 +190,6 @@ static int g_rs_drop;                                   /* set by the first save
 static int g_rb_test_nomem = -1;                        /* SSBU_RB_NET_TEST_NOMEM (test only): 1 = the commit check says no, 2 = an allocation of the full save fails, 3 = the ring's own allocations fail, 4 = the shadow's commit fails */
 static int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; } return g_rb_test_nomem; }
 static double g_save_need_mb, g_save_avail_mb;          /* the last commit check (MB) */
-static uint8_t *ppool_bookkeeping(size_t *n);              /* R4 (rb_learned.c) */
 static void collect(Ctx *c) {
     for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
     g_nr = 0;
@@ -285,7 +280,7 @@ static void threads_report(const char *when) {
 typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; } Th;
 /* (R3 hs16) cok: rsp / rip read by th_blocked while this thread is held (suspended by us ever since): live_rsps uses them
  * instead of asking Windows again (GetThreadContext of a thread blocked in the kernel costs ~20 us: 0.5 ms per capture) */
-static int g_audio_free;
+int g_audio_free;
 static void async_add(uint8_t *a);
 static long long g_th_audio_other;                   /* (R3 hs11) ring loads that took an audio thread at another wait (ra_hold_restore) */
 static Th g_th[256]; static int g_nth, g_th_mismatch, g_ninfo, g_park_ms = 500;
@@ -820,7 +815,7 @@ static void async_add(uint8_t *a) {
     g_async[g_nasync++] = a;
     qsort(g_async, g_nasync, sizeof *g_async, cmp_ptr);
 }
-static int is_async(uint8_t *a) { if (g_use_async < 0) g_use_async = getenv("SSBU_R1_FAST_ASYNC") != NULL || g_audio_free; return g_use_async && g_nasync && bsearch(&a, g_async, g_nasync, sizeof *g_async, cmp_ptr) != NULL; }
+int is_async(uint8_t *a) { if (g_use_async < 0) g_use_async = getenv("SSBU_R1_FAST_ASYNC") != NULL || g_audio_free; return g_use_async && g_nasync && bsearch(&a, g_async, g_nasync, sizeof *g_async, cmp_ptr) != NULL; }
 static void async_learn(void) {               /* main held 30 ms, the others running: what do they write? (ranges collected, buffers allocated) */
     for (int i = 0; i < g_nr; i++) memcpy(g_r[i].s, g_r[i].a, g_r[i].n);
     Sleep(30);
@@ -919,12 +914,10 @@ static void fast_check(void) {
 static int g_mark = -1, g_mcheck, g_prot_on, g_prot = -1;
 static void prot_all(int on); static void prot_report(void);
 static Ctx g_mctx;
-static uint8_t **pm1, **pm2; static uint64_t *plo1, *pn1, *pn2;
-static uint8_t *g_win1, *g_sh1, *g_sh1c, *g_sh2, *g_sh2c; static uint64_t g_wn1;
-static uint8_t *g_dc;
-static uint8_t *g_ns1, *g_ns2; static int is_nosim(uint8_t *a);
-#define WIN2 0x7100000000ull
-#define WN2 0x200000000ull
+uint8_t **pm1, **pm2; uint64_t *plo1, *pn1, *pn2;
+uint8_t *g_win1; static uint8_t *g_sh1, *g_sh1c, *g_sh2, *g_sh2c; uint64_t g_wn1;
+uint8_t *g_dc;
+uint8_t *g_ns1, *g_ns2; static int is_nosim(uint8_t *a);
 typedef struct { uint8_t *a; size_t n; uint8_t *b; } Extra;
 static Extra g_x[8192]; static int g_nx; static size_t g_xbytes;
 static double g_ms_s[4096], g_ms_r[4096], g_ms_scan[4096]; static size_t g_pg_s[4096], g_pg_r[4096]; static int g_nms, g_nmr;
@@ -1040,7 +1033,6 @@ static void mark_undo(void) {
     g_nx = 0; g_xbytes = 0; g_win1 = NULL; g_wn1 = 0;
 }
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
-static void ls_start_after_base(void);                      /* R4 (rb_learned.c) */
 static int mark_setup(void) {
     size_t big = 0; uint8_t *base = NULL;
     for (int i = 0; i < g_nheap; i++) {
@@ -1158,12 +1150,12 @@ static void blk1_init(void) {                           /* mark_setup, threads h
 /* Round 5 (cheaper copy, run-ahead only): the pages a sweep finds are copied by the main thread and SSBU_RUNAHEAD_COPY_THREADS
  * helper threads (default 2; 0 = the main thread alone), in equal shares. The extras go the same way (cp_add_range). */
 typedef struct { uint8_t *d; const uint8_t *s; } CopyJob;
-static CopyJob *g_cj; static size_t g_ncj, g_cjcap;
+static CopyJob *g_cj; size_t g_ncj; static size_t g_cjcap;
 static int g_ncp = -1;
 static HANDLE g_cp_go[8], g_cp_done[8];
-static void cp_add(uint8_t *d, const uint8_t *s) { if (g_ncj >= g_cjcap) { g_cjcap = g_cjcap ? g_cjcap * 2 : 65536; g_cj = realloc(g_cj, g_cjcap * sizeof *g_cj); } g_cj[g_ncj].d = d; g_cj[g_ncj].s = s; g_ncj++; }
+void cp_add(uint8_t *d, const uint8_t *s) { if (g_ncj >= g_cjcap) { g_cjcap = g_cjcap ? g_cjcap * 2 : 65536; g_cj = realloc(g_cj, g_cjcap * sizeof *g_cj); } g_cj[g_ncj].d = d; g_cj[g_ncj].s = s; g_ncj++; }
 static void cp_add_range(uint8_t *d, const uint8_t *s, size_t n) { for (size_t o = 0; o < n; o += PG) cp_add(d + o, s + o); }
-static uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the queued jobs are COMPARED (g_cp_cmp[i] = 1 if they differ), not copied */
+uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the queued jobs are COMPARED (g_cp_cmp[i] = 1 if they differ), not copied */
 /* (R3 net3) g_cp_cond set: each queued page is copied only if it differs from its source (a ring load: most learned pages
  * already hold the value being loaded; reading both is cheaper than writing the page); g_cp_wrote[k] counts the copies */
 static int g_cp_cond; static volatile long long g_cp_wrote[9];
@@ -1178,7 +1170,7 @@ static void cp_init(void) {
     SYSTEM_INFO si; GetSystemInfo(&si); if (g_ncp > (int)si.dwNumberOfProcessors - 2) g_ncp = (int)si.dwNumberOfProcessors > 2 ? (int)si.dwNumberOfProcessors - 2 : 0;
     for (int k = 0; k < g_ncp; k++) { g_cp_go[k] = CreateEventA(NULL, FALSE, FALSE, NULL); g_cp_done[k] = CreateEventA(NULL, FALSE, FALSE, NULL); HANDLE t = CreateThread(NULL, 0, cp_thread, (void *)(intptr_t)k, 0, NULL); SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); CloseHandle(t); }
 }
-static void cp_run(void) {                            /* every queued page, then the queue is empty */
+void cp_run(void) {                            /* every queued page, then the queue is empty */
     if (g_ncp > 0 && g_ncj >= 64) { for (int k = 0; k < g_ncp; k++) SetEvent(g_cp_go[k]); cp_part(0); WaitForMultipleObjects((DWORD)g_ncp, g_cp_done, TRUE, INFINITE); }
     else { int keep = g_ncp; g_ncp = 0; cp_part(0); g_ncp = keep; }
     g_ncj = 0;
