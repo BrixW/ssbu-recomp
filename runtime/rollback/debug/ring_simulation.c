@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Split out of r1_state.c; what it shares with the other rollback files is declared in game_state_internal.h. */
 #include "../model/game_state_internal.h"
+static void rgv_after(void);
+/* Functions and variables of other runtime files that only this file uses: */
+uint64_t guest_function_of(uint64_t rip);
 
 /* ---------------------------------------------------------------- the rollback simulation (SSBU_RB_SIM) */
 static DWORD g_rgp_main; static int g_rgs_prof; extern volatile int g_rgp_seg; static void rgs_samp_start(void);
@@ -319,7 +322,7 @@ static void rgv_blocks_report(void) {
     b[o] = 0;
     LOG("r1: RB VERIFY differing 64 KB blocks (%d, the 40 largest):%s\n", g_rgv_nb, b);
 }
-void rgv_after(void) {                               /* right after the capture of the re-run pass that reached the target */
+static void rgv_after(void) {                               /* right after the capture of the re-run pass that reached the target */
     long long d[3] = {0, 0, 0}, pages = (long long)g_rgv_n; char first[400]; int o = 0; first[0] = 0;
     for (size_t n = 0; n < g_rgv_n; n++) {
         uint32_t id = g_rgv_id[n];

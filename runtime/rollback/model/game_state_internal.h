@@ -150,9 +150,7 @@ typedef struct { uint64_t bump, committed; uint64_t head[48]; uint64_t allocs, f
 
 /* ---- variables one piece defines and another uses (the piece that defines each is named) */
 extern long long g_r1_fls_stale;    /* model/threads.c */
-extern DWORD g_r1_fls_idx;    /* model/threads.c */
 extern void (*g_r1_fiber_born)(void *);    /* model/tracking_experiments/write_marks.c */
-extern int g_r1_keep_fibers;    /* model/game_state.c */
 extern int g_cycle;    /* model/game_state.c */
 extern int g_phase;    /* model/game_state.c */
 extern long long g_ff;    /* model/game_state.c */
@@ -323,54 +321,12 @@ extern volatile int g_rgp_seg;    /* debug/ring_simulation.c */
 /* ---- functions one piece defines and another calls */
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));    /* model/game_state.c */
 void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stack_size, void *fiber));    /* model/threads.c */
-void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);    /* model/threads.c */
-void os_r1_fiber_get(uint64_t key, uint64_t v[6]);    /* model/threads.c */
-void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);    /* model/threads.c */
 DWORD os_r1_fiber_tid(uint64_t key);    /* model/threads.c */
-void *os_r1_fiber_fls(uint64_t key);    /* model/threads.c */
-void os_r1_fiber_put_fls(uint64_t key, void *fiber, void *fls);    /* model/threads.c */
-void *nnunwind_catch_table(size_t *bytes);    /* model/threads.c */
-void *fighter_host_fls_slot(void);    /* model/threads.c */
-void nvn_gl_r1_cb_area(void **cbs, void **ncbs, void **all);    /* model/threads.c */
 void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb);    /* model/threads.c */
 size_t nvn_r1_cb_save(void);    /* model/full_save.c */
 void nvn_r1_cb_restore(void);    /* model/full_save.c */
-uint64_t hook_address(const char *name);    /* model/runahead.c */
-int hook_install_name(const char *name, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);    /* model/runahead.c */
 int rbn_on(void);    /* controller/rollback_controller.c */
 void rbn_init(void);    /* controller/rollback_controller.c */
-void rbn_start(long long f0);    /* controller/rollback_controller.c */
-int rbn_started(void);    /* controller/rollback_controller.c */
-int rbn_local_player(void);    /* controller/rollback_controller.c */
-int rbn_ahead(void);    /* controller/rollback_controller.c */
-void rbn_local_pad(long long f, RbPad now);    /* controller/rollback_controller.c */
-RbPad rbn_pad(int player, long long f);    /* controller/rollback_controller.c */
-void rbn_drain(long long cur);    /* controller/rollback_controller.c */
-int rbn_take_mismatch(void);    /* controller/rollback_controller.c */
-long long rbn_confirmed(void);    /* controller/rollback_controller.c */
-int rbn_peer_gone(void);    /* controller/rollback_controller.c */
-void rbn_pass_hash(long long f);    /* controller/rollback_controller.c */
-void rbn_finalize(long long cur);    /* controller/rollback_controller.c */
-double rbn_pace_extra(long long f);    /* controller/rollback_controller.c */
-void rbn_report(FILE *o, long long frames);    /* controller/rollback_controller.c */
-int rbn_delay(void);    /* controller/rollback_controller.c */
-int rbn_rtt_ms(void);    /* controller/rollback_controller.c */
-double rbn_offset_ms(void);    /* controller/rollback_controller.c */
-void rbn_resend(void);    /* controller/rollback_controller.c */
-void rbn_status(char *out, size_t n);    /* controller/rollback_controller.c */
-void rbn_hello(void);    /* controller/rollback_controller.c */
-int rbn_peer_started(void);    /* controller/rollback_controller.c */
-void rbn_choose_delay(void);    /* controller/rollback_controller.c */
-int rbn_match_cancelled(void);    /* controller/rollback_controller.c */
-void rbn_match_reset(void);    /* controller/rollback_controller.c */
-int rbn_match_number(void);    /* controller/rollback_controller.c */
-void rbn_set_lockstep(int on);    /* controller/rollback_controller.c */
-int rbn_loop(void);    /* controller/rollback_controller.c */
-void input_mark(const char *what);    /* controller/rollback_controller.c */
-void rbn_put_mismatch(int m);    /* controller/rollback_controller.c */
-void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb);    /* model/snapshot_ring.c */
-void nnunwind_catch_free(unsigned i);    /* model/snapshot_ring.c */
-uint64_t guest_function_of(uint64_t rip);    /* debug/ring_simulation.c */
 int ra_wanted(void);    /* model/game_state.c */
 int r1_on(void);    /* model/game_state.c */
 int rw(DWORD p);    /* model/memory_map.c */
@@ -409,7 +365,6 @@ void fast_save(Ctx *c);    /* model/tracking_experiments/fast_save.c */
 void fast_restore(Ctx *c);    /* model/tracking_experiments/fast_save.c */
 int cmp_d(const void *a, const void *b);    /* model/tracking_experiments/fast_save.c */
 void fast_report(void);    /* model/tracking_experiments/fast_save.c */
-void fast_check(void);    /* model/tracking_experiments/fast_save.c */
 int mark_bind(void);    /* model/tracking_experiments/write_marks.c */
 uint8_t *in_shadow(uint8_t *a, uint8_t **cmap, size_t *pi);    /* model/tracking_experiments/write_marks.c */
 int sh_commit(uint8_t *sh, uint8_t *cmap, size_t pi);    /* model/tracking_experiments/write_marks.c */
@@ -460,7 +415,6 @@ void rgs_step(Ctx *c);    /* debug/ring_simulation.c */
 void rgp_wait_note(uint64_t lr, double dt);    /* debug/ring_simulation.c */
 void rgs_lite_init(void);    /* debug/ring_simulation.c */
 void rgv_before(int si, long long target);    /* debug/ring_simulation.c */
-void rgv_after(void);    /* debug/ring_simulation.c */
 int rgs_skip_now(void);    /* debug/ring_simulation.c */
 int rgs_poll(void);    /* debug/ring_simulation.c */
 void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry);    /* debug/ring_simulation.c */

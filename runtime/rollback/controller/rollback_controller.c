@@ -14,6 +14,36 @@
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "../model/game_state_internal.h"
+/* Functions and variables of other runtime files that only this file uses: */
+void rbn_start(long long f0);
+int rbn_started(void);
+int rbn_local_player(void);
+int rbn_ahead(void);
+void rbn_local_pad(long long f, RbPad now);
+RbPad rbn_pad(int player, long long f);
+void rbn_drain(long long cur);
+int rbn_take_mismatch(void);
+long long rbn_confirmed(void);
+int rbn_peer_gone(void);
+void rbn_pass_hash(long long f);
+void rbn_finalize(long long cur);
+double rbn_pace_extra(long long f);
+void rbn_report(FILE *o, long long frames);
+int rbn_delay(void);
+int rbn_rtt_ms(void);
+double rbn_offset_ms(void);
+void rbn_resend(void);
+void rbn_status(char *out, size_t n);
+void rbn_hello(void);
+int rbn_peer_started(void);
+void rbn_choose_delay(void);
+int rbn_match_cancelled(void);
+void rbn_match_reset(void);
+int rbn_match_number(void);
+void rbn_set_lockstep(int on);
+int rbn_loop(void);
+void input_mark(const char *what);
+void rbn_put_mismatch(int m);
 #include "../rollback.h"
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);

@@ -2,6 +2,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Split out of r1_state.c; what it shares with the other rollback files is declared in game_state_internal.h. */
 #include "game_state_internal.h"
+/* Functions and variables of other runtime files that only this file uses: */
+extern DWORD g_r1_fls_idx;
+void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);
+void os_r1_fiber_get(uint64_t key, uint64_t v[6]);
+void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);
+void *os_r1_fiber_fls(uint64_t key);
+void os_r1_fiber_put_fls(uint64_t key, void *fiber, void *fls);
+void *nnunwind_catch_table(size_t *bytes);
+void *fighter_host_fls_slot(void);
+void nvn_gl_r1_cb_area(void **cbs, void **ncbs, void **all);
 
 /* ---------------------------------------------------------------- nn::os objects (compared, not restored) */
 

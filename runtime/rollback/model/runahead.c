@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Split out of r1_state.c; what it shares with the other rollback files is declared in game_state_internal.h. */
 #include "game_state_internal.h"
+/* Functions and variables of other runtime files that only this file uses: */
+uint64_t hook_address(const char *name);
+int hook_install_name(const char *name, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);
 
 /* ---------------------------------------------------------------- R1 round 5: RUN-AHEAD of one frame (SSBU_RUNAHEAD=1 or
  * graphics.ini `runahead = on`; default OFF; needs the marks: ssbu_game_p15r1.dll + the marked modules).

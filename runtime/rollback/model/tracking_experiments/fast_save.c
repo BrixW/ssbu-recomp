@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Split out of r1_state.c; what it shares with the other rollback files is declared in game_state_internal.h. */
 #include "../game_state_internal.h"
+static void fast_check(void);
 
 /* ---------------------------------------------------------------- R1 round 2: the fast save (SSBU_R1_FAST=1)
  * The first SSBU_R1_LEARN cycles (default 5) are full ones (above): they learn the pages the simulation changes (union
@@ -91,7 +92,7 @@ void fast_report(void) {
         g_nfs, g_nfr, ss / g_nfs, g_fs_ms[g_nfs / 2], g_fs_ms[g_nfs * 99 / 100], g_fs_ms[g_nfs - 1], rs / g_nfr, g_fr_ms[g_nfr / 2], g_fr_ms[g_nfr * 99 / 100], g_fr_ms[g_nfr - 1], g_nfp);
 }
 /* SSBU_R1_FAST_CHECK: after a fast restore, the full snapshot taken at the same save says which pages the set missed */
-void fast_check(void) {
+static void fast_check(void) {
     size_t miss = 0; int shown = 0;
     for (int i = 0; i < g_nr; i++) {
         Rng *r = &g_r[i];

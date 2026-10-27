@@ -29,6 +29,9 @@
  * against a run without it and every re-run frame against the frame it replays. SSBU_RB_SIM_SKIP=<mask>: run-ahead's
  * kick-skip mask in re-run passes except the last one (experiment). SSBU_RB_PARK_MS (default 30): hold limit. */
 #include "game_state_internal.h"
+/* Functions and variables of other runtime files that only this file uses: */
+void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb);
+void nnunwind_catch_free(unsigned i);
 
 extern volatile int g_rgp_seg;                            /* (R2 round 3, profile 3: which part of a pass main is in) */
 

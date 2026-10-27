@@ -52,6 +52,8 @@ void r1_register_heap(void) { r1_on(); }
 #include "runtime.h"
 #include "hostrt.h"
 #include "game_state_internal.h"                         /* what rb_learned.c (its own translation unit) shares with this file */
+/* Functions and variables of other runtime files that only this file uses: */
+extern int g_r1_keep_fibers;
 
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));     /* os_threads.c */
 
