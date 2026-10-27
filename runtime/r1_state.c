@@ -1167,10 +1167,25 @@ static uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the q
 /* (R3 net3) g_cp_cond set: each queued page is copied only if it differs from its source (a ring load: most learned pages
  * already hold the value being loaded; reading both is cheaper than writing the page); g_cp_wrote[k] counts the copies */
 static int g_cp_cond; static volatile long long g_cp_wrote[9];
+/* (2026-10-27) A page that the game decommitted after the ring listed it (the extras are the ranges committed at the last full save; jemalloc
+ * purges its arena afterwards, and a guest thread's stack / TLS goes away with the thread) faults when a job reads or writes it: c0000005 in
+ * the first capture's compare (joiner of a Local Wireless room match). The job is skipped instead (its compare reads "equal", its restore is
+ * not done: the page is gone) and counted in g_cp_fault. A guard per page costs nothing when no page faults (x64 SEH is table driven); a VirtualQuery
+ * per region before every capture did the same check and cost 26 ms per capture once the extras were fragmented (measured, Ryzen 9 7900X). */
+static volatile LONG64 g_cp_fault;
+/* The page operations go through a volatile function pointer: clang 9 builds the __try's scope table only from calls that may throw, and treats memcpy / memcmp
+ * (builtins, nounwind) as unable to, so a fault inside them was NOT caught (found 2026-10-27: a write fault in memcpy killed the game through the unhandled-exception
+ * report, while the reads in memcmp were caught). A call through a pointer the compiler cannot see through is covered. */
+static int cp_op_cmp(uint8_t *d, const uint8_t *s) { return memcmp(d, s, PG) != 0; }
+static int cp_op_copy(uint8_t *d, const uint8_t *s) { memcpy(d, s, PG); return 1; }
+static int cp_op_cond(uint8_t *d, const uint8_t *s) { if (memcmp(d, s, PG)) { memcpy(d, s, PG); return 1; } return 0; }
+static int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *) = cp_op_cmp;
+static int (*volatile cp_f_copy)(uint8_t *, const uint8_t *) = cp_op_copy;
+static int (*volatile cp_f_cond)(uint8_t *, const uint8_t *) = cp_op_cond;
 static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
-    if (g_cp_cmp) { for (size_t i = a; i < b; i++) g_cp_cmp[i] = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; }
-    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) if (memcmp(g_cj[i].d, g_cj[i].s, PG)) { memcpy(g_cj[i].d, g_cj[i].s, PG); w++; } g_cp_wrote[k < 9 ? k : 8] += w; }
-    else for (size_t i = a; i < b; i++) memcpy(g_cj[i].d, g_cj[i].s, PG); }
+    if (g_cp_cmp) { for (size_t i = a; i < b; i++) { int d = 0; __try { d = cp_f_cmp(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { d = 0; InterlockedIncrement64(&g_cp_fault); } g_cp_cmp[i] = (uint8_t)d; } }
+    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) { __try { w += cp_f_cond(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_cp_fault); } } g_cp_wrote[k < 9 ? k : 8] += w; }
+    else for (size_t i = a; i < b; i++) { __try { cp_f_copy(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_cp_fault); } } }
 static DWORD WINAPI cp_thread(void *p) { int k = (int)(intptr_t)p; for (;;) { WaitForSingleObject(g_cp_go[k], INFINITE); cp_part(k + 1); SetEvent(g_cp_done[k]); } return 0; }
 static void cp_init(void) {
     if (g_ncp >= 0) return;
