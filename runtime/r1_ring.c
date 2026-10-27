@@ -369,6 +369,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
     static uint8_t *xdiff; static size_t xdn; if (xdn < g_rg_nx + 1) { free(xdiff); xdn = g_rg_nx + 1; xdiff = calloc(xdn, 1); }   /* (hs12: the extras can change at a rebase) */
     static uint32_t *xjob; static size_t xjn; size_t nxj = 0;
     if (xjn < g_rg_nx + 1) { free(xjob); xjn = g_rg_nx + 1; xjob = malloc(xjn * sizeof *xjob); }
+    xww_poll();                                           /* (LS-X-WW) the pages the OS saw written since the last poll join the set */
     for (size_t e = 0; e < g_rg_nx; e++) {      /* (round 3) extras compared by main + the copy threads: not the pages of the extras' learned set that were never written (rb_learned.c, LS-X), nor a page not committed now; xjob[q] = the extras page of compare job q */
         if (xls_skip(e)) continue;
         xjob[nxj++] = (uint32_t)e; cp_add(g_rg_xa[e], rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e)));
@@ -631,6 +632,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     g_rg_count = si + 1;
     if (g_ls_active) ls_each(rg_load_page); else rg_sweep(rg_load_page);      /* written since the newest capture (R4: the learned set) */
     {   size_t nl = 0;
+        xww_poll();                                       /* (LS-X-WW) written since the newest capture */
         for (size_t e = 0; e < g_rg_nx; e++) { if (xls_skip(e)) continue; rg_touch((uint32_t)(g_rg_n1 + g_rg_n2 + e)); nl++; }      /* (LS-X: an extras page never written since the base still holds its value at every state) */
         g_xls_loads++; g_xls_loadpages += (long long)nl; }
     size_t pages = g_rg_ntl; g_rg_ldpg += (long long)pages;

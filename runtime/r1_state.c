@@ -41,6 +41,9 @@ void r1_init(void) { r1_on(); }
 void r1_on_decommit(void *p, size_t n) { (void)p; (void)n; }
 void r1_on_commit(void *p, size_t n) { (void)p; (void)n; }
 void r1_wrote(uint64_t a, uint64_t n) { (void)a; (void)n; }
+void r1_ww_note(void *const *pages, size_t cnt) { (void)pages; (void)cnt; }
+void r1_ww_note_range(const void *p, size_t n) { (void)p; (void)n; }
+int r1_ww_taken(const void *p, size_t n) { (void)p; (void)n; return 0; }
 void r1_nosim(uint64_t a, uint64_t n) { (void)a; (void)n; }
 void r1_read_retry_note(void) {}
 void r1_register_heap(void) { r1_on(); }
