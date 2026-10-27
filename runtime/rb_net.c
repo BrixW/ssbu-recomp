@@ -670,10 +670,10 @@ void rbn_choose_delay(void) {
 int rbn_started(void) { return g_started; }
 int rbn_delay(void) { return g_started ? g_delay : 0; }
 static void send_pads(void) {
-    long long newest = rb_input_local_latest();
+    long long newest = rb_input_local_newest_frame();
     if (newest < 1 || g_loop) return;
     RbMsg m; memset(&m, 0, sizeof m);
-    m.type = RB_MSG_PADS; m.player = g_local; m.newest = (int32_t)newest; m.ack = rb_input_remote_latest(g_remote);
+    m.type = RB_MSG_PADS; m.player = g_local; m.newest = (int32_t)newest; m.ack = rb_input_remote_newest_consecutive_frame(g_remote);
     long long from = g_peer_ack + 1; if (newest - from + 1 > RB_MAX_PADS_PER_MSG) from = newest - RB_MAX_PADS_PER_MSG + 1; if (from < 1) from = 1;
     for (long long f = newest; f >= from; f--) { RbPad p; if (!rb_input_local_get((int)f, &p)) break; m.pads[m.count++] = p; }
     long long cf = g_hfinal_upto;
@@ -730,7 +730,7 @@ void rbn_drain(long long cur) {
         int lat = lat2_from >= 0 && cur >= lat2_from ? lat2 : g_loop_lat;
         if (jit) { uint32_t h = mix32(jseed * 0x9E3779B9u ^ (uint32_t)(cur / (4 + (mix32(jseed) % 17))) * 0x85EBCA6Bu); lat -= (int)(h & 1); }
         long long upto = cur + g_delay - lat;
-        for (long long f = rb_input_remote_latest(g_remote) + 1; f <= upto; f++) rb_input_remote_put(g_remote, (int)f, loop_remote_pad(f));
+        for (long long f = rb_input_remote_newest_consecutive_frame(g_remote) + 1; f <= upto; f++) rb_input_remote_put(g_remote, (int)f, loop_remote_pad(f));
         return;
     }
     if (rbn_handshake_wanted()) hs_block_compare();
@@ -749,13 +749,13 @@ void rbn_drain(long long cur) {
         if (m.type != RB_MSG_PADS || !g_started || m.player != g_remote) continue;
         g_peer_started = 1;
         for (int k = 0; k < m.count; k++) rb_input_remote_put(g_remote, m.newest - k, m.pads[k]);
-        if (m.ack > g_peer_ack && m.ack <= rb_input_local_latest()) g_peer_ack = m.ack;      /* (hs12: never an acknowledgement of pads not sent yet) */
+        if (m.ack > g_peer_ack && m.ack <= rb_input_local_newest_frame()) g_peer_ack = m.ack;      /* (hs12: never an acknowledgement of pads not sent yet) */
         if (m.check_frame > 0) on_check(m.check_frame, m.check);
     }
 }
 int rbn_take_mismatch(void) { int m = rb_input_take_mismatch(); if (m) g_stat_mis++; return m; }
 void rbn_put_mismatch(int m) { rb_input_put_mismatch(m); if (m) g_stat_mis--; }      /* (R3 pub1) r1_ring_load refused: the wrong guess stays pending */
-long long rbn_confirmed(void) { return rb_input_remote_latest(g_remote); }
+long long rbn_confirmed(void) { return rb_input_remote_newest_consecutive_frame(g_remote); }
 int rbn_peer_gone(void) {
     if (g_loop || !g_started) return 0;
     LONG64 last = g_rx_last_ms;
@@ -824,7 +824,7 @@ static void detail_frame(long long f) {              /* frame f is final: the pa
 }
 /* no rollback pending: every frame up to min(cur, newest remote pad) is final */
 void rbn_finalize(long long cur) {
-    long long upto = rb_input_remote_latest(g_remote);
+    long long upto = rb_input_remote_newest_consecutive_frame(g_remote);
     if (upto > cur) upto = cur;
     for (long long f = g_hfinal_upto + 1; f <= upto; f++) {
         if (g_hlog && g_hframe[f % HR] == f) fprintf(g_hlog, "f %lld h %016llx\n", f, (unsigned long long)g_hash[f % HR]);
@@ -860,14 +860,14 @@ void rbn_resend(void) { if (g_started) send_pads(); }
 void rbn_hello(void) {
     if (!g_started || g_loop) return;
     { static int n; if (rbn_handshake_wanted() && n++ < 20 && (n % 4) == 0) hs_block_send(); }   /* (the block check again, a few times) */
-    if (rb_input_local_latest() >= 1) { send_pads(); return; }
+    if (rb_input_local_newest_frame() >= 1) { send_pads(); return; }
     RbMsg m; memset(&m, 0, sizeof m); m.type = RB_MSG_PADS; m.player = g_local; m.newest = 0; m.count = 0; send_msg(&m);
 }
 int rbn_peer_started(void) { return g_loop || g_peer_started; }
 void rbn_status(char *out, size_t n) {
     LONG q = (g_rq_head - g_rq_tail + RQ_N) % RQ_N;
     snprintf(out, n, "remote pads up to %d, local up to %d, the other game has ours up to %lld; packets sent %lld received %lld (bad %lld, queue %ld, full %lld)",
-             rb_input_remote_latest(g_remote), rb_input_local_latest(), g_peer_ack, (long long)g_tx_pkts, (long long)g_rx_pkts, (long long)g_rx_bad, (long)q, (long long)g_rx_drop);
+             rb_input_remote_newest_consecutive_frame(g_remote), rb_input_local_newest_frame(), g_peer_ack, (long long)g_tx_pkts, (long long)g_rx_pkts, (long long)g_rx_bad, (long)q, (long long)g_rx_drop);
 }
 double rbn_offset_ms(void) { return rb_ts_offset() / 1000.0; }
 
@@ -900,6 +900,6 @@ void rbn_report(FILE *o, long long frames) {
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
-            (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
+            (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_newest_consecutive_frame(g_remote), rb_input_local_newest_frame());
     fflush(o);
 }

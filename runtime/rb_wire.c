@@ -8,13 +8,17 @@
 #include <string.h>
 #include "rb.h"
 
+/* Little-endian writers: the value's bytes, least significant first, at p. */
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+/* Little-endian readers: the value stored at p by the matching put. */
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t get32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) | (uint64_t)get32(p + 4) << 32; }
 
+/* Writes message `m` (type chosen by m->type) into `b`, which holds `cap` bytes. Returns the number of bytes written,
+ * or 0 when the message does not fit, its type is unknown, or a PADS message carries too many pads. */
 size_t rb_msg_build(uint8_t *b, size_t cap, const RbMsg *m) {
     switch (m->type) {
     case RB_MSG_PADS: {
@@ -39,6 +43,9 @@ size_t rb_msg_build(uint8_t *b, size_t cap, const RbMsg *m) {
     return 0;
 }
 
+/* Reads the `len` bytes at `b` into *m (zeroed first). Returns 1 for a well-formed message and 0 for anything else: too short,
+ * wrong length for its type, a player or pad count out of range, or frame numbers that cannot exist (frames count from 1).
+ * Nothing in the message is trusted before it has been checked, so it is safe to call on bytes from the network. */
 int rb_msg_parse(const uint8_t *b, size_t len, RbMsg *m) {
     memset(m, 0, sizeof *m);
     if (len < 1) return 0;

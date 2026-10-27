@@ -126,7 +126,7 @@ int main(void) {
             if (!rb_msg_parse(b, n, &m) || m.type != RB_MSG_PADS) continue;
             for (int i = 0; i < m.count; i++) rb_input_remote_put(m.player, m.newest - i, m.pads[i]);
         }
-        peer_ack_of_theirs = rb_input_remote_latest(1);
+        peer_ack_of_theirs = rb_input_remote_newest_consecutive_frame(1);
         /* our own pad for this frame */
         rb_input_local(f, human(0, f));
         /* a misprediction since the last frame: roll back to it and simulate again up to the frame before */
@@ -156,7 +156,7 @@ int main(void) {
         RbPad a = f <= 2 ? (RbPad){0} : rb_pad_rest(human(0, f - 2)), bb = f <= 2 ? (RbPad){0} : rb_pad_rest(human(1, f - 2));
         ref = step(ref, &a, &bb);
     }
-    CHECK(rb_input_remote_latest(1) >= SIDE_FRAMES, "remote pads all received: %d", rb_input_remote_latest(1));
+    CHECK(rb_input_remote_newest_consecutive_frame(1) >= SIDE_FRAMES, "remote pads all received: %d", rb_input_remote_newest_consecutive_frame(1));
     CHECK(s.state[SIDE_FRAMES] == ref, "final state %016llx != perfect-input state %016llx", (unsigned long long)s.state[SIDE_FRAMES], (unsigned long long)ref);
     printf("rb_test: %d rollbacks, %d frames simulated again, deepest %d frames; %s\n", s.rollbacks, s.rolled_frames, s.max_back, fails ? "FAILED" : "all passed");
     return fails ? 1 : 0;

@@ -23,11 +23,11 @@ RbPad rb_pad_rest(RbPad p);                        /* the stick clamp both sides
 int rb_pad_equal(const RbPad *a, const RbPad *b);
 /* the local player's pad read at `frame`: kept for frame + delay; returns the pad that applies at `frame` (empty in the first frames) */
 RbPad rb_input_local(int frame, RbPad now);
-int rb_input_local_latest(void);                   /* newest frame with a local pad (frame + delay of the last call) */
+int rb_input_local_newest_frame(void);            /* newest frame with a local pad (frame + delay of the last call) */
 int rb_input_local_get(int frame, RbPad *out);     /* 1 when that frame's local pad is known (to send it again) */
 /* a pad of player `p` for `frame` from the network; a frame already known is ignored (redundant copies) */
 void rb_input_remote_put(int p, int frame, RbPad pad);
-int rb_input_remote_latest(int p);                 /* newest consecutive frame received from player p (0 = none) */
+int rb_input_remote_newest_consecutive_frame(int p);   /* newest consecutive frame received from player p (0 = none) */
 /* the pad player p uses at `frame`: the real one, or the last real one repeated (*predicted = 1, recorded for the check) */
 RbPad rb_input_get(int p, int frame, int *predicted);
 /* the earliest frame whose prediction was wrong since the last call, or 0; the caller rolls back to it */
