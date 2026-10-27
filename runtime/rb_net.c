@@ -25,11 +25,7 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
-#include "rb.h"
-#include "rb_input.c"
-#include "rb_wire.c"
-#include "rb_timesync.c"
-#undef M
+#include "rb.h"                                         /* rb_input.c, rb_wire.c, rb_timesync.c are units of their own (build.py); rb.h is their API */
 #include "net_stats.h"                                  /* (R3 net3) NetMatch, MM_*: the lobby's opponent search (net_relay.c) */
 
 int net_rb_send(const void *p, int n);                 /* net_relay.c: 1 = sent (or queued by the latency simulation) */
