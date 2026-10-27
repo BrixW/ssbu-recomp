@@ -277,7 +277,7 @@ static uint64_t hash40(const char *s) {
  * + 0x3d comes from state + 0x54 .. + 0x69 when state + 0x454 is set (or + 0x455 with type 0), else for a human from the
  * name-tag profile state + 0x214 (table [[[[0x7105313510] + 0x58]]] + 0xf7d8 * profile + 0xc, default 0x7105313518).
  * Both games force + 0x454 = 1 with the agreed layout of each player, so a player's own controls are the same on both PCs. */
-#include "rb_hs.h"
+#include "rollback/services/handshake.h"
 static int g_hs_wanted, g_hs_ok, g_hs_local, g_hs_lwr;      /* (R3 lwr) g_hs_lwr: a Local Wireless room's match played with rollback */
 static RbhMatch g_hs_m;
 /* (hs12) player 1's panel state as the game's function got it (before any change here): the template of player 2's state

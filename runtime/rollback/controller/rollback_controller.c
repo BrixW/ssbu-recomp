@@ -13,7 +13,7 @@
  *    wait), and for the other player when it is more than SSBU_RB_NET_AHEAD frames behind.
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
-#include "rb.h"
+#include "../rollback.h"
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
 void rbn_drain(long long cur); int rbn_take_mismatch(void); long long rbn_confirmed(void); int rbn_peer_gone(void);

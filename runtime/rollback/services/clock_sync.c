@@ -5,7 +5,7 @@
  *   them, one per 5 frames). The thresholds follow Slippi's netplay (study N1b section 6). SPDX-License-Identifier: GPL-3.0-or-later */
 #include <stdlib.h>
 #include <string.h>
-#include "rb.h"
+#include "../rollback.h"
 
 #define SAMPLE_COUNT 30                    /* offset samples kept (one per input message) */
 static int32_t g_samples[SAMPLE_COUNT];    /* ring of the latest offsets, in microseconds (positive = this side is ahead) */

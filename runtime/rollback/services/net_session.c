@@ -25,7 +25,7 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
-#include "rb.h"                                         /* rb_input.c, rb_wire.c, rb_timesync.c are units of their own (build.py); rb.h is their API */
+#include "../rollback.h"                                         /* rb_input.c, rb_wire.c, rb_timesync.c are units of their own (build.py); rb.h is their API */
 #include "net_stats.h"                                  /* (R3 net3) NetMatch, MM_*: the lobby's opponent search (net_relay.c) */
 
 int net_rb_send(const void *p, int n);                 /* net_relay.c: 1 = sent (or queued by the latency simulation) */
@@ -104,7 +104,7 @@ int rbn_bot_on(void) { return g_bot; }
  * set-up), Esc (game window in front) or B held on a controller stops waiting, the wait limit is SSBU_RB_NET_HS_WAIT
  * (seconds, default 120). No agreement = this match is played locally (Final Destination, one stock) and left at once
  * (rb_rollback.c: player 1 walks off the stage), back to the menus; the other game is told (REFUSE) so that it stops waiting. */
-#include "rb_hs.h"
+#include "handshake.h"
 #define RBH_PROTO 5                                     /* 3 (hs12): RbhMatch carries the stage set-up context; 4 (hs14): PADS end with a mode byte, the stage is drawn from both picks; 5 (R3 lwr): Local Wireless room matches, LAYOUT */
 enum { RBH_CHOICE = 0x48, RBH_PROPOSE = 0x49, RBH_ACCEPT = 0x4a, RBH_REFUSE = 0x4b, RBH_BLOCK = 0x4c, RBH_LAYOUT = 0x4d };      /* (R3 lwr) LAYOUT: a room match, each game's own player's control layout */
 #pragma pack(push, 1)

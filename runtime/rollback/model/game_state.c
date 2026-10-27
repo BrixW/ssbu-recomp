@@ -51,7 +51,7 @@ void r1_register_heap(void) { r1_on(); }
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
-#include "r1_internal.h"                         /* what rb_learned.c (its own translation unit) shares with this file */
+#include "game_state_internal.h"                         /* what rb_learned.c (its own translation unit) shares with this file */
 
 
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));     /* os_threads.c */
@@ -1803,8 +1803,8 @@ static void ra_report(void) {
     for (long long i = printed; i < g_ra_nkind; i += 200, printed = i < g_ra_nkind ? i : g_ra_nkind) LOG("r1: RA kinds %lld: %.*s\n", i + 1, (int)(g_ra_nkind - i < 200 ? g_ra_nkind - i : 200), g_ra_kind + i);
     if (rgs_wanted()) rgs_report();
 }
-#include "r1_ring.c"                                  /* R2: the snapshot ring (rollback) */
-#include "rb_rollback.c"                              /* R3: online rollback on the ring (SSBU_RB_NET) */
+#include "snapshot_ring.c"                                  /* R2: the snapshot ring (rollback) */
+#include "../controller/rollback_controller.c"                              /* R3: online rollback on the ring (SSBU_RB_NET) */
 static void ra_init(void) {
     g_ra = 1;
     if (getenv("SSBU_RUNAHEAD_PARK_MS")) g_ra_park_ms = atof(getenv("SSBU_RUNAHEAD_PARK_MS"));

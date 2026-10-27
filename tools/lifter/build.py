@@ -35,11 +35,11 @@ PLAT_FLAGS += MACOS_MIN
 PLAT_FLAGS += ['-mcx16'] if TARGET_LINUX else []
 CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'nnpad_gca.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
-                'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'r1_state.c', 'rb_learned.c',
-                'loose_host.c', 'osk.c', 'nnldn.c', 'net_relay.c', 'rb_net.c', 'rb_input.c', 'rb_wire.c', 'rb_timesync.c']    # the new fighters' file layer (loose_files.c): off unless SSBU_CHARACTERS / SSBU_LOOSE_FILES is set
+                'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'rollback/model/game_state.c', 'rollback/model/page_tracker_learned.c',
+                'loose_host.c', 'osk.c', 'nnldn.c', 'net_relay.c', 'rollback/services/net_session.c', 'rollback/model/input_history.c', 'rollback/services/wire_format.c', 'rollback/services/clock_sync.c']    # the new fighters' file layer (loose_files.c): off unless SSBU_CHARACTERS / SSBU_LOOSE_FILES is set
 # nnldn.c / net_relay.c: online play over the game's Local Wireless (plan/phases/N3_local_wireless_online.md), off unless SSBU_ONLINE
 # (taken only when present: a tree without the online files, e.g. a public one before they are published, still links)
-HOST_SOURCES[:] = [n for n in HOST_SOURCES if n not in ('nnldn.c', 'net_relay.c', 'rb_net.c', 'rb_input.c', 'rb_wire.c', 'rb_timesync.c') or os.path.exists(os.path.join(HERE, n))]   # rb_net.c: online rollback (R3), off unless SSBU_RB_NET
+HOST_SOURCES[:] = [n for n in HOST_SOURCES if n not in ('nnldn.c', 'net_relay.c', 'rollback/services/net_session.c', 'rollback/model/input_history.c', 'rollback/services/wire_format.c', 'rollback/services/clock_sync.c') or os.path.exists(os.path.join(HERE, n))]   # rb_net.c: online rollback (R3), off unless SSBU_RB_NET
 # Everything of the host that is derived from the dump is linked into the game DLL instead (game_data.h): the exe is made
 # of the runtime's own sources only and can be built without a dump (scripts/make_release.py).
 GAME_DATA_SOURCES = ['game_data.c', 'sdkdata.c', 'nro_registry.c', 'sdklift_gen.c']
@@ -196,7 +196,7 @@ if TARGET_POSIX:
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
     # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
     # (net_relay.c: Winsock extensions, COM UPnP; net_off.c answers "off", as with SSBU_ONLINE unset)
-    HOST_SOURCES = [n for n in HOST_SOURCES if n not in ('net_relay.c', 'rb_learned.c')] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']      # rb_learned.c: Windows only, like the state save it belongs to (r1_state.c is stubs here)
+    HOST_SOURCES = [n for n in HOST_SOURCES if n not in ('net_relay.c', 'rollback/model/page_tracker_learned.c')] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']      # rb_learned.c: Windows only, like the state save it belongs to (r1_state.c is stubs here)
     LIBS = pkg('--libs') + ['-lGL', '-lm', '-ldl', '-lpthread']      # libGL: the OpenGL front end is linked (not used)
     if TARGET_MACOS:                                     # OpenGL is a system framework; dl / pthread are in libSystem
         LIBS = pkg('--libs') + ['-framework', 'OpenGL', '-lm']
@@ -335,7 +335,7 @@ def cmd_link(host_only=False):
     objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
     t0 = time.time()
-    newest_dep = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith(('.h', '.inc'))] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])
+    newest_dep = max([os.path.getmtime(os.path.join(r, h)) for r, _, fs in os.walk(HERE) if os.path.basename(r) not in ('obj_host', 'deps', 'tests', 'plat', 'nocrt', 'r1src') for h in fs if h.endswith(('.h', '.inc'))] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])      # headers of runtime/ and of runtime/rollback/*/
     # nvn_vk.c includes the other nvn_vk*.c files as one translation unit: an edit of one of them must rebuild nvn_vk.obj
     newest_vk = max(os.path.getmtime(os.path.join(HERE, n)) for n in os.listdir(HERE) if n.startswith('nvn_vk') and n.endswith('.c'))
     objs, jobs = [], []
@@ -345,7 +345,7 @@ def cmd_link(host_only=False):
     # writes (r1src/nncxxrt.c, R1_MARK), like the game DLL built with -DR1_MARK (ssbu_game_r1.dll) it imports
     r1 = os.environ.get('RECOMP_R1') == '1'
     for n in HOST_SOURCES + ['gamedll.c'] + ([] if HAVE_IMGUI else ['menu_stub.c']):
-        src, obj = os.path.join(HERE, 'r1src' if r1 and n == 'nncxxrt.c' else '', n), os.path.join(objdir, n[:-2] + '.obj')
+        src, obj = os.path.join(HERE, 'r1src' if r1 and n == 'nncxxrt.c' else '', n), os.path.join(objdir, os.path.basename(n)[:-2] + '.obj')
         objs.append(obj)
         if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
                                                                        os.path.getmtime(os.path.join(HERE, 'plat_mf.c')) if n == 'mf_ffmpeg.c' else 0,   # mf_ffmpeg.c includes plat_mf.c

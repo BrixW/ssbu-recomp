@@ -42,7 +42,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
-#include "r1_internal.h"
+#include "game_state_internal.h"
 /* ================================================================ PART 1: THE LEARNED SET
  * What this file needs from r1_state.c and r1_ring.c, and what it gives them, is listed in r1_internal.h:
  *   r1_state.c  PG, WIN2 / WN2, g_win1 / g_wn1 (the windows), g_ns1 / g_ns2 (not-simulation maps), g_dc (decommitted flags),

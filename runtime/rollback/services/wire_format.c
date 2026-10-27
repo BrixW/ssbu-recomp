@@ -6,7 +6,7 @@
  *   pad   buttons u64 | lx i16 | ly i16 | rx i16 | ry i16
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <string.h>
-#include "rb.h"
+#include "../rollback.h"
 
 /* Little-endian writers: the value's bytes, least significant first, at p. */
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }

@@ -9,7 +9,7 @@
  * Frames are counted from 1. Each table below is a ring of RB_RING slots indexed by frame & RING_MASK; every slot also
  * stores the frame number it holds, so a slot left over from an older lap of the ring is never taken for a current one. */
 #include <string.h>
-#include "rb.h"
+#include "../rollback.h"
 
 #define RING_MASK (RB_RING - 1)
 

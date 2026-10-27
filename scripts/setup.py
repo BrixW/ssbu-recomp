@@ -1215,13 +1215,13 @@ def _sdk_result(cx, out):
 def _rbtest(cx):
     # the rollback netcode's game-free parts (rb.h): a scripted peer over a lossy link, prediction and rollback against a toy
     # simulation (tests/rb_test.c). It needs no game; a PC without the sources staged (a prebuilt runtime) skips it
-    srcs = [os.path.join('tests', 'rb_test.c'), 'rb_input.c', 'rb_wire.c', 'rb_timesync.c']
-    if not all(os.path.exists(os.path.join(cx.work, s)) for s in srcs + ['rb.h']):
+    srcs = [os.path.join('tests', 'rb_test.c')] + [os.path.join('rollback', d) for d in ('model/input_history.c', 'services/wire_format.c', 'services/clock_sync.c')]
+    if not all(os.path.exists(os.path.join(cx.work, s)) for s in srcs + [os.path.join('rollback', 'rollback.h')]):
         say('  rollback netcode test: skipped (its sources are not staged)')
         return
     exe = 'rb_test' if cx.posix else 'rb_test.exe'
     try:
-        cx.run('check', [cx.tools['clang'], '-O1', '-I', '.'] + srcs + ['-o', exe], log='check_rbtest')
+        cx.run('check', [cx.tools['clang'], '-O1', '-I', '.', '-I', 'rollback'] + srcs + ['-o', exe], log='check_rbtest')
         out = cx.run('check', [os.path.join(cx.work, exe)], log='check_rbtest', timeout=SELFTEST_LIMIT)
     except Fail as e:
         say('  WARNING: the rollback netcode test did not run or failed (%s; logs/check_rbtest.log)' % e)
