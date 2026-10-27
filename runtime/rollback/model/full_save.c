@@ -33,11 +33,11 @@ void save(Ctx *c) {
             r->async = calloc(r->n / PG, 1);
             if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_memory_map.range_count, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
         }
-        if (!bad && !g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
+        if (!bad && !g_guest_fibers.pool) { g_guest_fibers.pool = malloc(g_guest_fibers.pool_cap); if (!g_guest_fibers.pool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
         if (!bad && g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { bad = 1; LOG("r1: FULL SAVE NOT MADE: list allocation FAILED\n"); } }   /* no allocation while threads are held */
         if (bad) { release(); g_save_failed = 2; return; }
     }
-    if (g_fast > 0 && g_cycle < g_learn) async_learn();
+    if (g_fast > 0 && g_session.cycle < g_learn) async_learn();
     double tp0 = now_ms();
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now (busy: %s)\n", g_ra_busy_first_save()); g_save_failed = 1; return; } } else park_quiet(0);
     fibers_save();
@@ -56,12 +56,12 @@ void save(Ctx *c) {
                     if (memcmp(r->a + p * PG, r->s + p * PG, PG)) {
                         r->async[p] = 1; np++; if (g_audio_free) async_add(r->a + p * PG);
                         memcpy(r->s + p * PG, r->a + p * PG, PG);
-                        if (g_cycle == 0 && shown < 40) g_e[shown++].a = r->a + p * PG;
+                        if (g_session.cycle == 0 && shown < 40) g_e[shown++].a = r->a + p * PG;
                     }
             }
         }
         int mfail = 0;
-        if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
+        if (g_mark > 0 && g_session.cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
         if (g_ra > 0 && !mfail) nvn_r1_cb_save();
         unpark();
         if (mfail) { release(); g_save_failed = 2; return; }
@@ -70,14 +70,14 @@ void save(Ctx *c) {
     }
     g_ctx_save = *c;
     g_nos = 0; os_r1_objs(os_cb); qsort(g_os, (size_t)g_nos, sizeof *g_os, cmp_os);
-    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)\n", g_cycle, g_ff, g_memory_map.range_count, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0);
-    if (g_cycle == 0) {
+    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)\n", g_session.cycle, g_session.fight_frame, g_memory_map.range_count, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0);
+    if (g_session.cycle == 0) {
         for (int i = 0; i < g_memory_map.range_count; i++) if (g_memory_map.ranges[i].n >= (4u << 20)) LOG("r1:   range %s + %.1f MB\n", where(g_memory_map.ranges[i].a), g_memory_map.ranges[i].n / 1048576.0);
         park_report("at the save");
-        LOG("r1: %d fibers at the save:\n", g_nfib); fibers_report();
+        LOG("r1: %d fibers at the save:\n", g_guest_fibers.count); fibers_report();
     }
-    { int ns = 0; for (int i = 0; i < g_nfib; i++) ns += g_fib[i].susp;
-      LOG("r1: fibers: %d running on a thread, %d in all, %d switched away (host stack + fiber block + context saved: %.1f KB), %d switched away but not readable\n", g_fib_running, g_nfib, ns, g_fib_bytes / 1024.0, g_fib_bad); }
+    { int ns = 0; for (int i = 0; i < g_guest_fibers.count; i++) ns += g_guest_fibers.table[i].susp;
+      LOG("r1: fibers: %d running on a thread, %d in all, %d switched away (host stack + fiber block + context saved: %.1f KB), %d switched away but not readable\n", g_guest_fibers.running, g_guest_fibers.count, ns, g_guest_fibers.bytes / 1024.0, g_guest_fibers.unreadable_stack); }
 }
 /* the learned set (union of all changed pages so far): what a fixed-set save / restore would copy */
 size_t g_learn_pages;
@@ -118,7 +118,7 @@ const char *where(uint8_t *a) {
 
 void stop_born_threads(void) {      /* guest threads created in the window do not exist at the save point: held for good */
     Ctx *tc; const char *nm; HANDLE h; int o = 0; g_nborn = 0;
-    for (int i = g_ninfo; guest_thread_info(i, &tc, &nm, &h); i++) {
+    for (int i = g_guest_threads.info_count; guest_thread_info(i, &tc, &nm, &h); i++) {
         if (!h || GetThreadId(h) == GetCurrentThreadId()) continue;
         SuspendThread(h); g_nborn++;
         if (o < 1900) o += snprintf(g_born + o, sizeof g_born - o, " [%s %s]", nm ? nm : "?", tc->in_import ? tc->in_import : "guest code");
@@ -155,18 +155,18 @@ void restore(Ctx *c) {
     double t1 = now_ms();
     unpark();
     *c = g_ctx_save;                                   /* the main thread's guest registers at the save point */
-    LOG("r1: holding the guest threads at their save-point waits took %.2f ms; %d of %d not at the same wait\n", t0 - tp0, g_th_mismatch, g_nth);
-    if (g_cycle == 0 || g_th_mismatch) park_report("at the restore");
-    LOG("r1: fibers at the restore: %d at their save-point state (registers restored), %d not, %d new\n", g_fib_same, g_fib_diff, g_fib_new);
+    LOG("r1: holding the guest threads at their save-point waits took %.2f ms; %d of %d not at the same wait\n", t0 - tp0, g_guest_threads.mismatch, g_guest_threads.count);
+    if (g_session.cycle == 0 || g_guest_threads.mismatch) park_report("at the restore");
+    LOG("r1: fibers at the restore: %d at their save-point state (registers restored), %d not, %d new\n", g_guest_fibers.restored, g_guest_fibers.not_restored, g_guest_fibers.replaced);
     learn_merge();
     LOG("r1: cycle %d RESTORE at fight frame %lld: %zu pages changed (%.1f MB) in %zu of %d ranges (those ranges %.1f MB); compare + copy back %.2f ms; %zu ranges partly decommitted in the window (committed again)\n",
-        g_cycle, g_ff, pages, pages * PG / 1048576.0, ranges_hit, g_memory_map.range_count, ranges_hit_bytes / 1048576.0, t1 - t0, skipped);
+        g_session.cycle, g_session.fight_frame, pages, pages * PG / 1048576.0, ranges_hit, g_memory_map.range_count, ranges_hit_bytes / 1048576.0, t1 - t0, skipped);
     {   /* where the changed pages are: one line per contiguous group (first 40) */
         int shown = 0;
         for (size_t i = 0; i < g_ne && shown < 40; ) {
             size_t j = i + 1;
             while (j < g_ne && g_e[j].a == g_e[j - 1].a + PG) j++;
-            if (g_cycle == 0) LOG("r1:   changed %s: %zu pages\n", where(g_e[i].a), j - i);
+            if (g_session.cycle == 0) LOG("r1:   changed %s: %zu pages\n", where(g_e[i].a), j - i);
             shown++; i = j;
         }
     }
@@ -197,7 +197,7 @@ void verify(void) {
             }
     }
     LOG("r1: cycle %d VERIFY at fight frame %lld (end of the re-run): %zu of %zu changed pages differ from the first pass's end state, %zu pages changed only in the re-run (%.1f ms)\n",
-        g_cycle, g_ff, bad, g_ne, extra, now_ms() - t0);
+        g_session.cycle, g_session.fight_frame, bad, g_ne, extra, now_ms() - t0);
     os_compare("at the end of the re-run");
 }
 void release(void) { for (int i = 0; i < g_memory_map.range_count; i++) { rs_free(g_memory_map.ranges[i].s); g_memory_map.ranges[i].s = NULL; free(g_memory_map.ranges[i].dirty); g_memory_map.ranges[i].dirty = NULL; free(g_memory_map.ranges[i].async); g_memory_map.ranges[i].async = NULL; } }

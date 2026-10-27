@@ -122,6 +122,54 @@ typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *
 
 typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
 
+/* The other guest threads while memory is copied (threads.c). The ring holds each at a wait (parks it), copies, and lets it go. */
+typedef struct {
+    Th table[256];                           /* one entry per other guest thread: its handle, context, the wait it is held at */
+    int count;                               /* entries of table[] in use */
+    int info_count;                          /* guest threads the host reports (guest_thread_info) at the last count */
+    int mismatch;                            /* threads found not parked when checked (counted for the log) */
+    int running;                             /* (ra_hold_restore) threads still RUNNING, not blocked at a wait, after park_ms */
+    int park_ms;                             /* how long to wait for the other threads to stop at a wait (default 500) */
+    long long audio_other;                   /* ring loads that took an audio thread at another wait (ra_hold_restore) */
+} GuestThreads;
+extern GuestThreads g_guest_threads;
+
+/* The job system's fibers (threads.c): a switched-away fiber keeps host state outside guest memory, so it is saved apart. */
+typedef struct {
+    Fib table[1024];                         /* the fibers saved at the last save */
+    int count;                               /* entries of table[] in use */
+    int running;                             /* fibers some thread was running at the save */
+    int unreadable_stack;                    /* fibers no thread was running whose host stack could not be read (not saved) */
+    int restored;                            /* at a restore: fibers found as saved and put back */
+    int not_restored;                        /* at a restore: fibers NOT put back (changed, or their stack was in use) */
+    int replaced;                            /* at a restore: fibers that were replaced since the save */
+    uint8_t *pool;                           /* memory the saved host stacks are copied into ... */
+    size_t pool_used, pool_cap;              /* ... bytes used and bytes reserved (default 256 MB) */
+    size_t bytes;                            /* bytes of fiber state saved */
+    long long live_seen, live_skipped;       /* fibers whose host stack a running thread was on: seen / not copied back */
+    long long teb_running;                   /* fibers taken as running at a capture because a thread's TEB names them (run tid said not) */
+    int live_count;                          /* entries of live_rsp[] in use */
+    uint64_t live_rsp[512];                  /* stack pointers of every guest thread and of this one, read before a restore */
+    int live_cache;                          /* -1 not decided, 1 reuse the registers read while held, 0 ask Windows again (SSBU_R1_LIVECACHE=0) */
+    long long live_cached, live_asked;       /* how many registers came from the cache / were asked of Windows */
+} GuestFibers;
+extern GuestFibers g_guest_fibers;
+
+/* The R1 test session (game_state.c): SSBU_R1=<start_frame>,<run_frames>[,<period>,<cycles>] saves the state at a fight frame, lets the fight
+ * run, restores it and runs the same frames again. SSBU_RB_SIM and run-ahead reuse the same machinery. */
+typedef struct {
+    int enabled;                             /* -1 not decided yet, 0 off, 1 on (r1_on) */
+    int start_frame;                         /* N: the fight frame at which the state is saved */
+    int run_frames;                          /* K: frames run before the restore (default 8) */
+    int period;                              /* P: frames between two cycles (default 2 * K + 2) */
+    int cycles;                              /* C: how many save / run / restore cycles (default 1) */
+    int cycle;                               /* the cycle in progress */
+    int phase;                               /* 0 idle, 1 first pass, 2 re-run, 3 done */
+    long long fight_frame;                   /* fight frames counted so far */
+    long long target_frame;                  /* the fight frame of the next save (start_frame at first) */
+} R1Session;
+extern R1Session g_session;
+
 typedef struct { uint8_t *a; size_t n; uint8_t *learn; } Learn;
 
 typedef struct { uint8_t *a; size_t n; uint8_t *b; } Extra;
@@ -158,9 +206,6 @@ typedef struct { uint64_t bump, committed; uint64_t head[48]; uint64_t allocs, f
 /* ---- variables one piece defines and another uses (the piece that defines each is named) */
 extern long long g_r1_fls_stale;    /* model/threads.c */
 extern void (*g_r1_fiber_born)(void *);    /* model/tracking_experiments/write_marks.c */
-extern int g_cycle;    /* model/game_state.c */
-extern int g_phase;    /* model/game_state.c */
-extern long long g_ff;    /* model/game_state.c */
 extern Ctx g_ctx_save;    /* model/game_state.c */
 extern int g_nborn;    /* model/game_state.c */
 extern char g_born[2048];    /* model/game_state.c */
@@ -177,32 +222,6 @@ extern double g_save_avail_mb;    /* model/memory_map.c */
 extern double g_save_need_mb;    /* model/memory_map.c */
 extern OsRec *g_os;    /* model/threads.c */
 extern int g_nos;    /* model/threads.c */
-extern long long g_th_audio_other;    /* model/threads.c */
-extern int g_nth;    /* model/threads.c */
-extern int g_ninfo;    /* model/threads.c */
-extern int g_th_mismatch;    /* model/threads.c */
-extern int g_park_ms;    /* model/threads.c */
-extern Th g_th[256];    /* model/threads.c */
-extern int g_th_running;    /* model/threads.c */
-extern int g_fib_new;    /* model/threads.c */
-extern int g_nfib;    /* model/threads.c */
-extern int g_fib_diff;    /* model/threads.c */
-extern int g_fib_running;    /* model/threads.c */
-extern int g_fib_bad;    /* model/threads.c */
-extern int g_fib_same;    /* model/threads.c */
-extern Fib g_fib[1024];    /* model/threads.c */
-extern size_t g_fpool_cap;    /* model/threads.c */
-extern size_t g_fpool_used;    /* model/threads.c */
-extern uint8_t *g_fpool;    /* model/threads.c */
-extern size_t g_fib_bytes;    /* model/threads.c */
-extern long long g_fib_live_seen;    /* model/threads.c */
-extern long long g_fib_live_skip;    /* model/threads.c */
-extern int g_nlive;    /* model/threads.c */
-extern uint64_t g_live_rsp[512];    /* model/threads.c */
-extern long long g_live_asked;    /* model/threads.c */
-extern int g_live_cache;    /* model/threads.c */
-extern long long g_live_cached;    /* model/threads.c */
-extern long long g_fib_teb_running;    /* model/threads.c */
 extern int g_r1_ctr;    /* model/threads.c */
 extern int g_busy_log;    /* model/threads.c */
 extern int g_wait_idle;    /* model/threads.c */

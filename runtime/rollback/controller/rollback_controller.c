@@ -172,10 +172,10 @@ static void rbg_step_body(Ctx *c) {
     }
     if (!g_rbg_in_match) {                              /* the base state: r1's full save (one hitch); (hs12) from the second match on: the ring's base made again */
         if (g_rbg_basefix < 0) { const char *e = getenv("SSBU_RB_NET_BASEFIX"); g_rbg_basefix = !(e && e[0] == '0'); }
-        if (g_rbg_ff_first < 0) g_rbg_ff_first = g_ff;
+        if (g_rbg_ff_first < 0) g_rbg_ff_first = g_session.fight_frame;
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
-            if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
-        if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
+            if (tl > 0 && g_session.fight_frame - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_session.fight_frame); return; } }
+        if (g_rbg_basefix) g_rgs_next = i = g_session.fight_frame - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
         if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
         else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
         g_rbg_noring = g_rg_nomem != 0;
@@ -200,7 +200,7 @@ static void rbg_step_body(Ctx *c) {
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
         if (!g_rbg_work) { g_rbg_work = calloc(RBG_NT, sizeof *g_rbg_work); g_rbg_gap = calloc(RBG_NT, sizeof *g_rbg_gap); g_rbg_wcyc = calloc(RBG_NT, sizeof *g_rbg_wcyc); g_rbg_wk = calloc(RBG_NT, 1); }
-        LOG("r1: RB NET: match start, base state = frame %lld (fight frame %lld); pacing %s; re-run skip mask %d, lite mask %d%s\n", i, g_ff, g_rbg_pace ? "60 Hz" : "off", g_rgs_skip, g_rgs_lite, g_rgs_lastlite ? " (the last re-run pass too)" : "");
+        LOG("r1: RB NET: match start, base state = frame %lld (fight frame %lld); pacing %s; re-run skip mask %d, lite mask %d%s\n", i, g_session.fight_frame, g_rbg_pace ? "60 Hz" : "off", g_rgs_skip, g_rgs_lite, g_rgs_lastlite ? " (the last re-run pass too)" : "");
         {   /* start barrier: both games begin frame 1 together (the one that finished loading first waits here, at frame 0,
              * instead of stalling seconds at frame 8 with states it might have to roll back to: rnh2 / rnh3 hung after that) */
             double tb = now_ms(), lastx = 0;
@@ -436,15 +436,15 @@ void rbg_report(void) {
     LOG("r1: RB NET report: ring memory (hs14, fix %s): captures given up %lld, old states freed early %lld, captures skipped to keep the oldest needed state %lld\n",
         g_rg_poolfix ? "on" : "OFF", g_rg_short_n, g_rg_freed_slots, g_rg_skip_full);
     LOG("r1: RB NET report: task-worker watchdog releases %lld (since the process start), rollbacks with the workers not held %lld (watchdog paused at H2: %s)\n", g_ra_wd_fired, g_rbg_rb_unheld, g_rbg_wdfix ? "yes" : "NO");
-    LOG("r1: RB NET report: loads that took the sound thread at another wait after 5 ms %lld; threads not at their wait after 500 ms %d (last load); loads refused, a thread still running (pub1) %lld\n", g_th_audio_other, g_th_mismatch, g_rg_refused);
-    LOG("r1: RB NET report: fiber host stacks in use at a load (not copied back) %lld, seen %lld; fibers found running by their thread (TEB) at a capture %lld; catch table at loads: entries dropped %lld, live entries put back %lld, loads changed %lld (hs13)\n", g_fib_live_skip, g_fib_live_seen, g_fib_teb_running, g_rgc_dropped, g_rgc_kept, g_rgc_loads_changed);
+    LOG("r1: RB NET report: loads that took the sound thread at another wait after 5 ms %lld; threads not at their wait after 500 ms %d (last load); loads refused, a thread still running (pub1) %lld\n", g_guest_threads.audio_other, g_guest_threads.mismatch, g_rg_refused);
+    LOG("r1: RB NET report: fiber host stacks in use at a load (not copied back) %lld, seen %lld; fibers found running by their thread (TEB) at a capture %lld; catch table at loads: entries dropped %lld, live entries put back %lld, loads changed %lld (hs13)\n", g_guest_fibers.live_skipped, g_guest_fibers.live_seen, g_guest_fibers.teb_running, g_rgc_dropped, g_rgc_kept, g_rgc_loads_changed);
     { void nnunwind_catch_stats(long long *, long long *, long long *, long long *, long long *); long long l, d, cr, fu, mp; nnunwind_catch_stats(&l, &d, &cr, &fu, &mp);
       LOG("r1: RB NET report: catch table (hs15): %lld live records, %lld removed slots, %lld puts found no free slot in their window, %lld table full, longest probe %lld; dead records dropped at loads %lld (host fiber stacks known %zu)\n", l, d, cr, fu, mp, g_rgc_dead, g_nbf); }
     LOG("r1: RB NET report: host stack pages inside the guest windows left out of the state %lld (%lld ranges, %lld from fibers made later)\n", g_hs_pages, g_hs_ranges, g_hs_fibers_later);
     if (g_rbg_rb) LOG("r1: RB NET report: rollback parts (ms per rollback): before the load %.3f (keep mode %d), load %.3f, re-run passes %.3f (%.2f per rollback, %.3f each), re-run captures %.3f (%.2f per rollback, recap mode %d)\n",
         g_rbg_t_pre / g_rbg_rb, g_rbg_keep, g_rbg_t_load / g_rbg_rb, g_rbg_t_rerun / g_rbg_rb, (double)g_rbg_n_rerun / g_rbg_rb, g_rbg_n_rerun ? g_rbg_t_rerun / g_rbg_n_rerun : 0.0, g_rbg_t_recap / g_rbg_rb, (double)g_rbg_n_recap / g_rbg_rb, g_rbg_recap);
     r1_hold_prof_report(); rg_meta_prof_report();
-    LOG("r1: RB NET report: live host stack check (hs16): thread contexts taken from the hold %lld, asked again %lld (SSBU_R1_LIVECACHE %s)\n", g_live_cached, g_live_asked, g_live_cache ? "on" : "OFF");
+    LOG("r1: RB NET report: live host stack check (hs16): thread contexts taken from the hold %lld, asked again %lld (SSBU_R1_LIVECACHE %s)\n", g_guest_fibers.live_cached, g_guest_fibers.live_asked, g_guest_fibers.live_cache ? "on" : "OFF");
     rbg_dist("work per tick (real pass + its rollback, without waits)", g_rbg_work, g_rbg_nw, g_rbg_wk, -1);
     rbg_dist("work per tick without rollback", g_rbg_work, g_rbg_nw, g_rbg_wk, 0);
     rbg_dist("work per tick with rollback", g_rbg_work, g_rbg_nw, g_rbg_wk, 1);

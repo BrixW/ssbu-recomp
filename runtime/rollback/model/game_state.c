@@ -57,8 +57,7 @@ extern int g_r1_keep_fibers;
 
 void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size));     /* os_threads.c */
 
-int g_on = -1, g_n, g_k, g_p, g_c, g_cycle, g_phase;        /* phase 0 idle, 1 first pass, 2 re-run, 3 done */
-long long g_ff, g_target;
+R1Session g_session = { .enabled = -1 };      /* the one test session (see R1Session in game_state_internal.h) */
 Ctx g_ctx_save;
 static double g_qpf;
 double now_ms(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / g_qpf; }
@@ -88,22 +87,22 @@ int ra_wanted(void) {
     return w;
 }
 int r1_on(void) {
-    if (g_on < 0) {
+    if (g_session.enabled < 0) {
         const char *e = getenv("SSBU_R1");
-        g_on = (e && e[0] && e[0] != '0') || ra_wanted();
-        if (g_on) {
-            if (e) sscanf(e, "%d,%d,%d,%d", &g_n, &g_k, &g_p, &g_c);
-            if (g_k <= 0) g_k = 8;
-            if (g_c <= 0) g_c = 1;
-            if (g_p < 2 * g_k + 2) g_p = 2 * g_k + 2;
-            g_target = g_n;
+        g_session.enabled = (e && e[0] && e[0] != '0') || ra_wanted();
+        if (g_session.enabled) {
+            if (e) sscanf(e, "%d,%d,%d,%d", &g_session.start_frame, &g_session.run_frames, &g_session.period, &g_session.cycles);
+            if (g_session.run_frames <= 0) g_session.run_frames = 8;
+            if (g_session.cycles <= 0) g_session.cycles = 1;
+            if (g_session.period < 2 * g_session.run_frames + 2) g_session.period = 2 * g_session.run_frames + 2;
+            g_session.target_frame = g_session.start_frame;
             LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpf = (double)f.QuadPart;
             const char *lp = getenv("SSBU_R1_LOG");
             g_log = lp && lp[0] ? fopen(lp, "w") : NULL;
             if (!g_log) g_log = stdout;
         }
     }
-    return g_on;
+    return g_session.enabled;
 }
 
 /* ---------------------------------------------------------------- the hooks */
@@ -131,51 +130,51 @@ static void r1_frame_end(Ctx *c, void *user) {
     uint64_t lr = c->x[30];
     double te = now_ms();
     { extern volatile int g_rgp_seg; if (g_rgp_seg == 2) g_rgp_seg = 3; }
-    int rerun = g_phase == 2;
+    int rerun = g_session.phase == 2;
     g_orig_frame_end(c);         /* (round 2 tried skipping the whole frame end in re-run frames: the game crashed in the first one) */
     if (lr != GA(0x7103747b7cull)) return;
     if (g_ra > 0) { fls_index_find(); ra_frame_end(te); return; }         /* run-ahead (round 5): the save / restore is at the kick after the submission, not here */
-    if (g_ff > 0 && g_t_poll > 0 && g_t_fe_prev > 0 && !g_fe_busy) { int k = rerun; g_st[k][0] += te - g_t_poll; g_st[k][1] += now_ms() - te; g_st[k][2] += te - g_t_fe_prev; g_stn[k]++; }
+    if (g_session.fight_frame > 0 && g_t_poll > 0 && g_t_fe_prev > 0 && !g_fe_busy) { int k = rerun; g_st[k][0] += te - g_t_poll; g_st[k][1] += now_ms() - te; g_st[k][2] += te - g_t_fe_prev; g_stn[k]++; }
     g_t_fe_prev = te;
-    { static long long nfe; if (++nfe % 600 == 0) { LOG("r1: (frame end %lld)\n", nfe); r1_stats_now(); } } { int ph = g_phase; static int last_ph; g_fe_busy = 0; (void)last_ph; last_ph = ph; }
+    { static long long nfe; if (++nfe % 600 == 0) { LOG("r1: (frame end %lld)\n", nfe); r1_stats_now(); } } { int ph = g_session.phase; static int last_ph; g_fe_busy = 0; (void)last_ph; last_ph = ph; }
     fls_index_find();
-    if (g_ff > 0 && g_phase < 3) {
+    if (g_session.fight_frame > 0 && g_session.phase < 3) {
         int idle = fibers_idle();
-        if (!idle && g_wait_idle && (g_phase == 0 || g_phase == 1) && g_ff >= g_target) { g_postponed++; if (g_busy_log > 0) g_busy_log--; return; }   /* a job is half done: the next frame end */
+        if (!idle && g_wait_idle && (g_session.phase == 0 || g_session.phase == 1) && g_session.fight_frame >= g_session.target_frame) { g_postponed++; if (g_busy_log > 0) g_busy_log--; return; }   /* a job is half done: the next frame end */
     }
-    if (g_phase == 0 && g_ff >= g_target) {
+    if (g_session.phase == 0 && g_session.fight_frame >= g_session.target_frame) {
         if (g_postponed) LOG("r1: save postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
         g_postponed = 0;
-        if (g_mark > 0) { if (g_cycle == 0) save(c); else mark_save(c); }      /* (cycle 0: save() starts the marks itself) */
-        else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else save(c);
-        g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms();
-    } else if (g_phase == 1 && g_ff >= g_target) {
+        if (g_mark > 0) { if (g_session.cycle == 0) save(c); else mark_save(c); }      /* (cycle 0: save() starts the marks itself) */
+        else if (g_fast > 0 && g_session.cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else save(c);
+        g_session.phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_session.fight_frame; g_session.target_frame = g_session.fight_frame + g_session.run_frames; g_t_mark = now_ms();
+    } else if (g_session.phase == 1 && g_session.fight_frame >= g_session.target_frame) {
         if (g_postponed) LOG("r1: restore postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
-        g_postponed = 0; g_k_run = (int)(g_ff - g_save_ff);
+        g_postponed = 0; g_k_run = (int)(g_session.fight_frame - g_save_ff);
         g_t_pass1 = now_ms() - g_t_mark;
         if (g_mark > 0) mark_restore(c);
-        else if (g_fast > 0 && g_cycle >= g_learn) fast_restore(c); else restore(c);
-        g_phase = 2; g_fe_busy = 1; g_ipad = 0; g_ff = g_save_ff; g_target = g_ff + g_k_run; g_t_mark = now_ms();
+        else if (g_fast > 0 && g_session.cycle >= g_learn) fast_restore(c); else restore(c);
+        g_session.phase = 2; g_fe_busy = 1; g_ipad = 0; g_session.fight_frame = g_save_ff; g_session.target_frame = g_session.fight_frame + g_k_run; g_t_mark = now_ms();
         if (g_ar) LOG("r1: guest C heap: %llu allocations, %llu frees so far (counters inside the heap: rolled back too)\n", (unsigned long long)((uint64_t *)g_ar)[50], (unsigned long long)((uint64_t *)g_ar)[51]);
         LOG("r1: first pass %d frames in %.2f ms (%.2f ms per frame, wall, render included); %d pad polls recorded\n", g_k_run, g_t_pass1, g_t_pass1 / g_k_run, g_npad);
-    } else if (g_phase == 2 && g_ff == g_target) {
+    } else if (g_session.phase == 2 && g_session.fight_frame == g_session.target_frame) {
         g_t_rerun = now_ms() - g_t_mark;
         LOG("r1: re-run %d frames in %.2f ms (%.2f ms per frame); %d of %d recorded pad polls given\n", g_k_run, g_t_rerun, g_t_rerun / g_k_run, g_ipad, g_npad);
-        if (g_mark <= 0 && (!(g_fast > 0 && g_cycle >= g_learn) || g_fcheck)) verify();
+        if (g_mark <= 0 && (!(g_fast > 0 && g_session.cycle >= g_learn) || g_fcheck)) verify();
         release(); g_fe_busy = 1;
-        g_cycle++;
-        if (g_cycle < g_c) { g_phase = 0; g_target = g_ff + g_p - g_k_run; } else { g_phase = 3; LOG("r1: done, %d cycles\n", g_cycle); fast_report(); mark_report(); if (g_prot > 0) prot_report(); r1_stats_report(); }
+        g_session.cycle++;
+        if (g_session.cycle < g_session.cycles) { g_session.phase = 0; g_session.target_frame = g_session.fight_frame + g_session.period - g_k_run; } else { g_session.phase = 3; LOG("r1: done, %d cycles\n", g_session.cycle); fast_report(); mark_report(); if (g_prot > 0) prot_report(); r1_stats_report(); }
     }
 }
 /* nnhid.c, player 1's poll: ticks = fight frames since the last poll (0 before the fight). Returns 1 while the
  * re-run is replaying (the input sequence must not advance). */
 int r1_poll(int ticks) {
-    g_ff += ticks;
+    g_session.fight_frame += ticks;
     g_t_poll = now_ms();
     { extern volatile int g_rgp_seg; g_rgp_seg = 2; }
     if (g_ra > 0 && rgs_wanted()) return rgs_poll();     /* R2 simulation: a re-run pass's poll does not advance it either */
     if (g_ra > 0) return g_ra_phase == 1;                 /* run-ahead: the speculative pass's poll does not advance the input sequence */
-    return g_phase == 2 && g_ipad < g_npad;
+    return g_session.phase == 2 && g_ipad < g_npad;
 }
 /* nnhid.c, player 1's values just before they are written: recorded in the first pass, replaced in the re-run */
 /* nnhid.c, port 2's values just before they are written (R3 online rollback only) */
@@ -188,12 +187,12 @@ void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
         else { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_ra_pad = r; }
         return;
     }
-    if (g_phase == 1 && g_npad < 8192) { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_pad[g_npad++] = r; }
-    else if (g_phase == 2 && g_ipad < g_npad) { PadRec r = g_pad[g_ipad++]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; }
+    if (g_session.phase == 1 && g_npad < 8192) { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_pad[g_npad++] = r; }
+    else if (g_session.phase == 2 && g_ipad < g_npad) { PadRec r = g_pad[g_ipad++]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; }
 }
 void r1_init(void) {
     if (!r1_on()) return;
-    if (getenv("SSBU_R1_PARK_MS")) g_park_ms = atoi(getenv("SSBU_R1_PARK_MS"));
+    if (getenv("SSBU_R1_PARK_MS")) g_guest_threads.park_ms = atoi(getenv("SSBU_R1_PARK_MS"));
     AddVectoredExceptionHandler(1, r1_veh);
     atexit(r1_stats_report);
     g_audio_free = getenv("SSBU_R1_AUDIO_FREE") != NULL; g_async_cap = 65536; g_async = malloc(g_async_cap * sizeof *g_async);
@@ -204,7 +203,7 @@ void r1_init(void) {
     ppool_init();                                          /* R4: the presentation pool of the learned-set save */
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
-    LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_n, g_k, g_p, g_c, id ? "installed" : "FAILED");
+    LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_session.start_frame, g_session.run_frames, g_session.period, g_session.cycles, id ? "installed" : "FAILED");
 }
 
 #endif

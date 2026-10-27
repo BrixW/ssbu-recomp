@@ -314,7 +314,7 @@ void mark_save(Ctx *c) {
     double t0 = now_ms();
     park(0);
     double t1 = now_ms();
-    if (g_cycle < 6) slow_report("at the save");
+    if (g_session.cycle < 6) slow_report("at the save");
     size_t n = mark_sweep(0);
     double t2 = now_ms();
     if (g_mcheck) for (int i = 0; i < g_memory_map.range_count; i++) memcpy(g_memory_map.ranges[i].s, g_memory_map.ranges[i].a, g_memory_map.ranges[i].n);
@@ -326,7 +326,7 @@ void mark_save(Ctx *c) {
     g_mctx = *c;
     double t3 = now_ms();
     if (g_nms < 4096) { g_ms_s[g_nms] = t3 - t1; g_ms_scan[g_nms] = t2 - t1; g_pg_s[g_nms] = n; g_nms++; }
-    LOG("r1: cycle %d SAVE at fight frame %lld (marks): %zu pages, %.3f ms (+ %.3f ms holding the threads)\n", g_cycle, g_ff, n, t3 - t1, t1 - t0);
+    LOG("r1: cycle %d SAVE at fight frame %lld (marks): %zu pages, %.3f ms (+ %.3f ms holding the threads)\n", g_session.cycle, g_session.fight_frame, n, t3 - t1, t1 - t0);
 }
 static void mark_check(void) {                         /* threads still held */
     size_t miss = 0; int shown = 0;
@@ -360,7 +360,7 @@ static void mark_check(void) {                         /* threads still held */
 void mark_restore(Ctx *c) {
     double t0 = now_ms();
     park(1);
-    if (g_prot > 0 && g_prot_on) { prot_all(0); if (g_cycle % 5 == 4) prot_report(); }
+    if (g_prot > 0 && g_prot_on) { prot_all(0); if (g_session.cycle % 5 == 4) prot_report(); }
     double t1 = now_ms();
     size_t n = mark_sweep(1);
     for (int i = 0; i < g_nx; i++) memcpy(g_x[i].a, g_x[i].b, g_x[i].n);
@@ -374,5 +374,5 @@ void mark_restore(Ctx *c) {
     *c = g_mctx;
     if (g_nmr < 4096) { g_ms_r[g_nmr] = t2 - t1; g_pg_r[g_nmr] = n; g_nmr++; }
     LOG("r1: cycle %d RESTORE at fight frame %lld (marks): %zu pages, %.3f ms (+ %.3f ms holding the threads; %d threads not at their save wait, %d fibers not restored)\n",
-        g_cycle, g_ff, n, t2 - t1, t1 - t0, g_th_mismatch, g_fib_diff);
+        g_session.cycle, g_session.fight_frame, n, t2 - t1, t1 - t0, g_guest_threads.mismatch, g_guest_fibers.not_restored);
 }

@@ -101,24 +101,24 @@ static int ra_hold_save(void) {
     DWORD me = GetCurrentThreadId(); Ctx *tc; const char *nm; HANDLE h;
     if (g_hp_on < 0) g_hp_on = getenv("SSBU_RB_HOLD_PROF") && atoi(getenv("SSBU_RB_HOLD_PROF")) > 0;
     if (g_hp_on) g_hp_holds++;
-    g_nth = 0;
-    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_nth < 256; i++) {
+    g_guest_threads.count = 0;
+    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_guest_threads.count < 256; i++) {
         if (!h || GetThreadId(h) == me) continue;
-        Th *t = &g_th[g_nth++]; memset(t, 0, sizeof *t); t->h = h; t->c = tc; t->name = nm ? nm : "?";
+        Th *t = &g_guest_threads.table[g_guest_threads.count++]; memset(t, 0, sizeof *t); t->h = h; t->c = tc; t->name = nm ? nm : "?";
     }
-    g_ninfo = 0; while (guest_thread_info(g_ninfo, &tc, &nm, &h)) g_ninfo++;
+    g_guest_threads.info_count = 0; while (guest_thread_info(g_guest_threads.info_count, &tc, &nm, &h)) g_guest_threads.info_count++;
     static int all_first = -1; if (all_first < 0) { const char *e = getenv("SSBU_RB_HOLD_ALL"); all_first = rgs_wanted() && e && atoi(e) != 0; }      /* opt-in: saved ~0.07 ms only; rb2f1 crashed with it (cause not shown) */
     static uint8_t pre[256];                                /* (R2 round 3, ring only) every thread suspended first, then checked: the kernel delivers the suspends together */
-    if (all_first) for (int i = 0; i < g_nth; i++) pre[i] = !ra_free(g_th[i].name) && SuspendThread(g_th[i].h) != (DWORD)-1;
-    for (int i = 0; i < g_nth; i++) {
-        Th *t = &g_th[i];
+    if (all_first) for (int i = 0; i < g_guest_threads.count; i++) pre[i] = !ra_free(g_guest_threads.table[i].name) && SuspendThread(g_guest_threads.table[i].h) != (DWORD)-1;
+    for (int i = 0; i < g_guest_threads.count; i++) {
+        Th *t = &g_guest_threads.table[i];
         if (ra_free(t->name)) continue;
         double t0 = now_ms();
         if (all_first && pre[i]) {
             pre[i] = 0;
             if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c; continue; }
             ResumeThread(t->h);
-            for (int j = i + 1; j < g_nth; j++) if (pre[j]) { ResumeThread(g_th[j].h); pre[j] = 0; }      /* a thread not at a wait: the others go too (it may wait for one of them) */
+            for (int j = i + 1; j < g_guest_threads.count; j++) if (pre[j]) { ResumeThread(g_guest_threads.table[j].h); pre[j] = 0; }      /* a thread not at a wait: the others go too (it may wait for one of them) */
         }
         int spins = 0;
         for (;;) {
@@ -127,8 +127,8 @@ static int ra_hold_save(void) {
             ResumeThread(t->h); spins++;
             if (now_ms() - t0 > g_ra_park_ms) {
                 if (g_hp_on) hp_add(t->name, now_ms() - t0, spins);
-                for (int j = 0; j < i; j++) if (g_th[j].held) { ResumeThread(g_th[j].h); g_th[j].held = 0; }
-                if (all_first) for (int j = i + 1; j < g_nth; j++) if (pre[j]) { ResumeThread(g_th[j].h); pre[j] = 0; }
+                for (int j = 0; j < i; j++) if (g_guest_threads.table[j].held) { ResumeThread(g_guest_threads.table[j].h); g_guest_threads.table[j].held = 0; }
+                if (all_first) for (int j = i + 1; j < g_guest_threads.count; j++) if (pre[j]) { ResumeThread(g_guest_threads.table[j].h); pre[j] = 0; }
                 g_ra_busy = t->name; g_ra_busy_imp = t->c->in_import;      /* (R3 lwr) and the import it was in (log) */
                 if (strstr(t->name, "TaskWorker")) g_ra_skip_why[0]++; else if (ra_audio(t->name)) g_ra_skip_why[1]++; else g_ra_skip_why[2]++;
                 return 0;
@@ -140,12 +140,12 @@ static int ra_hold_save(void) {
     }
     return 1;
 }
-static void ra_release_save(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+static void ra_release_save(void) { for (int i = 0; i < g_guest_threads.count; i++) if (g_guest_threads.table[i].held && !ra_audio(g_guest_threads.table[i].name)) { ResumeThread(g_guest_threads.table[i].h); g_guest_threads.table[i].held = 0; } }
 /* restore: each thread at the SAME wait as at the save (the audio threads were never let go) */
 void ra_hold_restore(void) {
-    g_th_mismatch = 0; g_th_running = 0;
-    for (int i = 0; i < g_nth; i++) {
-        Th *t = &g_th[i];
+    g_guest_threads.mismatch = 0; g_guest_threads.running = 0;
+    for (int i = 0; i < g_guest_threads.count; i++) {
+        Th *t = &g_guest_threads.table[i];
         t->same = 0;
         if (t->held) { t->same = 1; continue; }
         t->cok = 0;
@@ -159,8 +159,8 @@ void ra_hold_restore(void) {
              * An audio thread blocked at another waiting import after 5 ms is taken as it is (what the 500 ms limit did anyway).
              * SSBU_RB_AUDIO_WAIT=0: the old way. */
             {   static int aw = -1; if (aw < 0) { const char *e = getenv("SSBU_RB_AUDIO_WAIT"); aw = !(e && e[0] == '0'); }
-                if (aw && rgs_wanted() && ra_audio(t->name) && now_ms() - t0 > 5 && waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; g_th_audio_other++; break; } }
-            if (now_ms() - t0 > 500) { t->held = 1; g_th_mismatch++; if (!(waiting_import(t->c->in_import) && th_blocked(t->h))) g_th_running++;
+                if (aw && rgs_wanted() && ra_audio(t->name) && now_ms() - t0 > 5 && waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; g_guest_threads.audio_other++; break; } }
+            if (now_ms() - t0 > 500) { t->held = 1; g_guest_threads.mismatch++; if (!(waiting_import(t->c->in_import) && th_blocked(t->h))) g_guest_threads.running++;
                 static int said; if (said++ < 20) LOG("r1: hold for a load: thread %s not back at its wait after 500 ms: held at %s @%llx then, now %s @%llx, blocked %d\n", t->name ? t->name : "?",
                     t->imp ? t->imp : "guest code", (unsigned long long)t->from, t->c->in_import ? t->c->in_import : "guest code", (unsigned long long)t->c->import_from, th_blocked(t->h));
                 break; }
@@ -188,7 +188,7 @@ int ra_hold_quiet(double limit) {
         if (ra_hold_save()) {
             double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
             if (fq) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
-            for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+            for (int i = 0; i < g_guest_threads.count; i++) if (g_guest_threads.table[i].held) { ResumeThread(g_guest_threads.table[i].h); g_guest_threads.table[i].held = 0; }
             g_ra_busy = "a job fiber (task worker)"; g_ra_skip_why[3]++;
         }
         tries++;
@@ -230,7 +230,7 @@ static void ra_restore(Ctx *c) {
     for (double tq = now_ms();;) {                       /* the same quiet moment as at the save (the speculative pass's jobs finished) */
         ra_hold_restore();
         if (ra_fibers_quiet() || now_ms() - tq > 200) { if (g_ra_busy_fibers) LOG("r1: RA restore: %d fibers still busy after 200 ms\n", g_ra_busy_fibers); break; }
-        for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+        for (int i = 0; i < g_guest_threads.count; i++) if (g_guest_threads.table[i].held && !ra_audio(g_guest_threads.table[i].name)) { ResumeThread(g_guest_threads.table[i].h); g_guest_threads.table[i].held = 0; }
         g_ra_fiber_waits++;
         SwitchToThread();
     }
@@ -250,7 +250,7 @@ static void ra_restore(Ctx *c) {
     unpark();
     g_ra_comp[1][0] += t2 - t1; g_ra_comp[1][1] += t3 - t2; g_ra_comp[1][2] += t4 - t3; g_ra_comp[1][3] += t5 - t4; g_ra_comp[1][4] += now_ms() - t5; g_ra_ncomp[1]++;
     *c = g_mctx;
-    if (g_th_mismatch || g_fib_diff) LOG("r1: RA restore at fight frame %lld: %d threads not at their save wait, %d fibers not restored\n", g_ff, g_th_mismatch, g_fib_diff);
+    if (g_guest_threads.mismatch || g_guest_fibers.not_restored) LOG("r1: RA restore at fight frame %lld: %d threads not at their save wait, %d fibers not restored\n", g_session.fight_frame, g_guest_threads.mismatch, g_guest_fibers.not_restored);
     if (g_ra_nr < 16384) { g_ra_r[g_ra_nr] = now_ms() - t0; g_ra_rh[g_ra_nr] = t1 - t0; g_ra_rp[g_ra_nr] = n; g_ra_nr++; }
 }
 /* Round 6, SSBU_RUNAHEAD_MODE=submit (experiment, needs a check of the pictures): no speculative pass at all. At the save point
@@ -294,7 +294,7 @@ static void ra_step(Ctx *c) {
     if (was_quiet) { g_ra_real_sum += t - g_ra_t_mark; g_ra_nreal++; }
     g_ra_phase = 0;
     int ok = 0;
-    if (!g_ra_ready && (g_ra_kicks == 1 || g_ra_kicks % 300 == 0)) LOG("r1: RA: save point reached %lld times, fight frame %lld, ready-go %d\n", g_ra_kicks, g_ff, ra_fight_on());
+    if (!g_ra_ready && (g_ra_kicks == 1 || g_ra_kicks % 300 == 0)) LOG("r1: RA: save point reached %lld times, fight frame %lld, ready-go %d\n", g_ra_kicks, g_session.fight_frame, ra_fight_on());
     if (!g_ra_off && ra_fight_on()) {
         if (!g_ra_ready) {                               /* the first time: a full save, the shadow and the marks (one hitch) */
             double t0 = now_ms();
@@ -303,11 +303,11 @@ static void ra_step(Ctx *c) {
             g_ra_wd_pause = 0;
             if (g_save_failed == 2) { g_ra_off = 1; LOG("r1: RA: first save not made (out of memory): run-ahead OFF\n"); return; }
             if (g_save_failed) return;
-            g_ra_ready = 1; g_cycle = 1; ok = 1;
-            LOG("r1: RA: first save (full, shadow filled, marks on) at fight frame %lld in %.1f ms\n", g_ff, now_ms() - t0);
+            g_ra_ready = 1; g_session.cycle = 1; ok = 1;
+            LOG("r1: RA: first save (full, shadow filled, marks on) at fight frame %lld in %.1f ms\n", g_session.fight_frame, now_ms() - t0);
             if (g_mark <= 0) { g_ra_off = 1; ok = 0; LOG("r1: RA: no marks (the game DLL with marks is not loaded): run-ahead OFF\n"); }
         } else ok = ra_save(c);
-        if (!ok && g_ra_ready && !g_ra_off) { g_ra_skips++; if (g_ra_skips <= 20 || g_ra_skips % 100 == 0) LOG("r1: RA: save %lld skipped at fight frame %lld: thread %s not at a wait within %.1f ms\n", g_ra_skips, g_ff, g_ra_busy ? g_ra_busy : "?", g_ra_park_ms); }
+        if (!ok && g_ra_ready && !g_ra_off) { g_ra_skips++; if (g_ra_skips <= 20 || g_ra_skips % 100 == 0) LOG("r1: RA: save %lld skipped at fight frame %lld: thread %s not at a wait within %.1f ms\n", g_ra_skips, g_session.fight_frame, g_ra_busy ? g_ra_busy : "?", g_ra_park_ms); }
     }
     if (!ok) { if (was_quiet) g_ra_after_quiet = 1; g_ra_t_mark = now_ms(); return; }
     g_ra_specs++;
@@ -370,7 +370,7 @@ static void ra_kick2(Ctx *c, void *user) {           /* hook on FUN 0x7103549170
         {   /* (hs10, test only) SSBU_RB_NET_TEST_H1=<fight frame>,<ms>: a slow pass at the first H1 from that fight frame on (the hold watchdog's case) */
             static long long tf = -2; static int tms;
             if (tf == -2) { const char *e = getenv("SSBU_RB_NET_TEST_H1"); tf = -1; if (e && *e) sscanf(e, "%lld,%d", &tf, &tms); }
-            if (tf > 0 && g_ff >= tf && g_ra_phase == 0) { tf = -1; Sleep((DWORD)tms); LOG("r1: TEST: a slow pass of %d ms at fight frame %lld, after the workers' hold (watchdog releases so far %lld)\n", tms, g_ff, g_ra_wd_fired); }
+            if (tf > 0 && g_session.fight_frame >= tf && g_ra_phase == 0) { tf = -1; Sleep((DWORD)tms); LOG("r1: TEST: a slow pass of %d ms at fight frame %lld, after the workers' hold (watchdog releases so far %lld)\n", tms, g_session.fight_frame, g_ra_wd_fired); }
         }
     }
     if (lr == g_ra_site) { ra_step(c); if (g_ra_wh_on) { ra_workers_release(); SetEvent(g_ra_wd_ev); } g_ra_wd_pause = g_ra_wd_base; }      /* H2 (R3: rb_rollback.c pauses the watchdog while it runs here, and keeps the long limit during the match) */
@@ -434,7 +434,7 @@ void ra_init(void) {
     { const char *m = getenv("SSBU_RUNAHEAD_MODE"); g_ra_submit_mode = m && !strcmp(m, "submit"); }
     if (g_ra_submit_mode) LOG("r1: RUN-AHEAD mode submit (no speculative pass; the submission step 71037f0590 is called at the save point): hook %s\n", hook_install(GA(0x71037f0590ull), ra_submit_hook, NULL, &g_orig_submit) ? "installed" : "FAILED");
     g_ra_wd_ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, ra_watchdog, NULL, 0, NULL));
-    g_park_ms = 20;
+    g_guest_threads.park_ms = 20;
     g_mark = mark_bind(); if (!g_mark) g_mark = ls_use_exe_maps();      /* R4: no marked DLL: the learned set (rb_learned.c) */
     int k = hook_install(GA(0x710354c720ull), ra_kick, NULL, &g_orig_kick) && hook_install(GA(0x7103549170ull), ra_kick2, NULL, &g_orig_kick2);
     int l = hook_install_name("_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv", ra_line, NULL, &g_orig_line);

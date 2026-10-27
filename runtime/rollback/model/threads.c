@@ -58,9 +58,7 @@ static void threads_report(const char *when) {
  * instead of asking Windows again (GetThreadContext of a thread blocked in the kernel costs ~20 us: 0.5 ms per capture) */
 int g_audio_free;
 
-long long g_th_audio_other;                   /* (R3 hs11) ring loads that took an audio thread at another wait (ra_hold_restore) */
-Th g_th[256]; int g_nth, g_th_mismatch, g_ninfo, g_park_ms = 500;
-int g_th_running;                              /* (R3 pub1) ra_hold_restore: threads still RUNNING (not blocked at a wait) after the 500 ms */
+GuestThreads g_guest_threads = { .park_ms = 500 };      /* the one thread table (see GuestThreads in game_state_internal.h) */
 int waiting_import(const char *s) { return s && (strstr(s, "Wait") || strstr(s, "wait") || strstr(s, "Sleep") || strstr(s, "Receive") || strstr(s, "Fiber") || strstr(s, "Timed")); }
 /* restore_mode 0: hold every guest thread (except this one) once it is inside a waiting import, note where;
  * restore_mode 1: hold each once it waits at the SAME guest return address as at the save (500 ms at most) */
@@ -70,16 +68,16 @@ void park(int restore_mode) {
     DWORD me = GetCurrentThreadId();
     Ctx *tc; const char *nm; HANDLE h;
     if (!restore_mode) {
-        g_nth = 0;
-        for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_nth < 256; i++) {
+        g_guest_threads.count = 0;
+        for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_guest_threads.count < 256; i++) {
             if (!h || GetThreadId(h) == me) continue;
-            Th *t = &g_th[g_nth++]; memset(t, 0, sizeof *t); t->h = h; t->c = tc; t->name = nm ? nm : "?";
+            Th *t = &g_guest_threads.table[g_guest_threads.count++]; memset(t, 0, sizeof *t); t->h = h; t->c = tc; t->name = nm ? nm : "?";
         }
-        g_ninfo = 0; while (guest_thread_info(g_ninfo, &tc, &nm, &h)) g_ninfo++;
+        g_guest_threads.info_count = 0; while (guest_thread_info(g_guest_threads.info_count, &tc, &nm, &h)) g_guest_threads.info_count++;
     }
-    g_th_mismatch = 0;
-    for (int i = 0; i < g_nth; i++) {
-        Th *t = &g_th[i];
+    g_guest_threads.mismatch = 0;
+    for (int i = 0; i < g_guest_threads.count; i++) {
+        Th *t = &g_guest_threads.table[i];
         double t0 = now_ms();
         t->held = 0; t->parked = 0; t->same = 0; t->wait_ms = 0;
         if (g_audio_free && (strstr(t->name, "nus3") || strstr(t->name, "udio") || strstr(t->name, "sindou"))) continue;   /* audio runs on: its memory is left out */
@@ -89,24 +87,24 @@ void park(int restore_mode) {
             if (SuspendThread(t->h) == (DWORD)-1) break;
             const char *imp = t->c->in_import;
             int ok = waiting_import(imp) && (!restore_mode || (t->c->import_from == t->from && imp == t->imp));
-            if (ok || now_ms() - t0 > g_park_ms) { t->held = 1; t->cok = 0; t->parked = ok; if (!ok && tm) (*tm)++; t->wait_ms = now_ms() - t0; break; }
+            if (ok || now_ms() - t0 > g_guest_threads.park_ms) { t->held = 1; t->cok = 0; t->parked = ok; if (!ok && tm) (*tm)++; t->wait_ms = now_ms() - t0; break; }
             ResumeThread(t->h);
             SwitchToThread();
         }
         if (!restore_mode) { t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c; }
-        else { t->same = t->parked; if (!t->same) g_th_mismatch++; }
+        else { t->same = t->parked; if (!t->same) g_guest_threads.mismatch++; }
     }
 }
 void slow_report(const char *when) {        /* which thread made the hold long */
     char b[1500]; int o = 0;
-    for (int i = 0; i < g_nth && o < 1400; i++) if (g_th[i].wait_ms > 1.0) o += snprintf(b + o, sizeof b - o, " [%s %.1f ms%s]", g_th[i].name, g_th[i].wait_ms, g_th[i].parked ? "" : " timeout");
+    for (int i = 0; i < g_guest_threads.count && o < 1400; i++) if (g_guest_threads.table[i].wait_ms > 1.0) o += snprintf(b + o, sizeof b - o, " [%s %.1f ms%s]", g_guest_threads.table[i].name, g_guest_threads.table[i].wait_ms, g_guest_threads.table[i].parked ? "" : " timeout");
     b[o] = 0;
     if (o) LOG("r1: hold %s: slow threads:%s\n", when, b);
 }
-void unpark(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+void unpark(void) { for (int i = 0; i < g_guest_threads.count; i++) if (g_guest_threads.table[i].held) { ResumeThread(g_guest_threads.table[i].h); g_guest_threads.table[i].held = 0; } }
 void restore_thread_regs(void) {     /* callee-saved registers + sp of each thread held at the same wait as at the save */
-    for (int i = 0; i < g_nth; i++) {
-        Th *t = &g_th[i];
+    for (int i = 0; i < g_guest_threads.count; i++) {
+        Th *t = &g_guest_threads.table[i];
         if (!t->same || (t->imp && strstr(t->imp, "Fiber"))) continue;
         for (int r = 19; r < 32; r++) t->c->x[r] = t->regs.x[r];
         for (int r = 8; r < 16; r++) t->c->v[r] = t->regs.v[r];
@@ -114,10 +112,10 @@ void restore_thread_regs(void) {     /* callee-saved registers + sp of each thre
 }
 void park_report(const char *when) {
     char buf[6000]; int o = 0;
-    for (int i = 0; i < g_nth && o < 5800; i++)
-        o += snprintf(buf + o, sizeof buf - o, " [%s %s%s @%llx]", g_th[i].name, g_th[i].parked ? "" : "NOT PARKED ", g_th[i].imp ? g_th[i].imp : "-", (unsigned long long)g_th[i].from);
+    for (int i = 0; i < g_guest_threads.count && o < 5800; i++)
+        o += snprintf(buf + o, sizeof buf - o, " [%s %s%s @%llx]", g_guest_threads.table[i].name, g_guest_threads.table[i].parked ? "" : "NOT PARKED ", g_guest_threads.table[i].imp ? g_guest_threads.table[i].imp : "-", (unsigned long long)g_guest_threads.table[i].from);
     buf[o] = 0;
-    LOG("r1: other guest threads %s (%d): %s\n", when, g_nth, buf);
+    LOG("r1: other guest threads %s (%d): %s\n", when, g_guest_threads.count, buf);
 }
 
 /* ---------------------------------------------------------------- the job system's fibers */
@@ -127,7 +125,8 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
  * CONTEXT at +0x30, StackBase +0x10, StackLimit +0x18) and its host stack from the saved RSP to StackBase. Both are
  * copied with its guest context (Ctx); a restore puts all three back when the fiber is switched away then too. */
 
-Fib g_fib[1024]; int g_fib_running, g_nfib, g_fib_mode, g_fib_same, g_fib_diff, g_fib_new, g_fib_bad;
+GuestFibers g_guest_fibers = { .pool_cap = 256u << 20, .live_cache = -1 };      /* the one fiber save area (see GuestFibers in game_state_internal.h) */
+static int g_fib_mode;      /* 0 while fibers_save runs, 1 while fibers_restore runs (fib_cb does the matching half) */
 void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);
 void os_r1_fiber_get(uint64_t key, uint64_t v[6]); void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);
 static struct { uint64_t key; void *fiber; Ctx *c; DWORD tid; } g_cur[2048]; static int g_ncur;
@@ -169,8 +168,6 @@ void fls_index_find(void) {
     if (g_fls_var && g_r1_fls_idx == 0xFFFFFFFF && *(DWORD *)(uintptr_t)g_fls_var != 0xFFFFFFFF) g_r1_fls_idx = *(DWORD *)(uintptr_t)g_fls_var;
 }
 
-uint8_t *g_fpool; size_t g_fpool_used, g_fpool_cap = 256u << 20;
-size_t g_fib_bytes;
 static int fib_switched_away(Ctx *c) { return !c->in_import || strstr(c->in_import, "SwitchToFiber") != NULL; }
 static int fib_host(void *fiber, uint64_t *rsp, uint64_t *base) {
     uint8_t *f = fiber;
@@ -182,23 +179,22 @@ static int fib_host(void *fiber, uint64_t *rsp, uint64_t *base) {
  * TEB names another fiber) a restore must never copy a saved host stack over a stack some thread is running on now: the
  * stack pointers of every guest thread and of this thread are read first, and a switched-away fiber whose host stack
  * holds one of them is not copied back (counted, logged). SSBU_R1_LIVESTK=0: copied anyway (the old way, test). */
-long long g_fib_live_skip, g_fib_live_seen; static int g_fib_live_on = -1;
-uint64_t g_live_rsp[512], g_live_rip[512], g_live_fib[512]; static const char *g_live_nm[512]; static HANDLE g_live_h[512]; int g_nlive;
+static int g_fib_live_on = -1;
+static uint64_t g_live_rip[512], g_live_fib[512]; static const char *g_live_nm[512]; static HANDLE g_live_h[512];
 static uint8_t *live_teb_addr(HANDLE h);
 int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);
-int g_live_cache = -1; long long g_live_cached, g_live_asked;
 static void live_rsps(void) {
-    if (g_live_cache < 0) { const char *e = getenv("SSBU_R1_LIVECACHE"); g_live_cache = !(e && e[0] == '0'); }      /* (hs16) =0: every thread asked again (the old way) */
-    g_nlive = 0;
-    { volatile uint64_t here = (uint64_t)(uintptr_t)&here; g_live_rsp[g_nlive] = here; g_live_rip[g_nlive] = 0; g_live_nm[g_nlive] = "this thread"; g_live_h[g_nlive] = NULL; g_live_fib[g_nlive] = (uint64_t)(uintptr_t)GetCurrentFiber(); g_nlive++; }
+    if (g_guest_fibers.live_cache < 0) { const char *e = getenv("SSBU_R1_LIVECACHE"); g_guest_fibers.live_cache = !(e && e[0] == '0'); }      /* (hs16) =0: every thread asked again (the old way) */
+    g_guest_fibers.live_count = 0;
+    { volatile uint64_t here = (uint64_t)(uintptr_t)&here; g_guest_fibers.live_rsp[g_guest_fibers.live_count] = here; g_live_rip[g_guest_fibers.live_count] = 0; g_live_nm[g_guest_fibers.live_count] = "this thread"; g_live_h[g_guest_fibers.live_count] = NULL; g_live_fib[g_guest_fibers.live_count] = (uint64_t)(uintptr_t)GetCurrentFiber(); g_guest_fibers.live_count++; }
     Ctx *tc; const char *nm; HANDLE h;
-    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_nlive < 512; i++) {
+    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_guest_fibers.live_count < 512; i++) {
         if (!h || GetThreadId(h) == GetCurrentThreadId()) continue;
         CONTEXT x; memset(&x, 0, sizeof x); x.ContextFlags = CONTEXT_CONTROL;
         int got = 0;
-        if (g_live_cache) for (int j = 0; j < g_nth; j++) if (g_th[j].h == h) { if (g_th[j].held && g_th[j].cok) { x.Rsp = g_th[j].rsp; x.Rip = g_th[j].rip; got = 1; g_live_cached++; } break; }
-        if (!got) { got = GetThreadContext(h, &x) != 0; g_live_asked++; }
-        if (got) { uint8_t *t = live_teb_addr(h); g_live_rsp[g_nlive] = x.Rsp; g_live_rip[g_nlive] = x.Rip; g_live_nm[g_nlive] = nm ? nm : "?"; g_live_h[g_nlive] = h; g_live_fib[g_nlive] = t ? *(volatile uint64_t *)(t + 0x20) : 0; g_nlive++; }
+        if (g_guest_fibers.live_cache) for (int j = 0; j < g_guest_threads.count; j++) if (g_guest_threads.table[j].h == h) { if (g_guest_threads.table[j].held && g_guest_threads.table[j].cok) { x.Rsp = g_guest_threads.table[j].rsp; x.Rip = g_guest_threads.table[j].rip; got = 1; g_guest_fibers.live_cached++; } break; }
+        if (!got) { got = GetThreadContext(h, &x) != 0; g_guest_fibers.live_asked++; }
+        if (got) { uint8_t *t = live_teb_addr(h); g_guest_fibers.live_rsp[g_guest_fibers.live_count] = x.Rsp; g_live_rip[g_guest_fibers.live_count] = x.Rip; g_live_nm[g_guest_fibers.live_count] = nm ? nm : "?"; g_live_h[g_guest_fibers.live_count] = h; g_live_fib[g_guest_fibers.live_count] = t ? *(volatile uint64_t *)(t + 0x20) : 0; g_guest_fibers.live_count++; }
     }
 }
 static void live_teb(HANDLE h, uint64_t *fd, uint64_t *sb, uint64_t *sl) {     /* (diagnosis) that thread's TEB: FiberData, StackBase, StackLimit */
@@ -221,13 +217,12 @@ static uint8_t *live_teb_addr(HANDLE h) {               /* a thread's TEB (cache
     return tb.teb;
 }
 static int live_running(void *fiber) {                 /* the host fiber is the current fiber of a thread (its TEB says so) */
-    for (int i = 0; i < g_nlive; i++) if (g_live_fib[i] && g_live_fib[i] == (uint64_t)(uintptr_t)fiber) return i + 1;
+    for (int i = 0; i < g_guest_fibers.live_count; i++) if (g_live_fib[i] && g_live_fib[i] == (uint64_t)(uintptr_t)fiber) return i + 1;
     return 0;
 }
-long long g_fib_teb_running;                     /* fibers taken as running at a capture because a thread's TEB names them (run tid said not) */
 static int live_on_stack(const uint8_t *blk) {          /* a fiber block (saved copy): +0x20 DeallocationStack, +0x10 StackBase */
     uint64_t lo = *(const uint64_t *)(blk + 0x20), hi = *(const uint64_t *)(blk + 0x10);
-    for (int i = 0; i < g_nlive; i++) if (g_live_rsp[i] >= lo && g_live_rsp[i] < hi) return i + 1;
+    for (int i = 0; i < g_guest_fibers.live_count; i++) if (g_guest_fibers.live_rsp[i] >= lo && g_guest_fibers.live_rsp[i] < hi) return i + 1;
     return 0;
 }
 static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
@@ -238,22 +233,22 @@ static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fi
         if (g_ncur < 2048) { g_cur[g_ncur].key = key; g_cur[g_ncur].fiber = fiber; g_cur[g_ncur].c = c; g_cur[g_ncur].tid = tid; g_ncur++; }
         return;
     }
-    if (g_nfib >= 1024) return;
-    Fib *f = &g_fib[g_nfib++];
+    if (g_guest_fibers.count >= 1024) return;
+    Fib *f = &g_guest_fibers.table[g_guest_fibers.count++];
     f->key = key; f->c = c; f->fiber = fiber; f->susp = 0; f->stk = NULL; f->n = 0; f->imp = NULL; f->from = 0; f->sp = 0; os_r1_fiber_get(key, f->obj); f->fls = tid ? NULL : os_r1_fiber_fls(key); if (f->fls) memcpy(f->flsb, f->fls, sizeof f->flsb);
     if (!c) return;                                           /* initialised, never run */
     f->regs = *c; f->imp = c->in_import; f->from = c->import_from; f->sp = c->x[31];
-    if (!tid && g_fib_live_on && fiber && live_running(fiber)) { tid = GetThreadId(g_live_h[live_running(fiber) - 1] ? g_live_h[live_running(fiber) - 1] : GetCurrentThread()); g_fib_teb_running++; }   /* (hs13) running in truth: its stack is live, not saved */
+    if (!tid && g_fib_live_on && fiber && live_running(fiber)) { tid = GetThreadId(g_live_h[live_running(fiber) - 1] ? g_live_h[live_running(fiber) - 1] : GetCurrentThread()); g_guest_fibers.teb_running++; }   /* (hs13) running in truth: its stack is live, not saved */
     uint64_t rsp, base;
     if (!tid && fib_host(fiber, &rsp, &base)) {
         size_t n = (size_t)(base - rsp) + 64;
-        if (g_fpool_used + n <= g_fpool_cap) {
-            f->stk = g_fpool + g_fpool_used; g_fpool_used += (n + 63) & ~(size_t)63;
+        if (g_guest_fibers.pool_used + n <= g_guest_fibers.pool_cap) {
+            f->stk = g_guest_fibers.pool + g_guest_fibers.pool_used; g_guest_fibers.pool_used += (n + 63) & ~(size_t)63;
             f->rsp = rsp - 64; f->n = n; memcpy(f->stk, (void *)(uintptr_t)f->rsp, n);
-            memcpy(f->blk, fiber, FIB_BLOCK); f->susp = 1; g_fib_bytes += n + FIB_BLOCK + sizeof(Ctx);
+            memcpy(f->blk, fiber, FIB_BLOCK); f->susp = 1; g_guest_fibers.bytes += n + FIB_BLOCK + sizeof(Ctx);
         }
-    } else if (!tid) g_fib_bad++;
-    if (tid) g_fib_running++;
+    } else if (!tid) g_guest_fibers.unreadable_stack++;
+    if (tid) g_guest_fibers.running++;
 }
 static uint64_t g_rest_lo[1024], g_rest_hi[1024]; static int g_nrest;     /* (hs13) the host stacks the last restore copied back */
 int rest_stack(uint64_t a) { for (int i = 0; i < g_nrest; i++) if (a >= g_rest_lo[i] && a < g_rest_hi[i]) return 1; return 0; }
@@ -263,32 +258,32 @@ int g_r1_ctr = -1;
 void fibers_restore_all(void) {
     g_nrest = 0;
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);
-    g_fib_same = g_fib_diff = g_fib_new = 0;
+    g_guest_fibers.restored = g_guest_fibers.not_restored = g_guest_fibers.replaced = 0;
     if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); }
     live_rsps();
-    for (int i = 0; i < g_nfib; i++) {
-        Fib *f = &g_fib[i];
+    for (int i = 0; i < g_guest_fibers.count; i++) {
+        Fib *f = &g_guest_fibers.table[i];
         int j; for (j = 0; j < g_ncur; j++) if (g_cur[j].key == f->key) break;
         void *cf = j < g_ncur ? g_cur[j].fiber : NULL; Ctx *cc = j < g_ncur ? g_cur[j].c : NULL;
         os_r1_fiber_put(f->key, f->obj);                     /* entry, argument, stack, host fiber, context as at the save */
         if (f->susp || !f->c) os_r1_fiber_put_fls(f->key, f->fiber, f->susp ? f->fls : NULL);   /* (R2) the block note of the host fiber put back; none for a fresh one */
         if (!f->c) {                                          /* never ran at the save: it must start from the beginning */
             R1_CTR(cf != f->fiber || cc ? "restore: fiber never ran then: fresh host fiber (key, old fiber)" : "restore: fiber never ran then: same (key, fiber)", f->key, (uint64_t)(uintptr_t)cf);
-            if (cf != f->fiber || cc) { os_r1_fiber_set(f->key, NULL, NULL, 1); g_fib_new++; } else g_fib_same++;
+            if (cf != f->fiber || cc) { os_r1_fiber_set(f->key, NULL, NULL, 1); g_guest_fibers.replaced++; } else g_guest_fibers.restored++;
             continue;
         }
         int running_now = j < g_ncur && g_cur[j].tid != 0;
         int live = f->susp && !running_now ? live_on_stack(f->blk) : 0;
         if (live) {
-            g_fib_live_seen++;
-            if (g_fib_live_seen <= 20) {
+            g_guest_fibers.live_seen++;
+            if (g_guest_fibers.live_seen <= 20) {
                 uint64_t fd, sb, sl; live_teb(g_live_h[live - 1], &fd, &sb, &sl);
                 LOG("r1:   fiber %llx: its host stack %p [%llx..%llx] is IN USE now by %s (rsp %llx rip %llx; its TEB: fiber %llx stack %llx..%llx); saved rsp %llx + %zu, host fiber now %p, run tid now %lu: %s\n",
                     (unsigned long long)f->key, f->fiber, (unsigned long long)*(uint64_t *)(f->blk + 0x20), (unsigned long long)*(uint64_t *)(f->blk + 0x10), g_live_nm[live - 1],
-                    (unsigned long long)g_live_rsp[live - 1], (unsigned long long)g_live_rip[live - 1], (unsigned long long)fd, (unsigned long long)sl, (unsigned long long)sb,
+                    (unsigned long long)g_guest_fibers.live_rsp[live - 1], (unsigned long long)g_live_rip[live - 1], (unsigned long long)fd, (unsigned long long)sl, (unsigned long long)sb,
                     (unsigned long long)f->rsp, f->n, cf, j < g_ncur ? (unsigned long)g_cur[j].tid : 0ul, g_fib_live_on ? "not copied back" : "copied back anyway (SSBU_R1_LIVESTK=0)");
             }
-            if (g_fib_live_on) { g_fib_live_skip++; g_fib_diff++; R1_CTR("restore: fiber stack in use, not copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20)); continue; }
+            if (g_fib_live_on) { g_guest_fibers.live_skipped++; g_guest_fibers.not_restored++; R1_CTR("restore: fiber stack in use, not copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20)); continue; }
         }
         if (f->susp && !running_now) {                        /* whole host + guest state back */
             if (g_nrest < 1024) { g_rest_lo[g_nrest] = *(uint64_t *)(f->blk + 0x20); g_rest_hi[g_nrest] = *(uint64_t *)(f->blk + 0x10); g_nrest++; }
@@ -297,14 +292,14 @@ void fibers_restore_all(void) {
             memcpy(f->fiber, f->blk, FIB_BLOCK);
             if (f->fls) memcpy(f->fls, f->flsb, sizeof f->flsb);
             *f->c = f->regs;
-            g_fib_same++;
+            g_guest_fibers.restored++;
         } else if (!f->susp && cf == f->fiber && cc == f->c && cc->in_import == f->imp && cc->import_from == f->from && cc->x[31] == f->sp) {
             R1_CTR("restore: fiber running at the save: registers only (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             for (int r = 19; r < 32; r++) cc->x[r] = f->regs.x[r];
             for (int r = 8; r < 16; r++) cc->v[r] = f->regs.v[r];
-            g_fib_same++;
+            g_guest_fibers.restored++;
         } else {
-            g_fib_diff++; R1_CTR("restore: fiber NOT restored (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
+            g_guest_fibers.not_restored++; R1_CTR("restore: fiber NOT restored (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             LOG("r1:   fiber %llx NOT restored: now %s, at the save %s @%llx sp %llx (switched away then: %d, same host fiber: %d)\n", (unsigned long long)f->key,
                 running_now ? "running" : "?", f->imp ? f->imp : "guest code", (unsigned long long)f->from, (unsigned long long)f->sp, f->susp, cf == f->fiber);
         }
@@ -355,21 +350,21 @@ void park_quiet(int restore_mode) {
         unpark(); SwitchToThread();
     }
 }
-void fibers_save(void) { if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); } if (g_fib_live_on) live_rsps(); g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
+void fibers_save(void) { if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); } if (g_fib_live_on) live_rsps(); g_guest_fibers.count = 0; g_fib_mode = 0; g_ncur = 0; g_guest_fibers.pool_used = 0; g_guest_fibers.bytes = 0; g_guest_fibers.unreadable_stack = 0; g_guest_fibers.running = 0; os_r1_fibers(fib_cb); }
 void fibers_restore(void) {
     fibers_restore_all();
-    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break; if (i == g_nfib) born++; }
+    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == g_cur[j].key) break; if (i == g_guest_fibers.count) born++; }
     Ctx *tc; const char *nm; HANDLE h; int nt = 0; for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) nt++;
     if (g_nborn) LOG("r1: %d guest threads created in the window, held for good at the restore:%s\n", g_nborn, g_born);
-    LOG("r1: in the window: %d fiber objects made that the save did not have; guest threads now %d (at the save %d + this one)\n", born, nt, g_nth);
+    LOG("r1: in the window: %d fiber objects made that the save did not have; guest threads now %d (at the save %d + this one)\n", born, nt, g_guest_threads.count);
 }
 void fibers_report(void) {
     int shown = 0;
-    for (int i = 0; i < g_nfib; i++) {
-        int dup = 0; for (int j = 0; j < i; j++) if (g_fib[j].imp == g_fib[i].imp && g_fib[j].from == g_fib[i].from) dup = 1;
+    for (int i = 0; i < g_guest_fibers.count; i++) {
+        int dup = 0; for (int j = 0; j < i; j++) if (g_guest_fibers.table[j].imp == g_guest_fibers.table[i].imp && g_guest_fibers.table[j].from == g_guest_fibers.table[i].from) dup = 1;
         if (dup || shown++ > 12) continue;
-        int n = 0; for (int j = i; j < g_nfib; j++) if (g_fib[j].imp == g_fib[i].imp && g_fib[j].from == g_fib[i].from) n++;
-        LOG("r1:   %d fibers in %s @%llx\n", n, g_fib[i].imp ? g_fib[i].imp : "guest code", (unsigned long long)g_fib[i].from);
+        int n = 0; for (int j = i; j < g_guest_fibers.count; j++) if (g_guest_fibers.table[j].imp == g_guest_fibers.table[i].imp && g_guest_fibers.table[j].from == g_guest_fibers.table[i].from) n++;
+        LOG("r1:   %d fibers in %s @%llx\n", n, g_guest_fibers.table[i].imp ? g_guest_fibers.table[i].imp : "guest code", (unsigned long long)g_guest_fibers.table[i].from);
     }
 }
 

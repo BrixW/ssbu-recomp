@@ -52,7 +52,7 @@ void fast_save(Ctx *c) {
     double t0 = now_ms();
     park(0);
     double th = now_ms();
-    if (g_cycle < 10) slow_report("at the save");
+    if (g_session.cycle < 10) slow_report("at the save");
     for (size_t i = 0; i < g_nfp; i++) memcpy(g_fbuf + i * PG, g_fpages[i], PG);
     if (g_catch_addr) memcpy(g_catch_copy, (void *)(uintptr_t)g_catch_addr, sizeof g_catch_copy);
     fibers_save();
@@ -60,7 +60,7 @@ void fast_save(Ctx *c) {
     g_fctx = *c;
     double t1 = now_ms();
     if (g_nfs < 4096) { g_fs_ms[g_nfs] = t1 - t0; g_fsh_ms[g_nfs] = th - t0; g_nfs++; }
-    if (!g_fcheck) LOG("r1: cycle %d SAVE at fight frame %lld (fast): %.3f ms (holding threads %.3f)\n", g_cycle, g_ff, t1 - t0, th - t0);
+    if (!g_fcheck) LOG("r1: cycle %d SAVE at fight frame %lld (fast): %.3f ms (holding threads %.3f)\n", g_session.cycle, g_session.fight_frame, t1 - t0, th - t0);
 }
 void fast_restore(Ctx *c) {
     double t0 = now_ms();
@@ -78,7 +78,7 @@ void fast_restore(Ctx *c) {
     *c = g_fctx;
     double t1 = now_ms();
     if (g_nfr < 4096) { g_fr_ms[g_nfr] = t1 - t0; g_frh_ms[g_nfr] = th - t0; g_nfr++; }
-    LOG("r1: cycle %d RESTORE at fight frame %lld (fast): %.3f ms (holding threads %.3f; %d threads not at their save wait, %d fibers not restored)\n", g_cycle, g_ff, t1 - t0, th - t0, g_th_mismatch, g_fib_diff);
+    LOG("r1: cycle %d RESTORE at fight frame %lld (fast): %.3f ms (holding threads %.3f; %d threads not at their save wait, %d fibers not restored)\n", g_session.cycle, g_session.fight_frame, t1 - t0, th - t0, g_guest_threads.mismatch, g_guest_fibers.not_restored);
 }
 
 int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }

@@ -71,7 +71,7 @@ static void add_fighter_dlls(void) {
         nmod++;
     }
     CloseHandle(sn);
-    if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod, bytes / 1024.0);
+    if (g_session.cycle == 0 && g_session.phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod, bytes / 1024.0);
 }
 /* (R3 hs13, tw1j) the full save's copy of every range (r->s, ~1.9 GB in a match) is page memory of its own, not CRT heap: the
  * first save of the ring / run-ahead gives it back (decommits it) range by range while mark_setup moves it into the shadow,

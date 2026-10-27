@@ -58,7 +58,7 @@ void prot_all(int on) {                          /* the committed RW parts of th
         }
     }
     g_prot_on = on;
-    if (g_cycle < 3) LOG("r1: PROT %s: %.1f MB in %.1f ms\n", on ? "read-only" : "writable again", n / 1048576.0, now_ms() - t0);
+    if (g_session.cycle < 3) LOG("r1: PROT %s: %.1f MB in %.1f ms\n", on ? "read-only" : "writable again", n / 1048576.0, now_ms() - t0);
 }
 void prot_open(uint64_t a, uint64_t n) {        /* a host writer that marked first (kernel reads): its pages writable again */
     uint8_t *map; size_t pi;
@@ -88,23 +88,23 @@ static void veh_fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void
     if (!fiber) return;
     uint64_t sb = *(uint64_t *)((uint8_t *)fiber + 0x10), da = *(uint64_t *)((uint8_t *)fiber + 0x20);
     if (g_veh_rsp >= da && g_veh_rsp < sb) {
-        int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == key) break;
+        int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == key) break;
         LOG("r1: CRASH on the host stack of fiber %llx (guest stack %llx..%llx, ctx %p fn %llx sp %llx tid-now %lu; at the last save: %s)\n", (unsigned long long)key,
             (unsigned long long)stack, (unsigned long long)(stack + size), (void *)c, c ? (unsigned long long)c->fn : 0ull, c ? (unsigned long long)c->x[31] : 0ull, (unsigned long)os_r1_fiber_tid(key),
-            i == g_nfib ? "not in the list" : !g_fib[i].c ? "never run" : g_fib[i].susp ? "switched away (host state saved)" : "running");
+            i == g_guest_fibers.count ? "not in the list" : !g_guest_fibers.table[i].c ? "never run" : g_guest_fibers.table[i].susp ? "switched away (host state saved)" : "running");
         g_veh_hits++;
     }
 }
 LONG CALLBACK r1_veh(EXCEPTION_POINTERS *e) {
     static volatile LONG n;
     DWORD code = e->ExceptionRecord->ExceptionCode;
-    if ((code != EXCEPTION_ACCESS_VIOLATION && code != 0xC00000FFu && code != 0xC0000409u && code != 0xC0000028u) || (g_cycle == 0 && g_phase < 2)) return EXCEPTION_CONTINUE_SEARCH;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != 0xC00000FFu && code != 0xC0000409u && code != 0xC0000028u) || (g_session.cycle == 0 && g_session.phase < 2)) return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedIncrement(&n) > 2) return EXCEPTION_CONTINUE_SEARCH;
     g_veh_rsp = e->ContextRecord->Rsp; g_veh_hits = 0;
     Ctx *tc; const char *nm; HANDLE h; const char *tn = "main or host";
     for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) if (h && GetThreadId(h) == GetCurrentThreadId()) tn = nm ? nm : "?";
     LOG("r1: CRASH %08lx at rip %llx addr %llx, host thread %lu (%s), rsp %llx, phase %d cycle %d\n", (unsigned long)code, (unsigned long long)e->ContextRecord->Rip,
-        (unsigned long long)e->ExceptionRecord->ExceptionInformation[1], (unsigned long)GetCurrentThreadId(), tn, (unsigned long long)g_veh_rsp, g_phase, g_cycle);
+        (unsigned long long)e->ExceptionRecord->ExceptionInformation[1], (unsigned long)GetCurrentThreadId(), tn, (unsigned long long)g_veh_rsp, g_session.phase, g_session.cycle);
     { HMODULE m = NULL; char mn[MAX_PATH] = "?"; if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)e->ContextRecord->Rip, &m)) GetModuleFileNameA(m, mn, MAX_PATH);
       LOG("r1: CRASH module %s +%llx; rcx %llx rdx %llx; TEB fiber data %p; [rsp] %llx %llx %llx %llx\n", mn, (unsigned long long)(e->ContextRecord->Rip - (uint64_t)(uintptr_t)m), (unsigned long long)e->ContextRecord->Rcx, (unsigned long long)e->ContextRecord->Rdx, GetCurrentFiber(),
           (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[0], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[1], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[2], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[3]); }

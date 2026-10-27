@@ -61,7 +61,7 @@ void rgs_step(Ctx *c) {
             g_rgs_ki++; g_rgs_real_since = 0; g_rgs_done++;
             g_rgs_left = (int)(i - best); g_rgs_next = best + 1; g_ra_phase = 2;
             if (g_rgs_left < RG_MAXSLOT) g_rgs_ksum[g_rgs_left]++;
-            if (g_rgs_done <= 30 || g_rgs_done % 50 == 0) LOG("r1: RB SIM: rollback %lld at pass %lld (fight frame %lld) to pass %lld (k %d) in %.3f ms\n", g_rgs_done, i, g_ff, best, g_rgs_left, g_rg_last[1]);
+            if (g_rgs_done <= 30 || g_rgs_done % 50 == 0) LOG("r1: RB SIM: rollback %lld at pass %lld (fight frame %lld) to pass %lld (k %d) in %.3f ms\n", g_rgs_done, i, g_session.fight_frame, best, g_rgs_left, g_rg_last[1]);
         }
     }
     r1_ring_let_go();                                     /* (no load after a kept capture) */
@@ -370,7 +370,7 @@ void rgs_report(void) {
     int n = g_rgc_n; double pg = 0, xp = 0; for (int i = 0; i < n; i++) { pg += (double)g_rgc_pg[i]; xp += (double)g_rgc_xp[i]; }
     LOG("r1: RING report: %lld captures (%lld skipped: a thread not at a wait), %lld loads, %u pool buffers made (%.1f MB), %u free; log overflows %lld\n",
         g_rg_caps, g_rg_cap_fail, g_rg_loads, g_rg_bump, g_rg_bump * (double)PG / 1048576.0, g_rg_nfree, g_rg_overflow);
-    LOG("r1: RING loads right after a capture with the threads kept held: %lld (threads kept at the same wait: %lld); fibers %d (last); stale fiber-block notes refused %lld\n", g_rg_kept_n, g_rg_kept_same, g_nfib, g_r1_fls_stale);
+    LOG("r1: RING loads right after a capture with the threads kept held: %lld (threads kept at the same wait: %lld); fibers %d (last); stale fiber-block notes refused %lld\n", g_rg_kept_n, g_rg_kept_same, g_guest_fibers.count, g_r1_fls_stale);
     LOG("r1: RING capture: median %.3f mean %.3f p99 %.3f ms; parts (means): hold %.3f, sweep + undo log %.3f, page copy (parallel) %.3f, fibers + threads + command buffers + let go %.3f; pages %.0f + extras %.0f mean (%.1f MB)\n",
         rg_pct(g_rgc[0], n, 50), rg_mean(g_rgc[0], n), rg_pct(g_rgc[0], n, 99), rg_mean(g_rgc[1], n), rg_mean(g_rgc[2], n), rg_mean(g_rgc[3], n), rg_mean(g_rgc[4], n), n ? pg / n : 0, n ? xp / n : 0, n ? (pg + xp) / n * PG / 1048576.0 : 0);
     {   long long w = 0; for (int q = 0; q < 9; q++) w += g_cp_wrote[q];
