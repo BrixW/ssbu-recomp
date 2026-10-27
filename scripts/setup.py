@@ -1190,6 +1190,7 @@ def step_check(cx):
         say('  %s: %s' % (var, line.strip() or 'no result line (logs/check_cxxrt.log)'))
         if not line.rstrip().endswith(' 0 failed'):
             say('  WARNING: the C++ runtime self-test reports failures (logs/check_cxxrt.log)')
+    _rbtest(cx)
     _difftest(cx)
 
 
@@ -1209,6 +1210,26 @@ def _sdk_result(cx, out):
     if known:
         say('  (accepted, not a fault of the build: %s)' % '; '.join(l.split(':')[0] + ': ' + ('the on-screen keyboard dialog could not take the focus'
             if l.startswith('swkbd') else 'album movie recording, not in the %s build yet' % ('Linux' if cx.linux else 'macOS')) for l in known))
+
+
+def _rbtest(cx):
+    # the rollback netcode's game-free parts (rb.h): a scripted peer over a lossy link, prediction and rollback against a toy
+    # simulation (tests/rb_test.c). It needs no game; a PC without the sources staged (a prebuilt runtime) skips it
+    srcs = [os.path.join('tests', 'rb_test.c'), 'rb_input.c', 'rb_wire.c', 'rb_timesync.c']
+    if not all(os.path.exists(os.path.join(cx.work, s)) for s in srcs + ['rb.h']):
+        say('  rollback netcode test: skipped (its sources are not staged)')
+        return
+    exe = 'rb_test' if cx.posix else 'rb_test.exe'
+    try:
+        cx.run('check', [cx.tools['clang'], '-O1', '-I', '.'] + srcs + ['-o', exe], log='check_rbtest')
+        out = cx.run('check', [os.path.join(cx.work, exe)], log='check_rbtest', timeout=SELFTEST_LIMIT)
+    except Fail as e:
+        say('  WARNING: the rollback netcode test did not run or failed (%s; logs/check_rbtest.log)' % e)
+        return
+    line = next((l for l in reversed(out.splitlines()) if l.startswith('rb_test:')), '')
+    say('  rollback netcode test: ' + (line.strip() or 'no result line (logs/check_rbtest.log)'))
+    if 'all passed' not in line:
+        say('  WARNING: the rollback netcode test reports failures (logs/check_rbtest.log)')
 
 
 def _difftest(cx):
