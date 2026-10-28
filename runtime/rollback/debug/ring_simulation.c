@@ -70,7 +70,7 @@ void rgs_step(Ctx *c) {
     if (g_ra_phase == 0 && ok && g_rg_caps >= g_rgs_warm && g_rgs_real_since >= g_rgs_n) {
         int k = 1 + g_rgs_ki % g_rgs_k;
         long long target = i - k, best = -1;
-        for (int s = 0; s < g_rg_count; s++) { long long f = rg_slot(s)->frame; if (f <= target && f > best) best = f; }
+        best = rg_best_state(target);                          /* the newest QUIET state at or before target (snapshot_ring.c) */
         if (best >= 0 && r1_ring_load(best, c) > 0) {
             g_rgs_ki++; g_rgs_real_since = 0; g_rgs_done++;
             g_rgs_left = (int)(i - best); g_rgs_next = best + 1; g_ra_phase = 2;

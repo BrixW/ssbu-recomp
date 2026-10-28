@@ -182,7 +182,7 @@ static void rbg_wait_until(double t) {                  /* a high-resolution tim
 }
 static int rbg_rollback(Ctx *c, long long i, int m) {
     long long target = m - 1, best = -1;
-    for (int s = 0; s < g_rg_count; s++) { long long f = rg_slot(s)->frame; if (f <= target && f > best) best = f; }
+    best = rg_best_state(target);                          /* the newest QUIET state at or before target (snapshot_ring.c) */
     if (best < 0) {
         g_rbg_miss++; g_rbg_pend = 0;
         if (g_rbg_miss <= 10) LOG("r1: RB NET: wrong guess at frame %lld but no state at or before frame %lld in the ring (oldest %lld): NOT rolled back (desync)\n", (long long)m, target, r1_ring_oldest());
@@ -476,6 +476,7 @@ void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
+    rb_fault_report();                                  /* once per match: the safety net and the quiet states (fault_recovery.c, snapshot_ring.c) */
     if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);

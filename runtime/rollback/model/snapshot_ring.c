@@ -235,6 +235,65 @@ static void rg_cb_load(RgSlot *s) {
     }
     nvn_r1_cb_restore();
 }
+/* ---- QUIET STATES (option 1). A rollback can only be undone cleanly when, at the state it goes back to, every Windows "worker" (the job fibers the game's scripts run on) was at one of its
+ * usual pauses: the host side of a fiber (its stack, its place in the job system) is not part of the memory the ring rewinds, and a state taken while a fiber stood somewhere unusual (in the
+ * middle of a script shutting down, say) is the kind after which the real matches crashed or froze. Each capture is marked quiet or not:
+ *   - every guest thread the capture held is at a wait (parked);
+ *   - every fiber that has run stands at a known pause site (the import it is in and the call site). The sites of the first capture of a fight are known; a new site becomes known once it has
+ *     been seen in QS_LEARN captures in a row (a new character's normal pause), so a fight does not stay "noisy" for ever.
+ * A load takes the newest QUIET state at or before the frame it needs; with none, the newest state as before (a rollback is never refused: that would desync an online match).
+ * SSBU_RB_QUIET=0: off (always the newest state). The counts go to the log, which is also the measurement of how often states are noisy and why. */
+#define QS_MAX 64
+#define QS_LEARN 30
+static struct { const char *imp; uint64_t from; int known; long long streak, last_cap; } g_qs[QS_MAX]; static int g_nqs;
+static long long g_qs_capno, g_qs_quiet, g_qs_noisy, g_qs_loads_quiet, g_qs_loads_older, g_qs_loads_fallback, g_qs_extra;
+static int g_qs_on = -1;
+static int qs_same(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+static void qs_mark(RgSlot *s) {
+    if (g_qs_on < 0) { const char *e = getenv("SSBU_RB_QUIET"); g_qs_on = !(e && e[0] == '0'); }
+    s->qset = 1; s->quiet = 1;
+    if (!g_qs_on) return;
+    int first = g_nqs == 0; g_qs_capno++;
+    const char *why = NULL; char detail[160] = "";
+    for (int i = 0; i < g_guest_threads.count; i++) {
+        Th *t = &g_guest_threads.table[i];
+        if (t->held && !t->parked && !why) { why = "a thread not at a wait"; snprintf(detail, sizeof detail, "%s in %s", t->name ? t->name : "?", t->c && t->c->in_import ? t->c->in_import : "guest code"); }
+    }
+    for (int i = 0; i < g_guest_fibers.count; i++) {
+        Fib *f = &g_guest_fibers.table[i];
+        if (!f->c) continue;                                  /* set up, never run */
+        int k; for (k = 0; k < g_nqs; k++) if (qs_same(g_qs[k].imp, f->imp) && g_qs[k].from == f->from) break;
+        if (k == g_nqs) { if (g_nqs >= QS_MAX) continue; g_qs[k].imp = f->imp; g_qs[k].from = f->from; g_qs[k].known = first; g_qs[k].streak = 0; g_qs[k].last_cap = 0; g_nqs++; }
+        if (g_qs[k].last_cap != g_qs_capno) {
+            g_qs[k].streak = g_qs[k].last_cap == g_qs_capno - 1 ? g_qs[k].streak + 1 : 1; g_qs[k].last_cap = g_qs_capno;
+            if (!g_qs[k].known && g_qs[k].streak >= QS_LEARN) { g_qs[k].known = 1; LOG("r1: QUIET: pause site %s @%llx learned (seen in %d captures in a row)\n", f->imp ? f->imp : "guest code", (unsigned long long)f->from, QS_LEARN); }
+        }
+        if (!g_qs[k].known && !why) { why = "a fiber at an unusual place"; snprintf(detail, sizeof detail, "%s @%llx", f->imp ? f->imp : "guest code", (unsigned long long)f->from); }
+    }
+    s->quiet = why == NULL;
+    if (s->quiet) g_qs_quiet++; else { g_qs_noisy++; if (g_qs_noisy <= 20) LOG("r1: QUIET: state of frame %lld is NOT quiet: %s (%s)\n", s->frame, why, detail); }
+}
+/* The state a rollback to `target` loads (see above). Every load site uses it: the online controller, the forced-rollback simulation, the safety net. */
+long long rg_best_state(long long target) {
+    long long best = -1, bq = -1;
+    for (int i = 0; i < g_rg_count; i++) {
+        RgSlot *sl = rg_slot(i); long long f = sl->frame;
+        if (f < 0 || f > target) continue;
+        if (f > best) best = f;
+        if ((!sl->qset || sl->quiet) && f > bq) bq = f;
+    }
+    long long n = g_qs_loads_quiet + g_qs_loads_fallback + 1;
+    if (bq >= 0) {
+        g_qs_loads_quiet++;
+        if (bq != best) { g_qs_loads_older++; g_qs_extra += best - bq; if (g_qs_loads_older <= 20) LOG("r1: QUIET: rollback to %lld: the newest state (%lld) is not quiet, state %lld loaded instead (%lld more frames again)\n", target, best, bq, best - bq); }
+    } else if (best >= 0) { g_qs_loads_fallback++; if (g_qs_loads_fallback <= 20) LOG("r1: QUIET: rollback to %lld: no quiet state at or before it in the ring: the newest (%lld) loaded as before\n", target, best); }
+    if (n % 100 == 0) rg_quiet_report();
+    return bq >= 0 ? bq : best;
+}
+void rg_quiet_report(void) {
+    LOG("r1: QUIET: captures quiet %lld / not quiet %lld; loads from a quiet state %lld (%lld of them an older one than the newest, %lld frames run again more in all), loads with no quiet state %lld\n",
+        g_qs_quiet, g_qs_noisy, g_qs_loads_quiet, g_qs_loads_older, g_qs_extra, g_qs_loads_fallback);
+}
 static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: their places, the fibers, the command buffers */
     s->ctx = *c;
     nnsdk_tls_save(s->tls);
@@ -246,6 +305,7 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     if (g_guest_fibers.pool_used && rg_vcom(s->fpool, &s->fpool_com, g_guest_fibers.pool_used, 1u << 20)) { memcpy(s->fpool, g_guest_fibers.pool, g_guest_fibers.pool_used); s->fpool_used = g_guest_fibers.pool_used; }
     else if (g_guest_fibers.pool_used) for (int i = 0; i < s->nfib; i++) s->fib[i].susp = 0;
     if (!rg_cb_capture(s)) s->ncbs = 0;
+    qs_mark(s);
 }
 static void rg_free_all(void) {                         /* (hs13) a ring that could not be made: what it took is given back */
     if (g_rg_idx) VirtualFree(g_rg_idx, 0, MEM_RELEASE);

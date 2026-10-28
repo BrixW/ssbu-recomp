@@ -213,6 +213,7 @@ typedef struct {
     int ncbs; uint8_t *cbs; uint8_t *cbd; size_t cbd_used, cbd_com;
     size_t pages, xpages;
     uint64_t tls[64];                                   /* nn::os thread-local storage slots (nnsdk.c: one host table), as at the capture */
+    int quiet, qset;                                    /* every worker at a usual pause when it was taken (snapshot_ring.c rg_best_state) */
 } RgSlot;
 
 typedef struct { uint64_t blk; long long n[3]; } RgPageCount;
@@ -450,7 +451,8 @@ void rbg_step(Ctx *c);    /* controller/rollback_controller.c */
 void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry);    /* controller/rollback_controller.c */
 void rbg_fight_off(void);    /* controller/rollback_controller.c */
 void rbg_report(void);    /* controller/rollback_controller.c */
-RgSlot *rg_slot(int i);    /* model/snapshot_ring.c */
+RgSlot *rg_slot(int i);
+long long rg_best_state(long long target); void rg_quiet_report(void);    /* model/snapshot_ring.c: the state a rollback loads (the newest quiet one) */    /* model/snapshot_ring.c */
 void r1_ring_let_go(void);    /* model/snapshot_ring.c */
 int r1_ring_hold(void);    /* model/snapshot_ring.c */
 long long r1_ring_oldest(void);    /* model/snapshot_ring.c */

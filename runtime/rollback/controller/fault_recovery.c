@@ -188,7 +188,7 @@ int rb_fault_recover(long long i, Ctx *c, long long *best_out) {
     LONG depth = InterlockedIncrement(&g_fr_depth);
     if (g_fr_recoveries >= FR_MAX_RECOVERIES) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: %d recoveries in this run: the net lets go\n", FR_MAX_RECOVERIES); return 0; }
     long long target = i - depth, best = -1;
-    for (int s = 0; s < g_rg_count; s++) { long long f = rg_slot(s)->frame; if (f >= 0 && f <= target && f > best) best = f; }
+    best = rg_best_state(target);                          /* the newest QUIET state at or before target (snapshot_ring.c) */
     if (best < 0) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: pass %lld faulted %ld times in a row and the ring has no older state: the net lets go\n", i, (long)depth); return 0; }
     g_rg_keep = 0;
     double t0 = now_ms();
@@ -213,6 +213,7 @@ void rb_fault_give_up(void) { InterlockedExchange(&g_fr_pending, 0); Interlocked
 void rb_fault_pass_clean(void) { if (!g_fr_pending && g_fr_depth) InterlockedExchange(&g_fr_depth, 0); InterlockedExchange(&g_fr_in_pass, 0); }
 
 void rb_fault_report(void) {
+    rg_quiet_report();
     if (g_fr_total || g_fr_not_absorbable || g_fr_giveups)
         LOG("r1: FAULT RECOVERY so far: %lld faults absorbed, %lld recoveries, %lld not absorbable, %lld times the net let go%s\n", (long long)g_fr_total, (long long)g_fr_recoveries, (long long)g_fr_not_absorbable, (long long)g_fr_giveups, g_fr_off ? " (OFF now)" : "");
 }
