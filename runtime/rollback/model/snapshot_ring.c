@@ -294,6 +294,40 @@ void rg_quiet_report(void) {
     LOG("r1: QUIET: captures quiet %lld / not quiet %lld; loads from a quiet state %lld (%lld of them an older one than the newest, %lld frames run again more in all), loads with no quiet state %lld\n",
         g_qs_quiet, g_qs_noisy, g_qs_loads_quiet, g_qs_loads_older, g_qs_extra, g_qs_loads_fallback);
 }
+/* ---- THE FIBERS' GUEST STACKS (the root cause of the post-rollback crashes, 2026-10-28). A coroutine made after the ring's base gets its guest stack in pages committed after it, which the ring
+ * never saves (the third big reservation is "extras" as committed at the base): the failing throw's sp, x29 and return-address slot were all in such a stack, "NOT saved by the ring". A load put
+ * the coroutine's registers and host stack back to the capture, while its guest stack still held what it wrote AFTER the capture: resumed, it read frames from the future (a wrong x29 / return
+ * address: the throw that could not be walked, the cascades, Lua's index2value). Each capture now copies, for every fiber that has run, the live part of its guest stack [sp, top); a load writes
+ * it back. Tens of fibers with shallow stacks: a few hundred KB per capture. SSBU_R1_GSTACK=0: off. */
+static int g_gstk_on = -1; static long long g_gstk_caps, g_gstk_bytes, g_gstk_fail, g_gstk_loads;
+static void rg_gstk_capture(RgSlot *s) {
+    if (g_gstk_on < 0) { const char *e = getenv("SSBU_R1_GSTACK"); g_gstk_on = !(e && e[0] == '0'); }
+    s->gstk_used = 0;
+    if (!g_gstk_on || !s->gstk) return;
+    for (int i = 0; i < s->nfib; i++) {
+        Fib *f = &s->fib[i];
+        if (!f->c) continue;                                    /* never ran: nothing on its stack yet */
+        uint64_t lo = f->obj[4], hi = f->obj[4] + f->obj[5], sp = f->sp;
+        if (!f->obj[5] || sp < lo || sp >= hi) continue;
+        uint64_t a = sp & ~(uint64_t)15; size_t n = (size_t)(hi - a), need = s->gstk_used + 16 + ((n + 15) & ~(size_t)15);
+        if (n > (16u << 20) || !rg_vcom(s->gstk, &s->gstk_com, need, 1u << 20)) { g_gstk_fail++; break; }
+        uint8_t *o = s->gstk + s->gstk_used;
+        ((uint64_t *)o)[0] = a; ((uint64_t *)o)[1] = n;
+        memcpy(o + 16, (const void *)(uintptr_t)a, n);
+        s->gstk_used = need;
+    }
+    g_gstk_caps++; g_gstk_bytes += (long long)s->gstk_used;
+    if (g_gstk_caps == 1 || g_gstk_caps % 2000 == 0) LOG("r1: GSTACK: %lld captures, %.1f KB of fiber guest stacks each on average, %lld that ran out of room\n", g_gstk_caps, g_gstk_bytes / 1024.0 / g_gstk_caps, g_gstk_fail);
+}
+static void rg_gstk_load(const RgSlot *s) {
+    if (!g_gstk_on || !s->gstk) return;
+    for (size_t off = 0; off + 16 <= s->gstk_used; ) {
+        const uint8_t *o = s->gstk + off; uint64_t a = ((const uint64_t *)o)[0]; size_t n = (size_t)((const uint64_t *)o)[1];
+        memcpy((void *)(uintptr_t)a, o + 16, n);
+        off += 16 + ((n + 15) & ~(size_t)15);
+    }
+    g_gstk_loads++;
+}
 static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: their places, the fibers, the command buffers */
     s->ctx = *c;
     nnsdk_tls_save(s->tls);
@@ -305,6 +339,7 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     if (g_guest_fibers.pool_used && rg_vcom(s->fpool, &s->fpool_com, g_guest_fibers.pool_used, 1u << 20)) { memcpy(s->fpool, g_guest_fibers.pool, g_guest_fibers.pool_used); s->fpool_used = g_guest_fibers.pool_used; }
     else if (g_guest_fibers.pool_used) for (int i = 0; i < s->nfib; i++) s->fib[i].susp = 0;
     if (!rg_cb_capture(s)) s->ncbs = 0;
+    rg_gstk_capture(s);
     qs_mark(s);
 }
 static void rg_free_all(void) {                         /* (hs13) a ring that could not be made: what it took is given back */
@@ -318,6 +353,7 @@ static void rg_free_all(void) {                         /* (hs13) a ring that co
         RgSlot *s = &g_rg[i];
         if (s->ent) VirtualFree(s->ent, 0, MEM_RELEASE);
         if (s->fpool) VirtualFree(s->fpool, 0, MEM_RELEASE);
+        if (s->gstk) VirtualFree(s->gstk, 0, MEM_RELEASE);
         if (s->cbd) VirtualFree(s->cbd, 0, MEM_RELEASE);
         free(s->fib); free(s->cbs);
     }
@@ -343,7 +379,7 @@ static int rg_init(void) {
     for (int i = 0; i < g_nx; i++) for (size_t o = 0; o < g_x[i].n; o += PG) { g_rg_xa[e] = g_x[i].a + o; g_rg_xb[e] = g_x[i].b + o; e++; }
     for (int i = 0; i < g_rg_cap; i++) {
         RgSlot *s = &g_rg[i]; s->frame = -1;
-        s->ent = (uint32_t *)rg_vres(RG_ENT_RES); s->fpool = rg_vres(RG_FP_RES); s->cbd = rg_vres(RG_CB_RES);
+        s->ent = (uint32_t *)rg_vres(RG_ENT_RES); s->fpool = rg_vres(RG_FP_RES); s->cbd = rg_vres(RG_CB_RES); s->gstk = rg_vres(RG_GS_RES); s->gstk_used = s->gstk_com = 0;
         s->fib = malloc(1024 * sizeof *s->fib); s->cbs = malloc(512 * RG_CBS_SIZE);
         if (!s->ent || !s->fpool || !s->cbd || !s->fib || !s->cbs) { LOG("r1: RING: slot allocation FAILED\n"); rg_free_all(); return 0; }
     }
@@ -759,6 +795,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     restore_thread_regs(); double t2a = now_ms();
     long long lr_kept0 = g_rgc_kept, lr_dropped0 = g_rgc_dropped, lr_dead0 = g_rgc_dead;
     fibers_restore_all(); double t2b = now_ms();
+    rg_gstk_load(g);                                      /* the fibers' guest stacks as at that capture (pages the ring itself may not save) */
     rgc_after(); double t2c = now_ms();
     rg_load_note(frame, k, lr_kept0, lr_dropped0, lr_dead0);       /* (measurement) what this load did to the workers and the catch table */
     rg_cb_load(g);
