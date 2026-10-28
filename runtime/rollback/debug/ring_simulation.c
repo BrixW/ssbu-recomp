@@ -285,9 +285,39 @@ static uint64_t rgv_hash(const uint8_t *p) {
 }
 static void rgvd_keep(size_t n, const uint8_t *src); static void rgvd_show(size_t n, uint32_t id, const uint8_t *now);
 static uint8_t *rg_src_v(uint32_t id, uint32_t v) { uint32_t s = g_rg_idx[id]; g_rg_idx[id] = v; uint8_t *r = rg_src(id); g_rg_idx[id] = s; return r; }
+/* SSBU_RB_SIM_VERIFY=3: besides the tracked pages, snapshot the pages the ring does NOT save (committed/written outside it during the fight, page_tracker_learned.c) at the load and compare them after the
+ * re-run returns to the same pass. If many of those differ, the state the ring cannot restore is the cause of the post-rollback crashes and bringing those pages into the ring (option 2) would fix it;
+ * if ~none differ, the corruption is elsewhere (host-side) and option 2 would not be enough. First 12 rollbacks. */
+extern uint64_t g_xls_out_pg[]; extern volatile LONG g_xls_out_npg;
+static uint64_t *g_rgvo_h; static int g_rgvo_n;
+static uint64_t rgv_hash(const uint8_t *p);
+static void rgvo_before(void) {
+    if (g_rgv_on < 3 || g_rgv_runs >= 12) { g_rgvo_n = 0; return; }
+    int n = (int)g_xls_out_npg; if (n > 65536) n = 65536;
+    if (!g_rgvo_h) g_rgvo_h = malloc((size_t)65536 * 8);
+    if (!g_rgvo_h) { g_rgvo_n = 0; return; }
+    g_rgvo_n = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t *a = (uint8_t *)(uintptr_t)g_xls_out_pg[i];
+        MEMORY_BASIC_INFORMATION mi; if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+        g_xls_out_pg[g_rgvo_n] = g_xls_out_pg[i];       /* compact to the ones still committed, so rgvo_after lines up */
+        g_rgvo_h[g_rgvo_n] = rgv_hash(a); g_rgvo_n++;
+    }
+}
+static void rgvo_after(void) {
+    if (g_rgv_on < 3 || g_rgv_runs >= 12 || !g_rgvo_h || !g_rgvo_n) return;
+    int differ = 0; char first[300]; int o = 0; first[0] = 0;
+    for (int i = 0; i < g_rgvo_n; i++) {
+        uint8_t *a = (uint8_t *)(uintptr_t)g_xls_out_pg[i];
+        MEMORY_BASIC_INFORMATION mi; if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT) { differ++; continue; }
+        if (rgv_hash(a) != g_rgvo_h[i]) { differ++; if (o < 260) o += snprintf(first + o, sizeof first - o, " %llx", (unsigned long long)(uintptr_t)a); }
+    }
+    LOG("r1: RB VERIFY OUTSIDE-RING: %d of %d pages the ring does not save differ after the re-run%s%s\n", differ, g_rgvo_n, differ ? "; first:" : " (so these pages are not the cause)", first);
+}
 void rgv_before(int si, long long target) {        /* in r1_ring_load, before the undo logs are applied */
-    if (g_rgv_on < 0) g_rgv_on = getenv("SSBU_RB_SIM_VERIFY") ? (atoi(getenv("SSBU_RB_SIM_VERIFY")) > 1 ? 2 : 1) : 0;
+    if (g_rgv_on < 0) g_rgv_on = getenv("SSBU_RB_SIM_VERIFY") ? atoi(getenv("SSBU_RB_SIM_VERIFY")) : 0;
     if (!g_rgv_on) return;
+    rgvo_before();
     size_t tot = g_rg_n1 + g_rg_n2 + g_rg_nx;
     if (!g_rgv_in) { g_rgv_in = calloc(tot, 1); g_rgv_id = malloc((size_t)RGV_MAX * 4); g_rgv_h = malloc((size_t)RGV_MAX * 8); }
     g_rgv_n = 0;
@@ -374,6 +404,7 @@ static void rgv_after(void) {                               /* right after the c
     if (d[0] || d[1]) g_rgv_bad_runs++;
     if (d[0] || d[1] || d[2] || g_rgv_runs <= 5) LOG("r1: RB VERIFY rollback to %lld, back at %lld: %lld pages compared; differ: window 1 %lld, window 2 %lld, extras %lld;%s\n", g_rgv_from, g_rgv_target, pages, d[0], d[1], d[2], first);
     if (d[0] || d[1] || d[2]) { if (g_rgv_runs <= 8 || g_rgv_runs % 50 == 0) rgv_blk_print(); else g_rgv_nblk = 0; }
+    rgvo_after();                                           /* VERIFY=3: the pages the ring does not save */
     g_rgv_target = -1;
 }
 int rgs_skip_now(void) { return g_rgs_on > 0 && g_ra_phase == 2 && (g_rgs_left > 1 || g_rgs_lastlite) ? g_rgs_skip : 0; }
