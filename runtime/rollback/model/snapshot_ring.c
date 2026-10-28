@@ -336,6 +336,8 @@ int r1_ring_capture(long long frame, Ctx *c) {
         if (g_mark <= 0) { g_ra_off = 1; LOG("r1: RING: no marks (the game DLL with marks is not loaded): OFF\n"); return 0; }
         if (!rg_init()) { g_rg_nomem = 2; if (!rbg_on()) g_ra_off = 1; LOG("r1: RING: its own allocations FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
         g_rg_ready = 1;
+        {   const char *e = getenv("SSBU_RB_AUDIO_OFF");              /* the audio threads stop for the rest of the fight (hostrt.c rb_audio_off_gate) */
+            if (e && e[0] && e[0] != '0') { InterlockedExchange(&g_rb_audio_off, 1); LOG("r1: RING: SSBU_RB_AUDIO_OFF: the audio threads stop at their next SDK call until the fight is over\n"); } }
         RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
         s->frame = frame; s->nent = 0;
         rg_meta_capture(s, &g_ctx_save);

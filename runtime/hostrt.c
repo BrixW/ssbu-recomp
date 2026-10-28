@@ -571,6 +571,21 @@ static int g_import_count_all = 1;
  * waits here (the console's kernel stops the threads wherever they are; a thread inside a kernel call finishes it there too). */
 volatile LONG g_guest_frozen;
 void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }
+/* Rollback, SSBU_RB_AUDIO_OFF=1: once the snapshot ring has made its base (rollback/model/snapshot_ring.c sets g_rb_audio_off) the audio threads of the
+ * game (nus3 / sindou / "Audio" in the thread name) stop for good at their next SDK call or return. Their state lives in the same guest memory the ring
+ * rewinds while they keep running at another point of their loop: after a load they crashed (reads of 0x5, 0xffffffffffffffff) or spun at 375 % CPU.
+ * They look like a thread blocked in a wait (so the ring parks them like any other) until the fight is over. No sound in rollback matches while it is on. */
+volatile LONG g_rb_audio_off;
+const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
+void rb_audio_off_gate(Ctx *c) {
+    static __declspec(thread) int is_audio = -1;
+    if (is_audio < 0) { const char *n = guest_thread_name_of(GetCurrentThreadId()); if (!n) return; is_audio = (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")) ? 1 : 0; }
+    if (!is_audio) return;
+    const char *saved_name = c->in_import; uint64_t saved_from = c->import_from;
+    c->in_import = "nn::os::WaitEvent (rollback: audio thread stopped)"; c->import_from = 0;
+    while (g_rb_audio_off) Sleep(20);                    /* the fight is over: the audio threads go on */
+    c->in_import = saved_name; c->import_from = saved_from;
+}
 /* Session 8 (track V), SSBU_IMPORT_WATCH=<part of an import's name>: the calls of that one import are timed, and for every
  * frame in which they took more than 2 ms a line says how many there were, what they cost, the slowest one (with the text
  * its third argument points at when it is a printable string: the format of a formatting function) and how many different
@@ -617,6 +632,7 @@ void host_import(Ctx *c, int sym) {
 static void host_import_real(Ctx *c, int sym) {
     static volatile LONG order_count;
     if (g_guest_frozen) guest_freeze_wait();
+    if (g_rb_audio_off) rb_audio_off_gate(c);
     if (!g_import_count_all && g_import_calls[sym] >= 3 && g_handlers[sym]) {
         const char *saved_name = c->in_import;
         uint64_t saved_from = c->import_from;
@@ -626,6 +642,7 @@ static void host_import_real(Ctx *c, int sym) {
         c->in_import = saved_name;
         c->import_from = saved_from;
         if (g_guest_frozen) guest_freeze_wait();
+        if (g_rb_audio_off) rb_audio_off_gate(c);
         return;
     }
     unsigned long long n = (unsigned long long)InterlockedIncrement64((volatile LONG64 *)&g_import_calls[sym]);
@@ -657,6 +674,7 @@ static void host_import_real(Ctx *c, int sym) {
     c->in_import = saved_name;
     c->import_from = saved_from;
     if (g_guest_frozen) guest_freeze_wait();
+    if (g_rb_audio_off) rb_audio_off_gate(c);
 }
 
 void print_import_summary(FILE *out) {
