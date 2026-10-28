@@ -340,7 +340,7 @@ static void catch_diag(uint64_t cfa) {                                        /*
 
 /* What nro_catch_call keeps on its host frame. The jmp_buf comes first, so the pointer in the catch table IS a CatchFrame: the rest says which function it is (body), the guest frame (cfa)
  * and how many guest mutexes the thread held when the function was entered (held, os_threads.c), for absorb_by_host_stack below. */
-typedef struct { jmp_buf jb; void (*body)(Ctx *, uint64_t); uint64_t cfa; int held; } CatchFrame;
+typedef struct { jmp_buf jb; void (*body)(Ctx *, uint64_t); uint64_t cfa; int held; Ctx *ctx; } CatchFrame;
 int os_mutexes_held_here(void); void os_release_held_down_to(int depth);      /* os_threads.c */
 
 /* Entry of every lifted function whose LSDA has a catch clause (generated code: `nro_catch_call(c, u_<fn>)`). */
@@ -350,7 +350,7 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     volatile uint64_t cfa = c->x[31];                     /* the CFA of an AArch64 frame is the stack pointer at entry */
     const char *volatile in_import = c->in_import;
     volatile uint64_t import_from = c->import_from;
-    cf.body = body; cf.cfa = cfa; cf.held = os_mutexes_held_here();
+    cf.body = body; cf.cfa = cfa; cf.held = os_mutexes_held_here(); cf.ctx = c;
     catch_put(cfa, &cf.jb);
     if (setjmp(cf.jb) == 0) {
         body(c, 0);
@@ -624,6 +624,8 @@ static int reload_via_host_catch(Ctx *c, uint64_t exc) {
     ReleaseSRWLockExclusive(&g_catch_lock);
     os_release_held_down_to(best->held);
     { EhPad pad; memset(&pad, 0, sizeof pad); pad.exception = exc; eh_enter_pad(c, &pad); }      /* the exception is no longer in flight */
+    c->x[0] = 0; c->x[1] = 0;                              /* the function "returns" 0: eh_enter_pad left the exception pointer in x0, and the job runner read that return value as the fiber to switch to
+                                                         * next (a real match, 2026-10-28: SwitchToFiber to "CLNGC++\0", the exception's class tag). 0 = nothing next, back to the thread. */
     InterlockedIncrement(&g_host_reloads);
     if (g_host_reloads <= 20) printf("unwind: %s at 0x%llx would terminate: host stack unwound to f_%llx, the pass will be reloaded (%ld so far)\n",
                                      eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)guest_function_of((uint64_t)(uintptr_t)best->body), (long)g_host_reloads);
@@ -649,6 +651,27 @@ static CatchFrame *innermost_catch_above(uint64_t rsp) {
 }
 int nnunwind_has_bail_target(uint64_t rsp) { return innermost_catch_above(rsp) != NULL; }
 static volatile LONG g_bails;
+/* fault_recovery.c, from the exception filter: the faulting thread resumes at the innermost catch frame of its own stack as if its setjmp had returned 1 (the frame's function returns 0 to its
+ * guest caller). The CONTEXT is loaded straight from the jmp_buf: Windows restores it when the filter returns EXCEPTION_CONTINUE_EXECUTION, no frame has to be walked. 1 = done. */
+int nnunwind_bail_context(CONTEXT *cx) {
+    CatchFrame *best = innermost_catch_above(cx->Rsp);
+    if (!best) return 0;
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++)
+        if (g_catch[i].cfa > 1 && g_catch[i].jb && catch_here(g_catch[i].jb) && (uintptr_t)g_catch[i].jb <= (uintptr_t)best) catch_free_slot(i);
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    os_release_held_down_to(best->held);
+    if (best->ctx) { best->ctx->x[0] = 0; best->ctx->x[1] = 0; }
+    const _JUMP_BUFFER *j = (const _JUMP_BUFFER *)(const void *)best->jb;
+    cx->Rbx = j->Rbx; cx->Rsp = j->Rsp; cx->Rbp = j->Rbp; cx->Rsi = j->Rsi; cx->Rdi = j->Rdi;
+    cx->R12 = j->R12; cx->R13 = j->R13; cx->R14 = j->R14; cx->R15 = j->R15; cx->Rip = j->Rip; cx->Rax = 1;
+    cx->MxCsr = j->MxCsr;
+    const SETJMP_FLOAT128 *jx = &j->Xmm6; M128A *cxx = &cx->Xmm6;
+    for (int k = 0; k < 10; k++) { cxx[k].Low = jx[k].Part[0]; cxx[k].High = (LONGLONG)jx[k].Part[1]; }
+    LONG n = InterlockedIncrement(&g_bails);
+    if (n <= 20) printf("fault recovery: a fault was cut: resumed at the catch frame of f_%llx, the pass will be reloaded (%ld so far)\n", (unsigned long long)guest_function_of((uint64_t)(uintptr_t)best->body), (long)n);
+    return 1;
+}
 __declspec(noreturn) void nnunwind_bail_trampoline(void) {
     volatile char here = 0;
     CatchFrame *best = innermost_catch_above((uint64_t)(uintptr_t)&here);
@@ -660,6 +683,7 @@ __declspec(noreturn) void nnunwind_bail_trampoline(void) {
     os_release_held_down_to(best->held);
     LONG n = InterlockedIncrement(&g_bails);
     if (n <= 20) printf("fault recovery: a fault cascade was cut: host stack unwound to f_%llx, the pass will be reloaded (%ld so far)\n", (unsigned long long)guest_function_of((uint64_t)(uintptr_t)best->body), (long)n);
+    if (best->ctx) { best->ctx->x[0] = 0; best->ctx->x[1] = 0; }      /* the function returns 0 (see reload_via_host_catch) */
     longjmp(best->jb, 1);
 }
 #else

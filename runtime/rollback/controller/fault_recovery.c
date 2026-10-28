@@ -124,9 +124,8 @@ int rb_fault_try_absorb(EXCEPTION_POINTERS *ep) {
         int in_game = guest_function_of(cx->Rip) != 0;
         if ((g_fr_pending || g_fr_in_pass >= FR_BAIL || !in_game) && nnunwind_has_bail_target(cx->Rsp)) {
             if (!fr_note(in_game ? "cut (pass already tainted)" : "cut (fault outside the game's code)", cx->Rip, er->ExceptionInformation[1])) return 0;
-            cx->Rsp = ((cx->Rsp - 256) & ~(DWORD64)15) - 8;      /* as at a function's entry; the trampoline never returns, the dispatcher's frames below are given up */
-            cx->Rip = (DWORD64)(uintptr_t)nnunwind_bail_trampoline;
-            return 1;
+            { extern int nnunwind_bail_context(CONTEXT *cx); if (nnunwind_bail_context(cx)) return 1; }      /* the context is loaded from the catch frame's jmp_buf */
+            return 0;
         }
         if (!in_game) { InterlockedIncrement64(&g_fr_not_absorbable); LOG("r1: FAULT RECOVERY: a fault at %p is outside the game's code and this thread has no catch frame: not absorbable\n", (void *)ip); return 0; }
     }
