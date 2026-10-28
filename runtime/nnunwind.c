@@ -710,8 +710,11 @@ static void eh_raise(Ctx *c, int reason) {
         LONG seq = InterlockedIncrement(&g_throws);
         int found = 0, depth = 0;
         regs_from(c, &cur);
+        uint64_t prev_cfa = 0;
         for (; depth < 4096; depth++) {
             if (!frame(c, exc, &cur, &pad, &cfa, &stop)) break;
+            if (prev_cfa && cfa <= prev_cfa) { stop = "the walk went in a circle (a frame's CFA did not grow)"; break; }      /* up a stack every CFA is higher than the last: one that is not means a loop */
+            prev_cfa = cfa;
             if (pad.kind == EH_HANDLER) { found = 1; break; }
         }
 #ifdef _WIN32
@@ -748,6 +751,7 @@ static void eh_raise(Ctx *c, int reason) {
     for (int depth = 0; depth < 4096; depth++) {
         Regs at = cur;                                    /* registers of this frame at its call */
         if (!frame(c, exc, &cur, &pad, &cfa, &stop)) break;
+        { static __declspec(thread) uint64_t p2; if (depth == 0) p2 = 0; if (p2 && cfa <= p2) { stop = "the walk went in a circle (a frame's CFA did not grow)"; break; } p2 = cfa; }
         if (g_fix_x29_valid) at.x[29] = g_fix_x29;       /* x29 of this frame was wrong: the pad runs with the one the CFI implies */
         if (pad.kind == EH_NONE) continue;
         void (*fn)(Ctx *, uint64_t) = resume_entry(pad.landing_pad, &owner);

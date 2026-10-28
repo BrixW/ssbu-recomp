@@ -158,7 +158,12 @@ int rb_fault_absorb_unwind(Ctx *c) {
 }
 
 /* nnunwind.c step(): a frame whose x29 was wrong was walked from sp instead. The state is suspect, so the pass is marked like an absorbed fault. */
-void rb_fault_note_repair(uint64_t where_) { if (fr_enabled()) fr_note("x29 repaired from sp", where_, 0); }
+/* (does not spend the pass's fault budget: an unwind walks many frames and may repair several; it only taints the pass so it is reloaded) */
+void rb_fault_note_repair(uint64_t where_) {
+    if (!fr_enabled()) return;
+    InterlockedIncrement64(&g_fr_total); InterlockedExchange(&g_fr_pending, 1);
+    if (InterlockedIncrement(&g_fr_lines) <= 40) LOG("r1: FAULT RECOVERY: x29 repaired from sp at %llx, pass %lld%s\n", (unsigned long long)where_, g_rgs_next, g_ra_phase == 2 ? " RE-RUN" : "");
+}
 int rb_fault_net_active(void) { return fr_enabled(); }
 int rb_fault_pending(void) { return g_fr_pending != 0; }
 
