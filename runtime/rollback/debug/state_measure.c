@@ -26,7 +26,9 @@
 #define SM_NAMES 64
 #define SM_TOPOBJ 16
 
-typedef struct { const Ctx *key; uint64_t chain; int depth; } SmThread;      /* depth -1: could not be read, -2: thread not held */
+enum { SM_CHAIN = 24 };
+typedef struct { const Ctx *key; uint64_t chain; int depth; uint64_t fn[SM_CHAIN]; int nfn; } SmThread;      /* depth -1: could not be read, -2: thread not held; fn[]: the guest function of each frame found (innermost first) */
+uint64_t guest_function_of(uint64_t rip);            /* hostrt.c */
 typedef struct { uint64_t key; int sig, cnt; uint64_t len; } SmObj;
 typedef struct { long long frame; long long seq; int nth, nobj; SmThread th[SM_MAXTH]; SmObj obj[SM_MAXOBJ]; } SmEntry;
 typedef struct { char name[40]; long loads, same_wait, other_wait, chain_same, chain_diff, chain_unknown, callee_diff, other_diff; } SmStat;
@@ -67,8 +69,8 @@ static void sm_modules(void) {
 static int sm_in_lifted(uint64_t v) { for (int i = 0; i < g_sm_nmods; i++) if (v >= g_sm_mods[i].lo && v < g_sm_mods[i].hi) return 1; return 0; }
 
 /* Hash, in order, of the words on the suspended thread's host stack that point into the lifted code (its guest call chain). */
-static void sm_chain(const Th *t, uint64_t *chain, int *depth) {
-    *chain = 0; *depth = -2;
+static void sm_chain(const Th *t, uint64_t *chain, int *depth, uint64_t *fn, int *nfn) {
+    *chain = 0; *depth = -2; *nfn = 0;
     if (!t->held || !t->h) return;
     CONTEXT cx; memset(&cx, 0, sizeof cx); cx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!GetThreadContext(t->h, &cx)) { *depth = -1; return; }
@@ -76,9 +78,10 @@ static void sm_chain(const Th *t, uint64_t *chain, int *depth) {
     if (!VirtualQuery((void *)(uintptr_t)rsp, &mi, sizeof mi) || mi.State != MEM_COMMIT) { *depth = -1; return; }
     uint64_t end = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize; if (end > rsp + 65536) end = rsp + 65536;
     uint64_t h = 0xcbf29ce484222325ull; int n = 0;
-    __try { for (uint64_t p = rsp; p + 8 <= end; p += 8) { uint64_t v = *(volatile uint64_t *)(uintptr_t)p; if (sm_in_lifted(v)) { for (int b = 0; b < 8; b++) { h ^= (v >> (8 * b)) & 0xff; h *= 0x100000001b3ull; } n++; } } }
+    __try { for (uint64_t p = rsp; p + 8 <= end; p += 8) { uint64_t v = *(volatile uint64_t *)(uintptr_t)p; if (sm_in_lifted(v)) { for (int b = 0; b < 8; b++) { h ^= (v >> (8 * b)) & 0xff; h *= 0x100000001b3ull; } if (n < SM_CHAIN) fn[n] = v; n++; } } }
     __except (EXCEPTION_EXECUTE_HANDLER) { *depth = -1; return; }
-    *chain = h; *depth = n;
+    *chain = h; *depth = n; *nfn = n < SM_CHAIN ? n : SM_CHAIN;
+    for (int i = 0; i < *nfn; i++) fn[i] = guest_function_of(fn[i]);
 }
 
 static void sm_obj_cb(uint64_t key, int sig, int cnt, uint64_t len, uint64_t thread, uint64_t stack, uint64_t stack_size) {
@@ -98,7 +101,7 @@ void sm_capture(long long frame) {
     e->nth = 0;
     for (int i = 0; i < g_guest_threads.count && e->nth < SM_MAXTH; i++) {
         const Th *t = &g_guest_threads.table[i];
-        SmThread *s = &e->th[e->nth++]; s->key = t->c; sm_chain(t, &s->chain, &s->depth);
+        SmThread *s = &e->th[e->nth++]; s->key = t->c; sm_chain(t, &s->chain, &s->depth, s->fn, &s->nfn);
     }
     sm_objects_now();
     memcpy(e->obj, g_sm_now, (size_t)g_sm_nnow * sizeof g_sm_now[0]); e->nobj = g_sm_nnow;
@@ -130,10 +133,18 @@ void sm_load(long long frame) {
         if (t->same) s->same_wait++; else s->other_wait++;
         const SmThread *was = NULL;
         for (int k = 0; k < e->nth; k++) if (e->th[k].key == t->c) { was = &e->th[k]; break; }
-        uint64_t chain; int depth; sm_chain(t, &chain, &depth);
+        uint64_t chain, fn[SM_CHAIN]; int depth, nfn; sm_chain(t, &chain, &depth, fn, &nfn);
         if (!was || was->depth < 0 || depth < 0) s->chain_unknown++;
         else if (was->chain == chain && was->depth == depth) s->chain_same++;
-        else s->chain_diff++;
+        else {
+            s->chain_diff++;
+            static int shown; if (shown++ < 12) {      /* the first few differences, frame by frame (guest functions, innermost first) */
+                char a[420], b[420]; int oa = 0, ob = 0; a[0] = b[0] = 0;
+                for (int k = 0; k < was->nfn && oa < 390; k++) oa += snprintf(a + oa, sizeof a - oa, " %llx", (unsigned long long)was->fn[k]);
+                for (int k = 0; k < nfn && ob < 390; k++) ob += snprintf(b + ob, sizeof b - ob, " %llx", (unsigned long long)fn[k]);
+                LOG("r1: STATE MEASURE chain of %s differs at load of frame %lld (wait %s @%llx): at the capture [%d]:%s | now [%d]:%s\n", t->name, frame, t->imp ? t->imp : "-", (unsigned long long)t->from, was->depth, a, depth, b);
+            }
+        }
         const Ctx *now = t->c, *saved = &t->regs;
         int callee = memcmp(&now->x[19], &saved->x[19], 13 * sizeof now->x[0]) || memcmp(&now->v[8], &saved->v[8], 8 * sizeof now->v[0]);
         int other = memcmp(&now->x[0], &saved->x[0], 19 * sizeof now->x[0]) || memcmp(&now->v[0], &saved->v[0], 8 * sizeof now->v[0]) || memcmp(&now->v[16], &saved->v[16], 16 * sizeof now->v[0])
