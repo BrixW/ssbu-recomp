@@ -331,7 +331,9 @@ static void rg_gstk_load(const RgSlot *s) {
         const uint64_t *h = (const uint64_t *)(s->gstk + off); uint64_t key = h[0], lo = h[1], hi = h[2], a = h[3]; size_t n = (size_t)h[4];
         off += GSH + ((n + 15) & ~(size_t)15);
         int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == key) break;
-        if (i == g_guest_fibers.count || !g_guest_fibers.table[i].rok || fibers_live_sp_in(lo, hi)) { g_gstk_skip++; continue; }
+        /* only a fiber put back WHOLE (switched away at the capture and now: its host stack and registers are the capture's): a fiber that was running on a thread at its usual wait gets its
+         * registers only, its host side stays where it is now, and old locals written under it (a render dispatch thread's job loop) made the game call std::terminate */
+        if (i == g_guest_fibers.count || g_guest_fibers.table[i].rok != 2 || fibers_live_sp_in(lo, hi)) { g_gstk_skip++; continue; }
         memcpy((void *)(uintptr_t)a, (const uint8_t *)h + GSH, n);
     }
     g_gstk_loads++;

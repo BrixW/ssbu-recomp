@@ -319,7 +319,7 @@ void fibers_restore_all(void) {
             memcpy(f->fiber, f->blk, FIB_BLOCK);
             if (f->fls) memcpy(f->fls, f->flsb, sizeof f->flsb);
             *f->c = f->regs;
-            g_guest_fibers.restored++; f->rok = 1;
+            g_guest_fibers.restored++; f->rok = 2;      /* (2: switched away then and now: host stack, block, registers all the capture's) */
         } else if (!f->susp && cf == f->fiber && cc == f->c && cc->in_import == f->imp && cc->import_from == f->from && cc->x[31] == f->sp) {
             R1_CTR("restore: fiber running at the save: registers only (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             for (int r = 19; r < 32; r++) cc->x[r] = f->regs.x[r];
