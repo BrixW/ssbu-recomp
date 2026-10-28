@@ -52,6 +52,7 @@ typedef struct Obj {
     uint64_t retval;                         /* pthread_create threads: start routine's result, for pthread_join */
     DWORD rw_owner;                          /* reader/writer locks: host thread holding the write lock, 0 = none */
     int rw_readers, rw_wcount, rw_wreads;    /* reader/writer locks: readers, write recursion, reads taken by the writer */
+    volatile LONG switch_outs;               /* fibers: times it switched away (rollback/debug/call_trace.c job trace: a job that suspends in the middle) */
 } Obj;
 
 #define BUCKETS 65536
@@ -746,6 +747,9 @@ static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 /* ---------------------------------------------------------------- fibers */
 void (*g_r1_fiber_born)(void *fiber);                 /* r1_state.c (R3 hs13): a new host fiber's stack is left out of the guest windows' state */
 static int fib_bad_target(uint64_t next, uint64_t from);
+/* rollback/debug/call_trace.c (job trace): the guest fiber this host thread runs now, and how many times a fiber has switched away so far */
+uint64_t os_fiber_cur_key(void) { return fiber_cur(); }
+long os_fiber_switch_outs(uint64_t key) { return key ? obj(key)->switch_outs : 0; }
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
     Ctx *c = new_ctx(o->stack + o->stack_size);
@@ -788,6 +792,7 @@ static void fib_switch(Ctx *c) {
     if (fib_bad_target(A0, c->x[30] - 4)) return;
     void *own = thread_fiber();
     uint64_t next = A0, self = fiber_cur();
+    if (self) InterlockedIncrement(&obj(self)->switch_outs);
     DWORD tid = GetCurrentThreadId();
     if (next) obj(next)->tp = c->tpidr;               /* the thread block (errno, ...) belongs to the host thread, not to the fiber */
     fiber_set_cur(next);

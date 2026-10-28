@@ -55,8 +55,78 @@ void call_trace_poll(void) {
     if (hook_install(GA(g_blr_fn), blr_hook, NULL, &g_blr_orig)) { g_blr_done = 1; LOG("r1: BAD LR TRACE: hook on f_%llx installed\n", g_blr_fn); }
 }
 
+
+/* ---------------------------------------------------------------- JOB TRACE (SSBU_TRACE_JOBS=1). Measurement for "run every job on the main thread during a rollback match".
+ * The game's job system runs each job on a Windows fiber: f_710353cf40 is the entry of every job (the job is [x0+64], its class's vtable [job], its Run the vtable's entry 6). Hooked there, during
+ * fights only, every job: its class (vtable), its Run, the thread it ran on, its wall time, and whether its fiber SWITCHED AWAY before it finished (it waited on something in the middle: such a job
+ * cannot simply be run start to end on one thread). Every 10 s of fight: jobs per frame, job time per frame (all, and of the jobs that never switched away = their CPU time), the time per thread, and
+ * the job classes by time. The question it answers: would every job of a frame fit in one thread's 16.7 ms, and which jobs wait in the middle. */
+uint64_t os_fiber_cur_key(void); long os_fiber_switch_outs(uint64_t key);            /* os_threads.c */
+const char *guest_thread_name_of(DWORD tid);                                           /* os_threads.c */
+#define JT_TYPES 256
+#define JT_THREADS 16
+typedef struct { uint64_t vt, run; long long n, nsusp; double ms, ms_nosusp, max; unsigned thr_mask; } JtType;
+static JtType g_jt[JT_TYPES]; static int g_njt;
+static struct { DWORD tid; char name[40]; double ms; long long n; } g_jth[JT_THREADS]; static int g_njth;
+static SRWLOCK g_jt_lock = SRWLOCK_INIT;
+static ImportFn g_jt_orig; static int g_jt_on = -1;
+static double g_jt_t0, g_jt_freq; static long long g_jt_n, g_jt_nsusp; static double g_jt_ms, g_jt_ms_nosusp;
+static double jt_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (double)q.QuadPart * 1000.0 / g_jt_freq; }
+static int jt_thread(void) {                                                           /* lock held */
+    DWORD me = GetCurrentThreadId();
+    for (int i = 0; i < g_njth; i++) if (g_jth[i].tid == me) return i;
+    if (g_njth >= JT_THREADS) return JT_THREADS - 1;
+    int i = g_njth++; g_jth[i].tid = me; g_jth[i].ms = 0; g_jth[i].n = 0;
+    const char *nm = guest_thread_name_of(me); snprintf(g_jth[i].name, sizeof g_jth[i].name, "%s", nm && nm[0] != '?' ? nm : "main or other");
+    return i;
+}
+static void jt_report(double t) {                                                      /* lock held */
+    double secs = (t - g_jt_t0) / 1000.0, frames = secs * 60.0; if (frames < 1) frames = 1;
+    LOG("r1: JOBS: %.1f s of fight: %lld jobs (%.1f per frame); job time %.2f ms per frame, of the jobs that never switched away %.2f ms per frame; %lld jobs switched away in the middle (%.1f%%)\n",
+        secs, g_jt_n, g_jt_n / frames, g_jt_ms / frames, g_jt_ms_nosusp / frames, g_jt_nsusp, g_jt_n ? 100.0 * g_jt_nsusp / g_jt_n : 0.0);
+    for (int i = 0; i < g_njth; i++) LOG("r1: JOBS:   thread %s: %lld jobs, %.2f ms per frame\n", g_jth[i].name, g_jth[i].n, g_jth[i].ms / frames);
+    for (int shown = 0; shown < 15; shown++) {
+        int b = -1; for (int i = 0; i < g_njt; i++) if (g_jt[i].n && (b < 0 || g_jt[i].ms > g_jt[b].ms)) b = i;
+        if (b < 0) break;
+        JtType *k = &g_jt[b]; char th[160] = ""; size_t o = 0;
+        for (int i = 0; i < g_njth && o < 140; i++) if (k->thr_mask & (1u << i)) o += (size_t)snprintf(th + o, sizeof th - o, "%s%s", o ? ", " : "", g_jth[i].name);
+        LOG("r1: JOBS:   class vtable %llx run f_%llx: %lld jobs (%.1f per frame), %.3f ms each on average, max %.2f, %.2f ms per frame; switched away in the middle %lld (%.0f%%); threads: %s\n",
+            (unsigned long long)k->vt, (unsigned long long)k->run, k->n, k->n / frames, k->ms / k->n, k->max, k->ms / frames, k->nsusp, 100.0 * k->nsusp / k->n, th);
+        k->n = 0;                                                                      /* (shown once) */
+    }
+    g_njt = 0; g_njth = 0; g_jt_n = g_jt_nsusp = 0; g_jt_ms = g_jt_ms_nosusp = 0; g_jt_t0 = t;
+}
+static void jt_hook(Ctx *c, void *u) {
+    (void)u;
+    if (!ra_fight_on()) { g_jt_orig(c); return; }
+    uint64_t job = rd64(c->x[0] + 64), vt = job ? rd64(job) : 0, run = vt ? rd64(vt + 48) : 0;
+    uint64_t key = os_fiber_cur_key(); long s0 = os_fiber_switch_outs(key);
+    double t0 = jt_now();
+    g_jt_orig(c);
+    double t1 = jt_now(), d = t1 - t0;
+    int susp = os_fiber_switch_outs(key) != s0;
+    AcquireSRWLockExclusive(&g_jt_lock);
+    if (g_jt_t0 <= 0) g_jt_t0 = t0;
+    int ti = jt_thread(); g_jth[ti].ms += d; g_jth[ti].n++;
+    int i; for (i = 0; i < g_njt; i++) if (g_jt[i].vt == vt) break;
+    if (i == g_njt && g_njt < JT_TYPES) { g_jt[i].vt = vt; g_jt[i].run = run; g_jt[i].n = g_jt[i].nsusp = 0; g_jt[i].ms = g_jt[i].ms_nosusp = g_jt[i].max = 0; g_jt[i].thr_mask = 0; g_njt++; }
+    if (i < g_njt) { JtType *k = &g_jt[i]; k->n++; k->ms += d; if (d > k->max) k->max = d; k->thr_mask |= 1u << ti; if (susp) k->nsusp++; else k->ms_nosusp += d; }
+    g_jt_n++; g_jt_ms += d; if (susp) g_jt_nsusp++; else g_jt_ms_nosusp += d;
+    if (t1 - g_jt_t0 >= 10000.0) jt_report(t1);
+    ReleaseSRWLockExclusive(&g_jt_lock);
+}
+static void job_trace_init(void) {
+    if (g_jt_on >= 0) return;
+    const char *e = getenv("SSBU_TRACE_JOBS"); g_jt_on = e && atoi(e) > 0;
+    if (!g_jt_on || !g_log) return;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_jt_freq = (double)f.QuadPart;
+    int ok = hook_install(GA(0x710353cf40ull), jt_hook, NULL, &g_jt_orig);
+    LOG("r1: JOBS: trace of every job (f_710353cf40) during fights: hook %s\n", ok ? "installed" : "NOT installed");
+}
+
 /* Called from r1_init: installs the hook when SSBU_TRACE_CALL is set. */
 void call_trace_init(void) {
+    job_trace_init();                                   /* (SSBU_TRACE_JOBS) */
     { const char *n = getenv("SSBU_TRACE_NULL"); if (n && n[0] && g_log) { g_nul_fn = strtoull(n, NULL, 16); call_trace_poll(); } }
     const char *b = getenv("SSBU_TRACE_BADLR");
     if (b && b[0] && g_log) { g_blr_fn = strtoull(b, NULL, 16); call_trace_poll(); }
