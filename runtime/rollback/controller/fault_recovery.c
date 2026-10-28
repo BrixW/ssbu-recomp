@@ -40,6 +40,14 @@ static int fr_enabled(void) {
 static int fr_note(const char *what, uint64_t where_, uint64_t addr) {
     if (InterlockedIncrement(&g_fr_in_pass) > FR_MAX_PER_PASS) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: more than %d faults in one pass: the net lets go\n", FR_MAX_PER_PASS); return 0; }
     { void rg_dump_recent_loads(const char *why); if (g_fr_in_pass == 1 && g_fr_total < 20) rg_dump_recent_loads("a fault in this pass (before the safety net acts)"); }
+    if (g_fr_in_pass == 1 && g_fr_total < 20) {           /* the fiber the faulting thread is on: born inside a rolled-back window? its guest stack, and the faulting address: saved by the ring? */
+        extern uint64_t os_fiber_cur_key(void); extern int os_fiber_stack(uint64_t key, uint64_t *lo, uint64_t *hi); extern const char *rb_born_info(uint64_t key, char *buf, size_t n); const char *r1_addr_class(uint64_t a);
+        uint64_t fk = os_fiber_cur_key(), lo = 0, hi = 0; char bi[160];
+        int has = os_fiber_stack(fk, &lo, &hi);
+        LOG("r1: FAULT RECOVERY: the fault (%s, address %llx: %s) is on fiber %llx (%s)%s\n", what, (unsigned long long)addr, addr >= 0x10000 ? r1_addr_class(addr) : "a small number, not memory",
+            (unsigned long long)fk, fk ? rb_born_info(fk, bi, sizeof bi) : "the thread's own context", has ? "" : "");
+        if (has) LOG("r1: FAULT RECOVERY:   that fiber's guest stack %llx..%llx: low end %s, high end %s\n", (unsigned long long)lo, (unsigned long long)hi, r1_addr_class(lo), r1_addr_class(hi - 8));
+    }
     InterlockedIncrement64(&g_fr_total); InterlockedExchange(&g_fr_pending, 1);
     if (InterlockedIncrement(&g_fr_lines) <= 40)
         LOG("r1: FAULT RECOVERY: absorbed fault #%lld (%s) at %llx, address %llx, pass %lld%s\n", (long long)g_fr_total, what, (unsigned long long)where_, (unsigned long long)addr, g_rgs_next, g_ra_phase == 2 ? " RE-RUN" : "");
