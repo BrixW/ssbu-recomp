@@ -360,8 +360,13 @@ static void rgs_perturb_pad(uint64_t *b, int *lx, int *ly) {
     if ((int)((g_rgs_prng >> 16) % 100) >= g_rgs_perturb) return;
     g_rgs_prng = g_rgs_prng * 1664525u + 1013904223u;
     uint32_t r = g_rgs_prng >> 8;
-    *b ^= 1ull << (r % 12);                                       /* one of the 12 lowest button bits */
-    *lx = (int)((r >> 4) & 0xffff) - 32768; *ly = (int)((r >> 12) & 0xffff) - 32768;
+    /* SSBU_RB_SIM_PERTURB_WHAT=b|s|bs (default bs): change only a button, only the left stick, or both. A stick value of -32768 is outside
+     * the console pad's range (-32767..32767): the stick is now kept inside it. Added to find out whether a crash seen with perturbed pads
+     * comes from the rollback or from the odd pad values themselves. */
+    static int what = -1; if (what < 0) { const char *e = getenv("SSBU_RB_SIM_PERTURB_WHAT"); what = (e && e[0] == 'b' && !e[1]) ? 1 : (e && e[0] == 's' && !e[1]) ? 2 : 3; }
+    if (what & 1) *b ^= 1ull << (r % 12);                         /* one of the 12 lowest button bits */
+    if (what & 2) { *lx = (int)(((r >> 4) & 0xffff) % 65535u) - 32767; *ly = (int)(((r >> 12) & 0xffff) % 65535u) - 32767; }
+    static int shown; if (shown++ < 30) LOG("r1: RB SIM perturbed pad %d: buttons %llx, left stick %d %d (pass %lld)\n", shown, (unsigned long long)*b, *lx, *ly, g_rgs_next);
 }
 void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (rbg_on()) { rbg_pad(0, b, lx, ly, rx, ry); return; }      /* R3 */
