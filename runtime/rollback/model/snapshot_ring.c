@@ -316,7 +316,7 @@ static void rg_opg_capture(RgSlot *s) {
         size_t need = s->opg_used + OPH + PG;
         if (!rg_vcom(s->opg, &s->opg_com, need, 1u << 20)) { g_opg_full++; break; }
         uint8_t *o = s->opg + s->opg_used;
-        if (!opg_try_copy(o + OPH, (const uint8_t *)(uintptr_t)a)) { g_opg_gone++; continue; }      /* not committed now: not part of this state */
+        if (!opg_try_copy(o + OPH, (const uint8_t *)(uintptr_t)a)) { g_opg_gone++; g_xls_out_pg[i] = 0; continue; }      /* not committed now: not part of this state; off the list (a later commit puts it back on: page_tracker_learned.c) */
         ((uint64_t *)o)[0] = a; ((uint64_t *)o)[1] = 0;
         s->opg_used = need;
     }
