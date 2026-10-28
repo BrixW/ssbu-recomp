@@ -204,6 +204,7 @@ void r1_init(void) {
     g_fast = getenv("SSBU_R1_FAST") != NULL; g_fcheck = getenv("SSBU_R1_FAST_CHECK") != NULL; if (getenv("SSBU_R1_LEARN")) g_learn = atoi(getenv("SSBU_R1_LEARN"));
     g_r1_keep_fibers = 1; g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
     ppool_init();                                          /* R4: the presentation pool of the learned-set save */
+    call_trace_init();                                     /* (debug, SSBU_TRACE_CALL) a hook on one guest function */
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
     LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_session.start_frame, g_session.run_frames, g_session.period, g_session.cycles, id ? "installed" : "FAILED");
