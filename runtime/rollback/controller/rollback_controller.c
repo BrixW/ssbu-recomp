@@ -289,7 +289,7 @@ static void rbg_step_body(Ctx *c) {
             return;
         }
         rb_fault_give_up();                             /* no ring to go back to (or none older): faults end the game again */
-    } else rb_fault_pass_clean();
+    } else rb_fault_pass_clean(i);
     rbn_pass_hash(i);
     { extern volatile long long g_unwind_trace_frame; g_unwind_trace_frame = i + 1; }      /* (hs15) the frame the next pass simulates, for SSBU_UNWIND_TRACE */
     { static int tr = -1; if (tr < 0) tr = getenv("SSBU_RB_NET_TRACE") ? atoi(getenv("SSBU_RB_NET_TRACE")) : 0;

@@ -21,6 +21,7 @@ static volatile LONG g_fr_pending;                      /* a fault was absorbed 
 static volatile LONG g_fr_in_pass;                      /* faults absorbed in the pass that is running */
 static volatile LONG64 g_fr_total, g_fr_recoveries, g_fr_giveups, g_fr_not_absorbable;
 static volatile LONG g_fr_depth;                        /* consecutive recoveries: how far back the next one goes */
+static long long g_fr_tainted_pass = -1;               /* the pass whose faults started the walk back */
 static volatile LONG g_fr_off;                          /* the net let go: faults end the game again */
 static volatile LONG g_fr_lines;
 static int g_fr_enabled = -1;
@@ -187,6 +188,7 @@ int rb_fault_pending(void) { return g_fr_pending != 0; }
 int rb_fault_recover(long long i, Ctx *c, long long *best_out) {
     InterlockedExchange(&g_fr_pending, 0); InterlockedExchange(&g_fr_in_pass, 0);
     LONG depth = InterlockedIncrement(&g_fr_depth);
+    if (i > g_fr_tainted_pass) g_fr_tainted_pass = i;
     if (g_fr_recoveries >= FR_MAX_RECOVERIES) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: %d recoveries in this run: the net lets go\n", FR_MAX_RECOVERIES); return 0; }
     long long target = i - depth, best = -1;
     best = rg_best_state(target);                          /* the newest QUIET state at or before target (snapshot_ring.c) */
@@ -211,7 +213,12 @@ int rb_fault_recover(long long i, Ctx *c, long long *best_out) {
 void rb_fault_give_up(void) { InterlockedExchange(&g_fr_pending, 0); InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); }
 
 /* A pass ended with no fault: the walk back starts from the newest state again next time. */
-void rb_fault_pass_clean(void) { if (!g_fr_pending && g_fr_depth) InterlockedExchange(&g_fr_depth, 0); InterlockedExchange(&g_fr_in_pass, 0); }
+/* A pass `i` ended with no fault. The walk back (how far the next recovery goes) starts from the newest state again only once the pass that FAULTED has come through clean: a clean pass before
+ * it is not news (a dense run, 2026-10-28: the walk went 1 back, 2 back, 1 back... 400 times at the same pass, because the clean pass in between reset it, and never reached an older state). */
+void rb_fault_pass_clean(long long i) {
+    if (!g_fr_pending && g_fr_depth && i >= g_fr_tainted_pass) { InterlockedExchange(&g_fr_depth, 0); g_fr_tainted_pass = -1; }
+    InterlockedExchange(&g_fr_in_pass, 0);
+}
 
 void rb_fault_report(void) {
     rg_quiet_report();

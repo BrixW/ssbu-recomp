@@ -315,6 +315,20 @@ void fibers_restore_all(void) {
                 running_now ? "running" : "?", f->imp ? f->imp : "guest code", (unsigned long long)f->from, (unsigned long long)f->sp, f->susp, cf == f->fiber);
         }
     }
+    {   /* Fibers BORN since the state just loaded (they exist now, not in its table) and switched away now: in the state loaded they did not exist, so their host side goes back to "never set up"
+         * (no host fiber, no context). Left as they were, they kept the host fiber and stack of their life after that state: a fiber object whose guest memory is reused by a coroutine made again
+         * in the re-run then ran on that stale host side (a dense rollback run, 2026-10-28: a fiber born in a rolled-back window at 21c4699cf80, a reused address, and 24 frames later every re-run of
+         * one pass failed the same way, beyond any reload). Set up again by the re-run, it gets a fresh host fiber (fib_init); used without that, the switch is refused (os_threads.c).
+         * A born fiber that is RUNNING now is left alone (its thread is inside it). SSBU_R1_BORNRESET=0: off. */
+        static int on = -1; if (on < 0) { const char *e = getenv("SSBU_R1_BORNRESET"); on = !(e && e[0] == '0'); }
+        static long long nreset;
+        if (on) for (int j = 0; j < g_ncur; j++) {
+            int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == g_cur[j].key) break;
+            if (i < g_guest_fibers.count || g_cur[j].tid) continue;
+            os_r1_fiber_set(g_cur[j].key, NULL, NULL, 0);
+            if (++nreset <= 20) LOG("r1: fiber %llx was born after the state loaded: its host side is reset to never set up (%lld so far)\n", (unsigned long long)g_cur[j].key, nreset);
+        }
+    }
 }
 int g_busy_depth, g_busy_log = 0, g_wait_idle;
 static struct { uint64_t key, min_depth; } g_fd[2048]; static int g_nfd;

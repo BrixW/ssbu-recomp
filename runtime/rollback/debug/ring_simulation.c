@@ -63,7 +63,7 @@ void rgs_step(Ctx *c) {
     if (g_rgv_target >= 0 && i == g_rgv_target) { if (ok) rgv_after(); else g_rgv_target = -1; }
     if (!g_rg_ready) { g_rgs_pass_t0 = 0; return; }
     if (!ok) g_rgs_nocap++;
-    if (ok) rb_fault_pass_clean();
+    if (ok) rb_fault_pass_clean(i);
     if (g_ra_phase == 2 && --g_rgs_left <= 0) { g_ra_phase = 0; g_ra_after_quiet = 1; g_rgs_left = 0; }
     g_rgs_next = i + 1;
     if (g_ra_phase == 0) g_rgs_real_since++;
