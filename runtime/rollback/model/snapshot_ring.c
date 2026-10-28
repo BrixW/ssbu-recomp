@@ -518,7 +518,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
 int rb_maybe_rebase(long long i, Ctx *c) {
     extern volatile LONG64 g_xls_out_commit;
     static long long thr = -1, gap, seen_at, last_frame = -1000000;
-    if (thr < 0) { const char *e = getenv("SSBU_RB_REBASE"); thr = e ? atoll(e) : 96; e = getenv("SSBU_RB_REBASE_GAP"); gap = e ? atoll(e) : 120; }
+    if (thr < 0) { const char *e = getenv("SSBU_RB_REBASE"); thr = e ? atoll(e) : 0; e = getenv("SSBU_RB_REBASE_GAP"); gap = e ? atoll(e) : 120; }
     if (thr <= 0 || !g_rg_ready) return 0;
     long long out = (long long)g_xls_out_commit;
     if (out - seen_at < thr || i - last_frame < gap) return 0;
