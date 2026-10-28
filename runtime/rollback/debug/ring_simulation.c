@@ -368,12 +368,35 @@ static void rgs_perturb_pad(uint64_t *b, int *lx, int *ly) {
     if (what & 2) { *lx = (int)(((r >> 4) & 0xffff) % 65535u) - 32767; *ly = (int)(((r >> 12) & 0xffff) % 65535u) - 32767; }
     static int shown; if (shown++ < 30) LOG("r1: RB SIM perturbed pad %d: buttons %llx, left stick %d %d (pass %lld)\n", shown, (unsigned long long)*b, *lx, *ly, g_rgs_next);
 }
+/* SSBU_RB_SIM_FORCEPADS="<pass>:<buttons hex>:<lx>:<ly>,..." (test only): in a REAL pass (the first time a frame runs) the player's pad of that pass is replaced
+ * by the one listed. With SSBU_RB_SIM=<a very large number> no rollback ever happens, so this feeds the game exactly the pads that a perturbed run
+ * (SSBU_RB_SIM_PERTURB; its log lists "perturbed pad ... (pass N)") ended up using, with no rollback at all: if the game then fails the same way,
+ * the failure comes from those inputs and not from the restore of a state. */
+typedef struct { long long pass; uint64_t b; int lx, ly; } ForcedPad;
+static ForcedPad g_forced[128]; static int g_nforced = -1;
+static void rgs_forced_pad(long long pass, uint64_t *b, int *lx, int *ly) {
+    if (g_nforced < 0) {
+        g_nforced = 0; const char *e = getenv("SSBU_RB_SIM_FORCEPADS");
+        for (const char *s = e; s && *s && g_nforced < 128;) {
+            long long ps; unsigned long long bb; int x, y, n = 0;
+            if (sscanf(s, "%lld:%llx:%d:%d%n", &ps, &bb, &x, &y, &n) != 4) break;
+            g_forced[g_nforced].pass = ps; g_forced[g_nforced].b = bb; g_forced[g_nforced].lx = x; g_forced[g_nforced].ly = y; g_nforced++;
+            s += n; while (*s == ',' || *s == ' ') s++;
+        }
+        if (g_nforced) LOG("r1: RB SIM: %d forced pads (SSBU_RB_SIM_FORCEPADS), first at pass %lld\n", g_nforced, g_forced[0].pass);
+    }
+    for (int i = 0; i < g_nforced; i++) if (g_forced[i].pass == pass) {
+        *b = g_forced[i].b; *lx = g_forced[i].lx; *ly = g_forced[i].ly;
+        LOG("r1: RB SIM forced pad at pass %lld: buttons %llx, left stick %d %d\n", pass, (unsigned long long)*b, *lx, *ly);
+        return;
+    }
+}
 void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (rbg_on()) { rbg_pad(0, b, lx, ly, rx, ry); return; }      /* R3 */
     long long p = g_rgs_next; int x = (int)(p & 255);
     if (g_ra_phase == 2) {
         if (g_rgs_padf[x] == p) { PadRec r = g_rgs_pad[x]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; rgs_perturb_pad(b, lx, ly); } else g_rgs_padmiss++;
-    } else { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_rgs_pad[x] = r; g_rgs_padf[x] = p; }
+    } else { rgs_forced_pad(p, b, lx, ly); PadRec r = {*b, *lx, *ly, *rx, *ry}; g_rgs_pad[x] = r; g_rgs_padf[x] = p; }
 }
 
 static double rg_pct(const double *v, int n, int p) {
