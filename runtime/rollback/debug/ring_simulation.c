@@ -29,6 +29,7 @@ ULONG64 rgs_cyc_now(void) { ULONG64 v = 0; QueryThreadCycleTime(GetCurrentThread
 /* at the safe point (H2) of every pass while the fight runs */
 void rgs_step(Ctx *c) {
     double t = now_ms(); ULONG64 cy = rgs_cyc_now();
+    call_trace_poll();
     g_rgp_main = GetCurrentThreadId(); g_rgp_seg = 1; if (g_rgs_prof == 3 && g_rg_ready) rgs_samp_start();
     if (g_rgs_pass_t0 > 0 && g_rg_ready) {                /* the pass that just ended: real (0) or re-run (1), without the capture / load */
         int kd = g_ra_phase == 2; double d = t - g_rgs_pass_t0; if (g_rgs_cyc0) g_rgs_cyc[kd] += (double)(cy - g_rgs_cyc0);
@@ -45,11 +46,33 @@ void rgs_step(Ctx *c) {
         int ph = g_ra_phase == 2 && g_rgs_left - 1 <= 0 ? 0 : g_ra_phase;
         g_rg_keep = g_rg_keep_on && g_rg_ready && ph == 0 && g_rg_caps + 1 >= g_rgs_warm && g_rgs_real_since + (ph == 0) >= g_rgs_n;
     }
-    int ok = r1_ring_capture(i, c);
+    rb_fault_test_tick();                                 /* (SSBU_RB_FAULT_TEST=<n>: a deliberate fault in a leaf read every n real passes) */
+    if (rb_fault_pending()) {                             /* the pass that ended had a fault absorbed (fault_recovery.c): it is not captured; the newest healthy state before it is loaded and it runs again */
+        long long best;
+        if (rb_fault_recover(i, c, &best)) {
+            g_rgs_left = (int)(i - best); g_rgs_next = best + 1; g_ra_phase = 2; g_rgs_real_since = 0;
+            r1_ring_let_go();
+            g_rgs_pass_t0 = now_ms(); g_ra_t_mark = g_rgs_pass_t0;
+            return;
+        }
+    }
+    int ok = 0, rebased = 0;
+    {   /* SSBU_RB_SIM_REBASE=<n>: the ring's base state is made again (a full save, a hitch of ~1.2 s) as soon as n pages have been committed in fights outside everything the ring saves
+         * (the third big reservation is extras only: pages committed after the base are never saved or restored). Only between real passes, with no re-run outstanding. */
+        extern volatile LONG64 g_xls_out_commit; static long long every = -1, at;
+        if (every < 0) { const char *e = getenv("SSBU_RB_SIM_REBASE"); every = e ? atoll(e) : 0; }
+        if (every > 0 && g_ra_phase == 0 && g_rg_ready && (long long)g_xls_out_commit - at >= every) {
+            at = (long long)g_xls_out_commit; g_rg_keep = 0;
+            ok = r1_ring_rebase(i, c); rebased = 1;
+            LOG("r1: RB SIM: ring rebased at pass %lld because %lld pages were committed outside it: %s\n", i, (long long)g_xls_out_commit, ok ? "done" : "refused (next pass)");
+        }
+    }
+    if (!rebased || !ok) ok = r1_ring_capture(i, c);
     g_rg_keep = 0;
     if (g_rgv_target >= 0 && i == g_rgv_target) { if (ok) rgv_after(); else g_rgv_target = -1; }
     if (!g_rg_ready) { g_rgs_pass_t0 = 0; return; }
     if (!ok) g_rgs_nocap++;
+    if (ok) rb_fault_pass_clean();
     if (g_ra_phase == 2 && --g_rgs_left <= 0) { g_ra_phase = 0; g_ra_after_quiet = 1; g_rgs_left = 0; }
     g_rgs_next = i + 1;
     if (g_ra_phase == 0) g_rgs_real_since++;
@@ -322,11 +345,27 @@ static void rgv_blocks_report(void) {
     b[o] = 0;
     LOG("r1: RB VERIFY differing 64 KB blocks (%d, the 40 largest):%s\n", g_rgv_nb, b);
 }
+/* The differing pages of one verification grouped by 64 KB block (where() names the block): the largest ones are printed after the summary line. */
+#define RGV_NB 256
+static struct { uint64_t blk; long long n; } g_rgv_blk[RGV_NB]; static int g_rgv_nblk;
+static void rgv_blk_note(uint8_t *addr) {
+    uint64_t b = (uint64_t)(uintptr_t)addr & ~0xffffull; int i;
+    for (i = 0; i < g_rgv_nblk; i++) if (g_rgv_blk[i].blk == b) { g_rgv_blk[i].n++; return; }
+    if (g_rgv_nblk < RGV_NB) { g_rgv_blk[g_rgv_nblk].blk = b; g_rgv_blk[g_rgv_nblk++].n = 1; }
+}
+static void rgv_blk_print(void) {
+    for (int shown = 0; shown < 10 && g_rgv_nblk; shown++) {
+        int best = 0; for (int i = 1; i < g_rgv_nblk; i++) if (g_rgv_blk[i].n > g_rgv_blk[best].n) best = i;
+        LOG("r1: RB VERIFY   block %s: %lld pages differ\n", where((uint8_t *)(uintptr_t)g_rgv_blk[best].blk), g_rgv_blk[best].n);
+        g_rgv_blk[best] = g_rgv_blk[--g_rgv_nblk];
+    }
+    g_rgv_nblk = 0;
+}
 static void rgv_after(void) {                               /* right after the capture of the re-run pass that reached the target */
     long long d[3] = {0, 0, 0}, pages = (long long)g_rgv_n; char first[400]; int o = 0; first[0] = 0;
     for (size_t n = 0; n < g_rgv_n; n++) {
         uint32_t id = g_rgv_id[n];
-        if (rgv_hash(rg_src(id)) != g_rgv_h[n]) { int k = rgv_kind(id); d[k]++; rgv_note(id); rgvd_show(n, id, rg_src(id)); if (o < 330 && d[k] <= 3) o += snprintf(first + o, sizeof first - o, " %s", where(rg_addr(id))); }
+        if (rgv_hash(rg_src(id)) != g_rgv_h[n]) { int k = rgv_kind(id); d[k]++; rgv_note(id); rgv_blk_note(rg_addr(id)); rgvd_show(n, id, rg_src(id)); if (o < 330 && d[k] <= 3) o += snprintf(first + o, sizeof first - o, " %s", where(rg_addr(id))); }
     }
     size_t extra = 0;
     for (int i = 0; i < g_rg_count; i++) {                  /* pages the re-run wrote that the original window did not */
@@ -336,13 +375,14 @@ static void rgv_after(void) {                               /* right after the c
             if (g_rgv_n + extra >= RGV_MAX) continue;
             g_rgv_in[id] = 2; g_rgv_id[g_rgv_n + extra++] = id;
             pages++;
-            if (rgv_hash(rg_src(id)) != rgv_hash(rg_src_v(id, s->ent[2 * n + 1]))) { int k = rgv_kind(id); d[k]++; rgv_note(id); if (o < 330 && d[k] <= 3) o += snprintf(first + o, sizeof first - o, " %s(re-run only)", where(rg_addr(id))); }
+            if (rgv_hash(rg_src(id)) != rgv_hash(rg_src_v(id, s->ent[2 * n + 1]))) { int k = rgv_kind(id); d[k]++; rgv_note(id); rgv_blk_note(rg_addr(id)); if (o < 330 && d[k] <= 3) o += snprintf(first + o, sizeof first - o, " %s(re-run only)", where(rg_addr(id))); }
         }
     }
     for (size_t n = 0; n < g_rgv_n + extra; n++) g_rgv_in[g_rgv_id[n]] = 0;
     g_rgv_runs++; g_rgv_pages += pages; for (int k = 0; k < 3; k++) g_rgv_diff[k] += d[k];
     if (d[0] || d[1]) g_rgv_bad_runs++;
     if (d[0] || d[1] || d[2] || g_rgv_runs <= 5) LOG("r1: RB VERIFY rollback to %lld, back at %lld: %lld pages compared; differ: window 1 %lld, window 2 %lld, extras %lld;%s\n", g_rgv_from, g_rgv_target, pages, d[0], d[1], d[2], first);
+    if (d[0] || d[1] || d[2]) { if (g_rgv_runs <= 8 || g_rgv_runs % 50 == 0) rgv_blk_print(); else g_rgv_nblk = 0; }
     g_rgv_target = -1;
 }
 int rgs_skip_now(void) { return g_rgs_on > 0 && g_ra_phase == 2 && (g_rgs_left > 1 || g_rgs_lastlite) ? g_rgs_skip : 0; }
@@ -440,6 +480,9 @@ void rgs_report(void) {
                 c[i].n[0] / (double)(g_rgpg_caps[0] ? g_rgpg_caps[0] : 1), c[i].n[1] / (double)(g_rgpg_caps[1] ? g_rgpg_caps[1] : 1), c[i].n[2] / (double)(g_rgpg_caps[2] ? g_rgpg_caps[2] : 1));
         }
         rgp_report();
+        rb_fault_report();
+        { extern volatile LONG64 g_xls_out_commit, g_xls_out_write; LOG("r1: PAGES OUTSIDE THE RING in fights so far: %lld committed, %lld written by the host (never saved or restored)\n", (long long)g_xls_out_commit, (long long)g_xls_out_write); }
+        { extern volatile LONG64 g_hw_fight, g_hw_rerun; LOG("r1: HOST WRITES reported in fights so far: %lld, of them in re-run passes %lld (SSBU_RB_HOSTWRITES=1 lists them)\n", (long long)g_hw_fight, (long long)g_hw_rerun); }
         LOG("r1: RB SIM: %lld rollbacks (k: 1 %lld, 2 %lld, 3 %lld, 4 %lld, 5 %lld, 6 %lld, 7 %lld), captures failed %lld, re-run pads missing %lld, passes with more than one poll %lld\n",
             g_rgs_done, g_rgs_ksum[1], g_rgs_ksum[2], g_rgs_ksum[3], g_rgs_ksum[4], g_rgs_ksum[5], g_rgs_ksum[6], g_rgs_ksum[7], g_rgs_nocap, g_rgs_padmiss, g_rgs_multi);
         LOG("r1: RB SIM passes (safe point to safe point, without the capture / load): real %lld mean %.3f median %.3f ms; re-run %lld mean %.3f median %.3f ms (kick skip mask in re-run passes but the last: %d)\n",

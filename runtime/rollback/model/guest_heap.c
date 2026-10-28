@@ -92,7 +92,22 @@ void r1_on_commit(void *p, size_t n) {
 }
 
 void r1_read_retry_note(void) { InterlockedIncrement64(&g_read_retry); }      /* (R4) nnfs.c read_at: a read repeated after ERROR_NOACCESS */
-void r1_wrote(uint64_t a, uint64_t n) { r1_mark_range(a, n); ls_range_event(a, n, 0); if (g_prot_on) prot_open(a, n); }          /* host code that writes guest memory (nnhid.c, nnfs.c reads: the kernel's writes do not fault) */
+const char *guest_thread_name_of(DWORD tid);        /* os_threads.c */
+/* HOST WRITES DURING A FIGHT (diagnostic, always counted, logged only with SSBU_RB_HOSTWRITES=1): every host-side write into guest memory that reports itself here (the file reads of
+ * nnfs.c, the pad poll of nnhid.c). A write that lands while a rollback is possible is state the ring may restore under an operation that is still going on: the thread that
+ * issued it is restored to before the call, but the file position / queue it advanced is host state. The line says which thread, how much, and in which pass and phase. */
+volatile LONG64 g_hw_fight, g_hw_rerun; static volatile LONG g_hw_lines;
+void r1_wrote(uint64_t a, uint64_t n) {
+    r1_mark_range(a, n); ls_range_event(a, n, 0); if (g_prot_on) prot_open(a, n);          /* host code that writes guest memory (nnhid.c, nnfs.c reads: the kernel's writes do not fault) */
+    if (!g_rg_ready || !ra_fight_on()) return;           /* (ra_fight_on reads guest memory: not before the ring exists, e.g. the file reads at boot) */
+    InterlockedIncrement64(&g_hw_fight); if (g_ra_phase == 2) InterlockedIncrement64(&g_hw_rerun);
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_HOSTWRITES"); on = e && e[0] == '1'; }
+    if (on && InterlockedIncrement(&g_hw_lines) <= 200) {
+        const char *tn = guest_thread_name_of(GetCurrentThreadId());
+        LOG("r1: HOST WRITE in a fight: thread %lu (%s) wrote %llu bytes at %llx, pass %lld%s\n", (unsigned long)GetCurrentThreadId(), tn ? tn : "not a guest thread", (unsigned long long)n, (unsigned long long)a,
+            g_rgs_next, g_ra_phase == 2 ? " RE-RUN" : "");
+    }
+}
 /* "not simulation": pages written by audio decoding etc.: not rolled back, not checked */
 void r1_nosim(uint64_t a, uint64_t n) {
     if (!g_ns1 || !n) return;

@@ -115,7 +115,10 @@ static int parse_fde(uint64_t at, Fde *f) {
 }
 
 enum { R_SAME = 0, R_OFFSET, R_UNDEF, R_REG };
-typedef struct { int cfa_reg; int64_t cfa_off; uint8_t rule[96]; int64_t val[96]; } Row;
+/* sp_off / have_sp: the CFA offset the CFI gave while the CFA register was sp (the frame size after the prologue). With a frame-pointer CFA (x29 + 16) the CFA can also be had as sp + sp_off in a
+ * function whose frame does not move, which does not depend on x29: see step(). */
+typedef struct { int cfa_reg; int64_t cfa_off; uint8_t rule[96]; int64_t val[96]; int64_t sp_off; int have_sp; } Row;
+#define NOTE_SP(r) do { if ((r)->cfa_reg == 31) { (r)->sp_off = (r)->cfa_off; (r)->have_sp = 1; } } while (0)
 
 static int run_cfi(const uint8_t *p, const uint8_t *end, const Fde *f, uint64_t *loc, uint64_t target, Row *row, const Row *init) {
     Row stack[8]; int sp = 0;
@@ -138,12 +141,12 @@ static int run_cfi(const uint8_t *p, const uint8_t *end, const Fde *f, uint64_t 
         case 0x09: r = uleb(&p); o = uleb(&p); if (r < 96) { row->rule[r] = R_REG; row->val[r] = (int64_t)o; } break;
         case 0x0a: if (sp >= 8) return 0; stack[sp++] = *row; break;
         case 0x0b: if (sp <= 0) return 0; *row = stack[--sp]; break;
-        case 0x0c: row->cfa_reg = (int)uleb(&p); row->cfa_off = (int64_t)uleb(&p); break;
-        case 0x0d: row->cfa_reg = (int)uleb(&p); break;
-        case 0x0e: row->cfa_off = (int64_t)uleb(&p); break;
+        case 0x0c: row->cfa_reg = (int)uleb(&p); row->cfa_off = (int64_t)uleb(&p); NOTE_SP(row); break;
+        case 0x0d: row->cfa_reg = (int)uleb(&p); NOTE_SP(row); break;
+        case 0x0e: row->cfa_off = (int64_t)uleb(&p); NOTE_SP(row); break;
         case 0x11: r = uleb(&p); { int64_t so = sleb(&p); if (r < 96) { row->rule[r] = R_OFFSET; row->val[r] = so * f->data_align; } } break;
-        case 0x12: row->cfa_reg = (int)uleb(&p); row->cfa_off = sleb(&p) * f->data_align; break;
-        case 0x13: row->cfa_off = sleb(&p) * f->data_align; break;
+        case 0x12: row->cfa_reg = (int)uleb(&p); row->cfa_off = sleb(&p) * f->data_align; NOTE_SP(row); break;
+        case 0x13: row->cfa_off = sleb(&p) * f->data_align; NOTE_SP(row); break;
         case 0x2d: break;                                 /* AArch64 negate_ra_state: no pointer authentication here */
         case 0x2e: uleb(&p); break;                       /* GNU_args_size */
         default: return 0;                                /* expressions and anything else: not used by this compiler's output */
@@ -153,6 +156,9 @@ static int run_cfi(const uint8_t *p, const uint8_t *end, const Fde *f, uint64_t 
 }
 
 /* Registers of the caller of the frame `r` (pc inside FDE f). Also returns this frame's CFA. */
+static uint64_t g_fix_x29; static int g_fix_x29_valid;   /* step() found x29 wrong for the frame it just walked and what it should have been */
+static uint64_t g_unw_lr_slot;                        /* address of the stack slot the newest frame's return address was read from (for the no-handler report) */
+const char *r1_addr_class(uint64_t a);                /* snapshot_ring.c: window 1 / window 2 / extras (saved by the ring) or not saved */
 static int step(const Fde *f, Regs *r, uint64_t *cfa_out) {
     Row init, row;
     memset(&init, 0, sizeof init);
@@ -165,9 +171,28 @@ static int step(const Fde *f, Regs *r, uint64_t *cfa_out) {
     if (!run_cfi(f->insns, f->insns_end, f, &loc, r->pc - 1, &row, &init)) return 0;
     if (row.cfa_reg < 19 || row.cfa_reg > 31) return 0;
     uint64_t cfa = r->x[row.cfa_reg] + (uint64_t)row.cfa_off;
+    g_fix_x29_valid = 0;
+    if (row.cfa_reg == 29 && row.have_sp) {              /* a frame-pointer CFA: x29 + off. sp is arithmetic and always right; x29 comes from a slot or a callee's return and has been seen wrong after rollbacks */
+        uint64_t spcfa = r->x[31] + (uint64_t)row.sp_off;
+        if (spcfa != cfa) {
+            static volatile LONG nmis; int use = 0;
+            LONG k = InterlockedIncrement(&nmis);
+#ifdef _WIN32
+            { extern int rb_fault_net_active(void); use = rb_fault_net_active(); }
+#endif
+            if (k <= 12) printf("unwind: frame f_%llx: the CFA from x29 (%llx) is not the one from sp (%llx) (x29 %llx, sp %llx, pc %llx): %s\n", (unsigned long long)f->start, (unsigned long long)cfa, (unsigned long long)spcfa,
+                                (unsigned long long)r->x[29], (unsigned long long)r->x[31], (unsigned long long)r->pc, use ? "using sp" : "using x29");
+            if (use) {
+                g_fix_x29 = spcfa - (uint64_t)row.cfa_off; g_fix_x29_valid = 1; cfa = spcfa;
+#ifdef _WIN32
+                { extern void rb_fault_note_repair(uint64_t where_); rb_fault_note_repair(r->pc - 4); }      /* the state that left x29 wrong is suspect: the pass is reloaded at its end */
+#endif
+            }
+        }
+    }
     Regs n = *r;
     for (int i = 19; i <= 30; i++) {
-        if (row.rule[i] == R_OFFSET) { if (!cxxrt_readable(cfa + (uint64_t)row.val[i], 8)) return 0; n.x[i] = rd64(cfa + (uint64_t)row.val[i]); }
+        if (row.rule[i] == R_OFFSET) { if (!cxxrt_readable(cfa + (uint64_t)row.val[i], 8)) return 0; n.x[i] = rd64(cfa + (uint64_t)row.val[i]); if (i == 30) g_unw_lr_slot = cfa + (uint64_t)row.val[i]; }
         else if (row.rule[i] == R_REG && row.val[i] >= 19 && row.val[i] <= 30) n.x[i] = r->x[row.val[i]];
     }
     for (int i = 0; i < 8; i++) if (row.rule[72 + i] == R_OFFSET) n.d[i] = rd64(cfa + (uint64_t)row.val[72 + i]);
@@ -308,17 +333,23 @@ static void catch_diag(uint64_t cfa) {                                        /*
            same, here, l, d, cr, fu, mp, g_cfix ? "on" : "OFF", catch_window());
 }
 
+/* What nro_catch_call keeps on its host frame. The jmp_buf comes first, so the pointer in the catch table IS a CatchFrame: the rest says which function it is (body), the guest frame (cfa)
+ * and how many guest mutexes the thread held when the function was entered (held, os_threads.c), for absorb_by_host_stack below. */
+typedef struct { jmp_buf jb; void (*body)(Ctx *, uint64_t); uint64_t cfa; int held; } CatchFrame;
+int os_mutexes_held_here(void); void os_release_held_down_to(int depth);      /* os_threads.c */
+
 /* Entry of every lifted function whose LSDA has a catch clause (generated code: `nro_catch_call(c, u_<fn>)`). */
 void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     Ctx *volatile cc = c;
-    jmp_buf jb;
+    CatchFrame cf;
     volatile uint64_t cfa = c->x[31];                     /* the CFA of an AArch64 frame is the stack pointer at entry */
     const char *volatile in_import = c->in_import;
     volatile uint64_t import_from = c->import_from;
-    catch_put(cfa, &jb);
-    if (setjmp(jb) == 0) {
+    cf.body = body; cf.cfa = cfa; cf.held = os_mutexes_held_here();
+    catch_put(cfa, &cf.jb);
+    if (setjmp(cf.jb) == 0) {
         body(c, 0);
-        catch_take(cfa, &jb);
+        catch_take(cfa, &cf.jb);
     } else {                                              /* a handler of this function ran it to its end (the unwinder removed the record) */
         cc->in_import = in_import;
         cc->import_from = import_from;
@@ -476,7 +507,11 @@ static void regs_from(Ctx *c, Regs *r) {
 static int frame(Ctx *c, uint64_t exc, Regs *cur, EhPad *pad, uint64_t *cfa, const char **stop) {
     EhFunction fn;
     Fde f;
-    if (!cur->pc || !eh_find_function(cur->pc - 4, &fn)) { *stop = "the call chain leaves the code with unwind tables (thread, fiber or host callback entry)"; return 0; }
+    if (!cur->pc || !eh_find_function(cur->pc - 4, &fn)) {
+        static char why[320];                             /* the address the chain stopped at, so a bad saved return address can be told from a real entry */
+        snprintf(why, sizeof why, "the call chain leaves the code with unwind tables at return address %llx, read from the stack slot %llx (%s) (thread, fiber or host callback entry)", (unsigned long long)cur->pc, (unsigned long long)g_unw_lr_slot, g_unw_lr_slot ? r1_addr_class(g_unw_lr_slot) : "none");
+        *stop = why; return 0;
+    }
     if (!parse_fde(fn.fde, &f)) { *stop = "FDE not understood"; return 0; }
     eh_personality(c, cur->pc - 4, exc, pad);
     pad->function = fn;
@@ -486,6 +521,79 @@ static int frame(Ctx *c, uint64_t exc, Regs *cur, EhPad *pad, uint64_t *cfa, con
                       pad->kind == EH_HANDLER ? "HANDLER" : pad->kind == EH_CLEANUP ? "cleanup" : "-");
     return 1;
 }
+
+/* ---------------------------------------------------------------- the throw whose frames cannot be walked
+ * eh_raise finds the handler by walking the GUEST stack (saved registers read from the guest frames). When a frame of it holds garbage (seen after rollbacks: x29 = 0, a return-address slot with a
+ * data pointer) the walk stops and the game ended in std::terminate, though the host stack is intact and the handler's frame is alive on it. With the rollback's safety net on
+ * (fault_recovery.c) the throw is delivered to that handler frame directly: the nearest live nro_catch_call frame on this host stack whose function is the one that caught this kind of
+ * exception before (remembered from every throw that did find its handler). The frames in between are skipped, so their clean-ups do not run: the guest mutexes they held are let go
+ * (os_threads.c), the catch records of the skipped frames are dropped, the callee-saved registers of the handler's caller are read from the handler's own frame by its CFI, and the
+ * function "returns" to its caller as after a handled exception. The pass is marked tainted and the net reloads the last healthy state at its end, so what the skipped clean-ups would
+ * have fixed in the guest's memory is put back by the reload. */
+static char g_hname[4][96]; static uint64_t g_hfn[4], g_hpad[4]; static int g_nh;
+static void note_handler(const char *tn, uint64_t fn, uint64_t pad) {
+    int i; for (i = 0; i < g_nh; i++) if (!strcmp(g_hname[i], tn)) break;
+    if (i == g_nh) { if (g_nh >= 4) return; strncpy(g_hname[g_nh], tn, 95); g_hname[g_nh][95] = 0; g_nh++; }
+    g_hfn[i] = fn; g_hpad[i] = pad;
+}
+static int cfi_callee_regs(uint64_t fn_pc, uint64_t cfa, Regs *out) {      /* the registers a function saved in its frame (CFI row at fn_pc), read from the frame whose CFA is `cfa` */
+    EhFunction fn; Fde f;
+    if (!eh_find_function(fn_pc, &fn) || !parse_fde(fn.fde, &f)) return 0;
+    Row init, row; memset(&init, 0, sizeof init); init.cfa_reg = 31;
+    uint64_t loc = f.start, no_limit = ~(uint64_t)0 - 1;
+    if (!run_cfi(f.cie_insns, f.cie_end, &f, &loc, no_limit, &init, NULL)) return 0;
+    row = init; loc = f.start;
+    if (!run_cfi(f.insns, f.insns_end, &f, &loc, fn_pc - 1, &row, &init)) return 0;
+    memset(out, 0, sizeof *out);
+    for (int i = 19; i <= 30; i++) if (row.rule[i] == R_OFFSET) { uint64_t a = cfa + (uint64_t)row.val[i]; if (!cxxrt_readable(a, 8)) return 0; out->x[i] = rd64(a); }
+    for (int i = 0; i < 8; i++) if (row.rule[72 + i] == R_OFFSET) { uint64_t a = cfa + (uint64_t)row.val[72 + i]; if (!cxxrt_readable(a, 8)) return 0; out->d[i] = rd64(a); }
+    return 1;
+}
+#ifdef _WIN32
+int rb_fault_absorb_unwind(Ctx *c);                        /* rollback/controller/fault_recovery.c */
+uint64_t guest_function_of(uint64_t rip);
+static long g_host_catches;
+static int absorb_by_host_stack(Ctx *c, uint64_t exc) {
+    /* OFF unless SSBU_RB_UNWIND_HOSTCATCH=1. Skipping the clean-ups of the frames between the throw and the handler leaves host state they would have set right (a job counter or event
+     * released by a destructor): in the first test (2026-10-28, SSBU_RB_UNWIND_FAIL=2) six throws were delivered and the game's thread then waited for ever on an event with every worker idle. A
+     * std::terminate with its report is better than that. Kept for the next step: run the clean-ups of the skipped frames instead of skipping them. */
+    { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_UNWIND_HOSTCATCH"); on = e && atoi(e) > 0; } if (!on) return 0; }
+    const char *tn = eh_type_name(exc);
+    int h = -1; for (int i = 0; i < g_nh; i++) if (!strcmp(g_hname[i], tn)) h = i;
+    if (h < 0) return 0;                                   /* no throw of this kind ever found its handler: nothing to aim at */
+    volatile char here = 0; uint64_t rsp = (uint64_t)(uintptr_t)&here;
+    CatchFrame *best = NULL;
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++) {
+        if (g_catch[i].cfa <= 1 || !g_catch[i].jb) continue;
+        uint64_t a = (uint64_t)(uintptr_t)g_catch[i].jb;
+        if (a <= rsp || !catch_here(g_catch[i].jb) || !cxxrt_readable(a, sizeof(CatchFrame))) continue;
+        CatchFrame *cf = (CatchFrame *)(uintptr_t)a;
+        if (cf->cfa != g_catch[i].cfa || guest_function_of((uint64_t)(uintptr_t)cf->body) != g_hfn[h]) continue;
+        if (!best || a < (uint64_t)(uintptr_t)best) best = cf;       /* the innermost one */
+    }
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    if (!best) return 0;
+    Regs r;
+    if (!cfi_callee_regs(g_hpad[h] + 1, best->cfa, &r)) return 0;
+    if (!rb_fault_absorb_unwind(c)) return 0;              /* last: this counts the fault and may refuse (net off, too many faults) */
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++)             /* the handler's own record and those of the frames it skips */
+        if (g_catch[i].cfa > 1 && g_catch[i].jb && catch_here(g_catch[i].jb) && (uintptr_t)g_catch[i].jb <= (uintptr_t)best) catch_free_slot(i);
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    os_release_held_down_to(best->held);
+    for (int i = 19; i <= 29; i++) c->x[i] = r.x[i];
+    c->x[31] = best->cfa;
+    for (int i = 0; i < 8; i++) { c->v[8 + i].d[0] = r.d[i]; c->v[8 + i].d[1] = 0; }
+    { EhPad pad; memset(&pad, 0, sizeof pad); pad.exception = exc; eh_enter_pad(c, &pad); }      /* the exception is no longer in flight */
+    c->x[0] = 0;
+    InterlockedIncrement(&g_host_catches);
+    if (g_host_catches <= 20) printf("unwind: %s thrown at 0x%llx could not be walked: delivered to its handler f_%llx through the host stack (%ld so far)\n", tn, (unsigned long long)c->x[30] - 4, (unsigned long long)g_hfn[h], g_host_catches);
+    longjmp(best->jb, 1);
+}
+#else
+static int absorb_by_host_stack(Ctx *c, uint64_t exc) { (void)c; (void)exc; return 0; }
+#endif
 
 static void eh_raise(Ctx *c, int reason) {
     uint64_t exc = eh_in_flight(c);
@@ -520,6 +628,13 @@ static void eh_raise(Ctx *c, int reason) {
         }
     }
     if (reason == EH_RAISE_THROW) {                       /* phase 1: is there a handler at all? (the console terminates without unwinding if not) */
+#ifdef _WIN32
+        {   /* SSBU_RB_UNWIND_BADX29=<n> (test): every n-th throw while the rollback's safety net is on starts with x29 = 0, the way the real failures did */
+            static int nb = -1; static long cntb; extern int rb_fault_net_active(void);
+            if (nb < 0) { const char *e = getenv("SSBU_RB_UNWIND_BADX29"); nb = e ? atoi(e) : 0; }
+            if (nb > 0 && rb_fault_net_active() && ++cntb % nb == 0) c->x[29] = 0;
+        }
+#endif
         LONG seq = InterlockedIncrement(&g_throws);
         int found = 0, depth = 0;
         regs_from(c, &cur);
@@ -527,15 +642,30 @@ static void eh_raise(Ctx *c, int reason) {
             if (!frame(c, exc, &cur, &pad, &cfa, &stop)) break;
             if (pad.kind == EH_HANDLER) { found = 1; break; }
         }
+#ifdef _WIN32
+        {   /* SSBU_RB_UNWIND_FAIL=<n> (test): every n-th throw that did find its handler is treated as if the walk had failed, while the rollback's safety net is on: tests absorb_by_host_stack */
+            static int nf = -1; static long cnt; extern int rb_fault_net_active(void);
+            if (nf < 0) { const char *e = getenv("SSBU_RB_UNWIND_FAIL"); nf = e ? atoi(e) : 0; }
+            if (nf > 0 && found && rb_fault_net_active() && ++cnt % nf == 0) { note_handler(eh_type_name(exc), pad.function.start, pad.landing_pad); found = 0; stop = "forced by SSBU_RB_UNWIND_FAIL"; }
+        }
+#endif
         if (found && !resume_entry(pad.landing_pad, &owner)) {
             printf("\nunwind: %s thrown at 0x%llx has its handler at %llx in %s, which has no resume entry (main is lifted without them; a module needs `python build.py nro <module> --relift`)\n",
                    eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)pad.landing_pad, owner);
             eh_terminate(c, "the handler cannot be entered");
         }
         if (!found) {
+            if (absorb_by_host_stack(c, exc)) return;      /* (does not come back when it takes the exception) */
             printf("\nunwind: %s thrown at 0x%llx: no handler in %d frames (%s)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, depth, stop);
+            printf("unwind: registers at the throw: sp %llx (%s), x29 %llx (%s), x30 %llx, x19 %llx, x20 %llx\n", (unsigned long long)c->x[31], r1_addr_class(c->x[31]),
+                   (unsigned long long)c->x[29], r1_addr_class(c->x[29]), (unsigned long long)c->x[30], (unsigned long long)c->x[19], (unsigned long long)c->x[20]);
+            if (g_unw_lr_slot && cxxrt_readable(g_unw_lr_slot - 96, 192)) {      /* the words around the slot: one pisotón or a whole frame of something else (data, code addresses 0x71.. / 0x72..) */
+                printf("unwind: stack words around the return-address slot %llx (sp of the throwing frame %llx):\n", (unsigned long long)g_unw_lr_slot, (unsigned long long)c->x[31]);
+                for (int w = -12; w < 12; w++) { uint64_t a = g_unw_lr_slot + (uint64_t)(int64_t)w * 8, v = rd64(a); printf("  %s%llx: %016llx%s\n", w == 0 ? "->" : "  ", (unsigned long long)a, (unsigned long long)v, (v >> 32) == 0x71 || (v >> 32) == 0x72 ? "  (code address)" : ""); }
+            }
             eh_terminate(c, "no handler");
         }
+        note_handler(eh_type_name(exc), pad.function.start, pad.landing_pad);
         if (g_log || seq <= 3)
             printf("unwind: throw #%ld of %s at 0x%llx: handler in %s f_%llx (landing pad %llx), %d frames up\n", (long)seq, eh_type_name(exc),
                    (unsigned long long)c->x[30] - 4, owner, (unsigned long long)pad.function.start, (unsigned long long)pad.landing_pad, depth);
@@ -545,6 +675,7 @@ static void eh_raise(Ctx *c, int reason) {
     for (int depth = 0; depth < 4096; depth++) {
         Regs at = cur;                                    /* registers of this frame at its call */
         if (!frame(c, exc, &cur, &pad, &cfa, &stop)) break;
+        if (g_fix_x29_valid) at.x[29] = g_fix_x29;       /* x29 of this frame was wrong: the pad runs with the one the CFI implies */
         if (pad.kind == EH_NONE) continue;
         void (*fn)(Ctx *, uint64_t) = resume_entry(pad.landing_pad, &owner);
         if (!fn) {

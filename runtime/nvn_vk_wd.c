@@ -30,6 +30,7 @@ static DWORD g_wd_main_tid;
 typedef struct { uint32_t rva; char name[68]; } WdSym;
 static WdSym *g_wd_sym;
 static int g_wd_nsym, g_wd_map_tried;
+int os_mutex_waits_text(char *buf, size_t n);   /* os_threads.c */
 static void wdp(const char *fmt, ...) {
     char b[1400];
     va_list ap;
@@ -172,6 +173,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         }
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
+    {   static char mw[4096]; if (os_mutex_waits_text(mw, sizeof mw)) wdp("%s", mw); else wdp("  mutex waits (guest mutexes a thread found taken): none\n"); }
 #ifdef _WIN32
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

@@ -277,6 +277,17 @@ static void rbg_step_body(Ctx *c) {
         g_rbg_tick0 = now_ms(); g_rbg_next = 0; g_rbg_cyc_go = rgs_cyc_now();
         return;
     }
+    rb_fault_test_tick();                               /* (SSBU_RB_FAULT_TEST=<n>: a deliberate fault in a leaf read every n real passes) */
+    if (rb_fault_pending()) {                           /* (fault_recovery.c) this pass had a fault absorbed: it is not hashed nor captured; the newest healthy state before it is loaded and it runs again with the same pads */
+        long long best;
+        if (!g_rbg_noring && rb_fault_recover(i, c, &best)) {
+            int k = (int)(i - best);
+            g_rbg_pend = 0; g_rbg_recap_first = -1; g_rbg_t_pass0 = now_ms();
+            g_rgs_left = k; g_rgs_next = best + 1; g_ra_phase = 2; g_rbg_cur_k = k;
+            return;
+        }
+        rb_fault_give_up();                             /* no ring to go back to (or none older): faults end the game again */
+    } else rb_fault_pass_clean();
     rbn_pass_hash(i);
     { extern volatile long long g_unwind_trace_frame; g_unwind_trace_frame = i + 1; }      /* (hs15) the frame the next pass simulates, for SSBU_UNWIND_TRACE */
     { static int tr = -1; if (tr < 0) tr = getenv("SSBU_RB_NET_TRACE") ? atoi(getenv("SSBU_RB_NET_TRACE")) : 0;

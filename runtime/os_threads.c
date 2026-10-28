@@ -423,7 +423,13 @@ static void movie_preroll_diag(Ctx *c) {
         (long long)((rd64(ar + 0x78) - rd64(ar + 0x70)) / 0x40), (long long)((rd64(ar + 0x60) - rd64(ar + 0x58)) / 0x18), (int)rd32(ar + 0x40));
     printf("%c", 10);
 }
-static void os_SleepThread(Ctx *c) { movie_preroll_diag(c); sleep_ns((int64_t)A0); }
+static void os_SleepThread(Ctx *c) {
+    movie_preroll_diag(c);
+    if ((int64_t)A0 > 1000000000ll) {                    /* a sleep over one second is rare: say who asked and for how long (a deadline computed from a clock the game keeps in its memory can come out huge after a rollback) */
+        static LONG lines; if (InterlockedIncrement(&lines) <= 20) printf("nn::os::SleepThread: asked to sleep %lld ms (%llx ns) by f_%llx (return address %llx)\n", (long long)((int64_t)A0 / 1000000ll), (unsigned long long)A0, (unsigned long long)c->fn, (unsigned long long)c->x[30]);
+    }
+    sleep_ns((int64_t)A0);
+}
 static void os_GetCurrentStackInfo(Ctx *c) {
     Obj *o = t_thread ? obj(t_thread) : NULL;
     if (A0) wr64(A0, o ? o->stack : g_main_stack_base);
@@ -526,13 +532,64 @@ static void mtx_lock_stat(Ctx *c) {
         fflush(stdout);
     }
 }
+/* Which host threads are blocked on which guest mutex right now, for the freeze report (os_mutex_waits_text, called by the watchdog): a thread that finds
+ * the mutex taken writes its slot before it sleeps in EnterCriticalSection and clears it after. A freeze on a mutex then says who owns it. */
+#define MWAIT_SLOTS 64
+static struct { volatile DWORD tid; volatile uint64_t key; volatile LONG64 since_ms; } g_mwait[MWAIT_SLOTS];
+static int mwait_enter(uint64_t key) {
+    DWORD me = GetCurrentThreadId();
+    for (int i = 0; i < MWAIT_SLOTS; i++) if (InterlockedCompareExchange((volatile LONG *)&g_mwait[i].tid, (LONG)me, 0) == 0) { g_mwait[i].key = key; g_mwait[i].since_ms = (LONG64)GetTickCount64(); return i; }
+    return -1;
+}
+static void mwait_leave(int i) { if (i >= 0) { g_mwait[i].key = 0; InterlockedExchange((volatile LONG *)&g_mwait[i].tid, 0); } }
+/* How many guest mutexes this host thread holds right now. The audio switch of the rollback tests (SSBU_RB_AUDIO_OFF, hostrt.c rb_audio_off_gate) stops an audio thread at its next SDK call;
+ * if it holds a mutex then, whoever needs that mutex waits for ever (found 2026-10-28: the game's thread waiting 20 s for a mutex owned by "nus3::audio update", parked in the gate). The gate
+ * asks here and does not stop a thread that holds one. Counted at lock / try-lock, taken off at unlock; never below zero. */
+#define HELD_MAX 64
+static __declspec(thread) Obj *t_mtx_stack[HELD_MAX]; static __declspec(thread) int t_mtx_held;
+int os_mutexes_held_here(void) { return t_mtx_held; }
+static void mtx_got(Obj *o) { if (t_mtx_held < HELD_MAX) t_mtx_stack[t_mtx_held] = o; t_mtx_held++; }
+static void mtx_released(Obj *o) {                      /* the most recent hold of this mutex (unlocks need not come in reverse order) */
+    int n = t_mtx_held < HELD_MAX ? t_mtx_held : HELD_MAX;
+    for (int i = n - 1; i >= 0; i--) if (t_mtx_stack[i] == o) { for (int k = i; k + 1 < n; k++) t_mtx_stack[k] = t_mtx_stack[k + 1]; break; }
+    if (t_mtx_held > 0) t_mtx_held--;
+}
+/* nnunwind.c absorb_by_host_stack: a handler's frame is entered without the clean-ups of the frames it skips; the mutexes they held (above `depth`) are let go here, once each. */
+void os_release_held_down_to(int depth) {
+    while (t_mtx_held > depth && t_mtx_held <= HELD_MAX) { Obj *o = t_mtx_stack[t_mtx_held - 1]; if (o && (DWORD)(uintptr_t)o->cs.OwningThread == GetCurrentThreadId()) LeaveCriticalSection(&o->cs); t_mtx_held--; }
+    if (t_mtx_held > HELD_MAX) t_mtx_held = depth < 0 ? 0 : depth;
+}
+static void mtx_enter(Obj *o) {
+    if (TryEnterCriticalSection(&o->cs)) { mtx_got(o); return; }
+    int slot = mwait_enter(o->key);
+    EnterCriticalSection(&o->cs);
+    mwait_leave(slot);
+    mtx_got(o);
+}
+#ifdef _WIN32
+int os_mutex_waits_text(char *buf, size_t n) {         /* one line per blocked thread: who waits, for which guest mutex, who owns it, is the owner alive */
+    size_t len = 0; int any = 0; buf[0] = 0;
+    for (int i = 0; i < MWAIT_SLOTS && len + 300 < n; i++) {
+        DWORD tid = g_mwait[i].tid; uint64_t key = g_mwait[i].key; if (!tid || !key) continue;
+        Obj *o = obj(key); DWORD owner = (DWORD)(uintptr_t)o->cs.OwningThread; int alive = 0;
+        if (owner) { HANDLE h = OpenThread(SYNCHRONIZE, FALSE, owner); if (h) { alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT; CloseHandle(h); } }
+        len += (size_t)snprintf(buf + len, n - len, "  mutex wait: host thread %lu has waited %.1f s for guest mutex %llx; owner host thread %lu (%s), lock count %ld, recursion %ld\n",
+                                (unsigned long)tid, (double)((LONG64)GetTickCount64() - g_mwait[i].since_ms) / 1000.0, (unsigned long long)key, (unsigned long)owner,
+                                !owner ? "nobody" : alive ? "alive" : "NO LONGER EXISTS", (long)o->cs.LockCount, (long)o->cs.RecursionCount);
+        any = 1;
+    }
+    return any;
+}
+#else
+int os_mutex_waits_text(char *buf, size_t n) { (void)n; buf[0] = 0; return 0; }
+#endif
 static void mtx_lock(Ctx *c) {
     if (g_mstat < 0) g_mstat = getenv("SSBU_MUTEXSTAT") != NULL;
     if (g_mstat) { mtx_lock_stat(c); return; }
-    EnterCriticalSection(&obj(A0)->cs);
+    mtx_enter(obj(A0));
 }
-static void mtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); }
-static void mtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 1 : 0); }
+static void mtx_unlock(Ctx *c) { Obj *o = obj(A0); LeaveCriticalSection(&o->cs); mtx_released(o); }
+static void mtx_trylock(Ctx *c) { Obj *o = obj(A0); int ok = TryEnterCriticalSection(&o->cs) ? 1 : 0; if (ok) mtx_got(o); RET(ok); }
 /* hitch.c (SSBU_HITCH): host thread id that owns the guest mutex `key` now, 0 = nobody. Diagnostics only. */
 #ifdef _WIN32
 DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs.OwningThread : 0; }
@@ -541,9 +598,9 @@ DWORD os_mutex_owner(uint64_t key) { (void)key; return 0; }       /* macOS: a pt
 #else
 DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)obj(key)->cs.__data.__owner : 0; }     /* glibc: the owner's tid */
 #endif
-static void pmtx_lock(Ctx *c) { EnterCriticalSection(&obj(A0)->cs); RET(0); }
-static void pmtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); RET(0); }
-static void pmtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 0 : 16); }   /* EBUSY */
+static void pmtx_lock(Ctx *c) { mtx_enter(obj(A0)); RET(0); }
+static void pmtx_unlock(Ctx *c) { Obj *o = obj(A0); LeaveCriticalSection(&o->cs); mtx_released(o); RET(0); }
+static void pmtx_trylock(Ctx *c) { Obj *o = obj(A0); int ok = TryEnterCriticalSection(&o->cs) ? 1 : 0; if (ok) mtx_got(o); RET(ok ? 0 : 16); }   /* EBUSY */
 
 /* ---------------------------------------------------------------- events (Event, LightEvent, SystemEvent) */
 /* nn::os::EventClearMode: 0 = ManualClear, 1 = AutoClear */

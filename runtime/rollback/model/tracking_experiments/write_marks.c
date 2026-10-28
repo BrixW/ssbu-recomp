@@ -274,10 +274,22 @@ static int cp_op_cond(uint8_t *d, const uint8_t *s) { if (memcmp(d, s, PG)) { me
 int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *) = cp_op_cmp;
 static int (*volatile cp_f_copy)(uint8_t *, const uint8_t *) = cp_op_copy;
 static int (*volatile cp_f_cond)(uint8_t *, const uint8_t *) = cp_op_cond;
+/* A restore copy that faults because the game decommitted the destination page after the state was captured: the state being restored HAD that page
+ * committed with data (window 1 does the same with g_dc), so the page is committed again and the copy retried. Without this the page stayed gone and the
+ * restored game found a missing page (or, after a purge and reuse, the allocator's old content) where its memory had been. Only restores set g_cp_restore;
+ * a capture's fault (a page gone on the READ side) is still only skipped. Counted: g_cp_fault skipped, g_cp_recommitted put back. */
+volatile int g_cp_restore;
+volatile LONG64 g_cp_recommitted;
+static int cp_recommit(uint8_t *d, const uint8_t *s) {
+    if (g_cp_restore && VirtualAlloc(d, PG, MEM_COMMIT, PAGE_READWRITE)) {
+        __try { cp_f_copy(d, s); InterlockedIncrement64(&g_cp_recommitted); return 1; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+    InterlockedIncrement64(&g_cp_fault); return 0;
+}
 static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
     if (g_cp_cmp) { for (size_t i = a; i < b; i++) { int d = 0; __try { d = cp_f_cmp(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { d = 0; InterlockedIncrement64(&g_cp_fault); } g_cp_cmp[i] = (uint8_t)d; } }
-    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) { __try { w += cp_f_cond(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_cp_fault); } } g_cp_wrote[k < 9 ? k : 8] += w; }
-    else for (size_t i = a; i < b; i++) { __try { cp_f_copy(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_cp_fault); } } }
+    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) { __try { w += cp_f_cond(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { w += cp_recommit(g_cj[i].d, g_cj[i].s); } } g_cp_wrote[k < 9 ? k : 8] += w; }
+    else for (size_t i = a; i < b; i++) { __try { cp_f_copy(g_cj[i].d, g_cj[i].s); } __except (EXCEPTION_EXECUTE_HANDLER) { cp_recommit(g_cj[i].d, g_cj[i].s); } } }
 static DWORD WINAPI cp_thread(void *p) { int k = (int)(intptr_t)p; for (;;) { WaitForSingleObject(g_cp_go[k], INFINITE); cp_part(k + 1); SetEvent(g_cp_done[k]); } return 0; }
 void cp_init(void) {
     if (g_ncp >= 0) return;
@@ -289,7 +301,7 @@ void cp_run(void) {                            /* every queued page, then the qu
     if (g_ncp > 0 && g_ncj >= 64) { for (int k = 0; k < g_ncp; k++) SetEvent(g_cp_go[k]); cp_part(0); WaitForMultipleObjects((DWORD)g_ncp, g_cp_done, TRUE, INFINITE); }
     else { int keep = g_ncp; g_ncp = 0; cp_part(0); g_ncp = keep; }
     g_ncj = 0;
-    { static LONG64 seen; if (g_cp_fault != seen) { seen = g_cp_fault; LOG("r1: %lld page jobs skipped so far because the page was gone (the game decommitted it after the extras were listed)\n", (long long)g_cp_fault); } }
+    { static LONG64 seen; if (g_cp_fault != seen) { seen = g_cp_fault; LOG("r1: %lld page jobs skipped so far because the page was gone (the game decommitted it after the extras were listed)\n", (long long)g_cp_fault); LOG("r1: %lld restore copies committed a page again first (the game had decommitted it since the capture)\n", (long long)g_cp_recommitted); } }
 }
 int g_cp_defer;                                /* mark_sweep queues its copies (run-ahead) instead of doing them */
 size_t mark_sweep(int dir) {

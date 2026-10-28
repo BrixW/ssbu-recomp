@@ -376,11 +376,17 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
                     (unsigned long long)g_icall[i].x0, (unsigned long long)g_icall[i].x1, (unsigned long long)g_icall[i].x2);
 }
 
+#ifdef _WIN32
+int rb_fault_absorb_icall(Ctx *c, uint64_t addr);      /* rollback/controller/fault_recovery.c */
+static int rb_icall_absorb(Ctx *c, uint64_t addr) { return rb_fault_absorb_icall(c, addr); }
+#else
+static int rb_icall_absorb(Ctx *c, uint64_t addr) { (void)c; (void)addr; return 0; }
+#endif
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
         void (*fn)(Ctx *) = lookup_guest(addr);
-        if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
+        if (!fn) { if (rb_icall_absorb(c, addr)) return; guest_trap("indirect call to an address that is not a known function", addr); }
         fn(c);
         return;
     }
@@ -407,7 +413,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
     if (nro_call_indirect(c, addr)) return;          /* a function of a run-time module (nnro.c) */
     if (addr >= 0x7500000000ULL && addr < 0x7500cfb000ULL) { sdk_dispatch(c, addr); return; }   /* lifted SDK code (sdklift_rt.c), e.g. a vtable entry of an SDK object */
     void (*fn)(Ctx *) = lookup_guest(addr);
-    if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
+    if (!fn) { if (rb_icall_absorb(c, addr)) return; guest_trap("indirect call to an address that is not a known function", addr); }
     fn(c);
 }
 
@@ -432,6 +438,19 @@ static void dump_guest_registers(void) {
     for (int i = 0; i < 31; i++)
         printf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 3 == 2 ? "\n" : "");
     printf("  sp  %016llx\n", (unsigned long long)c->x[31]);
+    {   /* where the pointers in those registers live, for the snapshot ring: only committed memory outside window 1, window 2 and the extras is "not saved" (a register holding a small
+         * number or an address that is not mapped is skipped) */
+        const char *r1_addr_class(uint64_t a);
+        int shown = 0;
+        for (int i = 0; i < 32; i++) {
+            uint64_t v = c->x[i];
+            if (v < 0x10000 || v >> 47) continue;
+            MEMORY_BASIC_INFORMATION mi;
+            if (!VirtualQuery((void *)(uintptr_t)v, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+            if (r1_addr_class(v)[0] == 'N') { if (!shown++) printf("registers that point into memory the snapshot ring does NOT save:"); if (i == 31) printf(" sp"); else printf(" x%d", i); }
+        }
+        if (shown) printf("\n");
+    }
 }
 
 /* ---------------------------------------------------------------- imports */
@@ -586,6 +605,7 @@ void rb_audio_off_gate(Ctx *c) {
         is_audio = (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")) ? 1 : 0;
     }
     if (!is_audio) return;
+    { int os_mutexes_held_here(void); if (os_mutexes_held_here()) return; }      /* holds a mutex: stopping it here could leave the game waiting for that mutex for ever; the next import will do */
     const char *saved_name = c->in_import; uint64_t saved_from = c->import_from;
     c->in_import = "nn::os::WaitEvent (rollback: audio thread stopped)"; c->import_from = 0;
     while (g_rb_audio_off) Sleep(20);                    /* the fight is over: the audio threads go on */
@@ -973,8 +993,10 @@ static void crash_file_report(EXCEPTION_POINTERS *ep) {
     fclose(f);
 }
 
+int rb_fault_try_absorb(EXCEPTION_POINTERS *ep);        /* rollback/controller/fault_recovery.c: the safety net under the rollback */
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (rb_fault_try_absorb(ep)) return EXCEPTION_CONTINUE_EXECUTION;      /* a fault in a leaf memory helper during a fight: the helper returns 0 and the pass is reloaded at its end */
     static volatile LONG owner;                     /* one report and one dump: a second thread that faults meanwhile waits for the exit */
     LONG me = (LONG)GetCurrentThreadId(), was = InterlockedCompareExchange(&owner, me, 0);
     if (was == me) TerminateProcess(GetCurrentProcess(), 4);      /* a fault inside the report itself ends the process */
@@ -999,17 +1021,43 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     dump_guest_registers();
     printf("guest call stack (innermost first):\n");
     CONTEXT ctx = *ep->ContextRecord;
-    uint64_t last = 0;
+    uint64_t last = 0; int no_unwind = 0;
+    char host_frames[2048]; size_t host_len = 0; host_frames[0] = 0;   /* the same walk as host module + offset, printed after the guest list */
     for (int depth = 0, shown = 0; depth < 400 && shown < 40; depth++) {
         uint64_t g = guest_function_of(ctx.Rip);
         if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
+        if (depth < 24 && host_len < sizeof host_frames - 160) {
+            HMODULE hm = NULL; char hn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ctx.Rip, &hm) && hm) GetModuleFileNameA(hm, hn, MAX_PATH);
+            host_len += (size_t)snprintf(host_frames + host_len, sizeof host_frames - host_len, "  %2d  %s+0x%llx%s\n", depth, base_name(hn),
+                                         hm ? (unsigned long long)(ctx.Rip - (uintptr_t)hm) : (unsigned long long)ctx.Rip, g ? "  [guest]" : "");
+        }
         DWORD64 image_base;
         RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &image_base, NULL);
-        if (!rf) break;
+        if (!rf) { no_unwind = 1; break; }
         void *handler_data;
         DWORD64 establisher;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, rf, &ctx, &handler_data, &establisher, NULL);
         if (!ctx.Rip) break;
+    }
+    printf("host call stack (innermost first, module + offset):\n%s", host_frames);
+    if (no_unwind) {   /* the lifted modules (lua2cpp_*.dll) have no Windows unwind tables: the walk stops in the first frame. Scan the stack for return addresses instead. */
+        printf("the faulting code has no unwind tables; return-address candidates found on its stack (nearest first, 'rsp+offset: module+offset'):\n");
+        uint64_t buf[1024]; SIZE_T got = 0; int shown = 0;
+        ReadProcessMemory(GetCurrentProcess(), (void *)ep->ContextRecord->Rsp, buf, sizeof buf, &got);      /* a read that runs past the top of the stack fails but still copies what it could */
+        if (got >= 8) {
+            for (size_t k = 0; k < got / 8 && shown < 24; k++) {
+                HMODULE hm = NULL; char hn[MAX_PATH] = "?";
+                if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)buf[k], &hm) || !hm) continue;
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void *)buf[k], &mi, sizeof mi) || !(mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) continue;
+                GetModuleFileNameA(hm, hn, MAX_PATH);
+                uint64_t g = guest_function_of(buf[k]);
+                printf("  rsp+0x%zx: %s+0x%llx%s", k * 8, base_name(hn), (unsigned long long)(buf[k] - (uintptr_t)hm), g ? "" : "\n");
+                if (g) printf("  [guest f_%llx]\n", (unsigned long long)g);
+                shown++;
+            }
+        }
     }
     fflush(stdout);
     crash_file_report(ep);                          /* the console report is out: a fault in what follows (stack, heap) cannot take it away */

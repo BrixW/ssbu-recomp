@@ -1161,6 +1161,7 @@ static void fd_hook(Ctx *c, void *user) {
  * first battle frame (SSBU_DET_OFF=1 leaves them alone, for diagnosis). */
 void input_mark(const char *what);                      /* nnhid.c */
 int rbn_handshake_wanted(void); uint64_t rbn_match_seed(void);   /* rb_net.c (R3: 0 / 0 without SSBU_RB_NET) */
+extern long long g_rgs_next; extern int g_ra_phase;   /* the ring simulation pass about to run (pass index goes back after a rollback) and its phase: 0 real, 2 re-run */
 static ImportFn g_fh_orig;
 static struct { uint64_t boma; int entry; long long frame; } g_fh_f[8];
 static int g_fh_n, g_fh_det, g_fh_detoff;
@@ -1253,8 +1254,8 @@ static void fh_hook(Ctx *c, void *user) {
             if (wk_on < 0) { const char *w = getenv("SSBU_FIGHT_HASH_WORK"); wk_on = w && w[0] && (fd_value(w, &wk_id) || ((wk_id = (double)strtoul(w, NULL, 16)), wk_id != 0)); }
             char wtxt[32] = "";
             if (wk_on) snprintf(wtxt, sizeof wtxt, " w %d", (int)fd_call(c, FD_N("24WorkModule__get_int_impl") "i", boma, (uint64_t)(int64_t)wk_id, 0, 0, 0, 0, 0, NULL));
-            fprintf(g_fh_out, "F %lld e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)%s\n",
-                    f, g_fh_f[k].entry, st, (unsigned long long)mot, bm, bx, by, bd, rc, (unsigned)(rh ^ (rh >> 32)), (unsigned long long)g_fh_run, (double)x, (double)y, (double)mf, (double)dmg, wtxt);
+            fprintf(g_fh_out, "F %lld P %lld %d e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)%s\n",
+                    f, g_rgs_next, g_ra_phase, g_fh_f[k].entry, st, (unsigned long long)mot, bm, bx, by, bd, rc, (unsigned)(rh ^ (rh >> 32)), (unsigned long long)g_fh_run, (double)x, (double)y, (double)mf, (double)dmg, wtxt);
             if ((f & 63) == 0) fflush(g_fh_out);
             if (k == 0 && f % 300 == 0 && rb) {            /* which generators are drawn from: the 9 call counters */
                 printf("[fight] frame %lld: generator calls", f);

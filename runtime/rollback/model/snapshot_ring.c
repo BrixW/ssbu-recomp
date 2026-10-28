@@ -237,6 +237,7 @@ static void rg_cb_load(RgSlot *s) {
 }
 static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: their places, the fibers, the command buffers */
     s->ctx = *c;
+    nnsdk_tls_save(s->tls);
     s->nth = g_guest_threads.count; s->ninfo = g_guest_threads.info_count;
     memcpy(s->th, g_guest_threads.table, (size_t)g_guest_threads.count * sizeof *g_guest_threads.table);
     for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; }
@@ -641,11 +642,12 @@ int r1_ring_load(long long frame, Ctx *c) {
     }
     {   /* (R3 net3) SSBU_RB_LOADCMP=1 (option, default off: measured no faster, na0 / na1): a page is written only if it differs from the value loaded */
         static int lc = -1; if (lc < 0) { const char *e = getenv("SSBU_RB_LOADCMP"); lc = e && e[0] == '1'; }
-        g_cp_cond = lc; cp_run(); g_cp_cond = 0; }
+        g_cp_cond = lc; g_cp_restore = 1; cp_run(); g_cp_restore = 0; g_cp_cond = 0; }      /* (a page the game decommitted since the capture is committed again, write_marks.c) */
     double t2 = now_ms();
     g_guest_fibers.count = g->nfib; memcpy(g_guest_fibers.table, g->fib, (size_t)g->nfib * sizeof *g_guest_fibers.table);
     if (g->fpool_used) memcpy(g_guest_fibers.pool, g->fpool, g->fpool_used);
     g_guest_fibers.pool_used = g->fpool_used;
+    { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_R1_TLS"); on = !(e && e[0] == '0'); } if (on) nnsdk_tls_load(g->tls); }      /* (SSBU_R1_TLS=0: not restored, to compare) */
     restore_thread_regs(); double t2a = now_ms();
     fibers_restore_all(); double t2b = now_ms();
     rgc_after(); double t2c = now_ms();
@@ -663,3 +665,11 @@ int r1_ring_load(long long frame, Ctx *c) {
     return 1;
 }
 
+
+/* Which part of the save an address belongs to, for crash reports: "window 1" / "window 2" / "an extras page" (the ring saves these) or "NOT saved by the ring". */
+const char *r1_addr_class(uint64_t a) {
+    if (g_win1 && a >= (uint64_t)(uintptr_t)g_win1 && a < (uint64_t)(uintptr_t)g_win1 + g_wn1) return "window 1, saved";
+    if (a >= WIN2 && a < WIN2 + WN2) return "window 2, saved";
+    for (size_t e = 0; g_rg_xa && e < g_rg_nx; e++) if ((uint64_t)(uintptr_t)g_rg_xa[e] == (a & ~(uint64_t)(PG - 1))) return "an extras page, saved";
+    return "NOT saved by the ring";
+}

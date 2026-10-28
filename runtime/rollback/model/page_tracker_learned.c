@@ -277,8 +277,14 @@ static void xls_protect(void) {                          /* threads held, the ba
     if (g_xww_on) LOG("r1: LS-X-WW: %d of %d extras ranges are write-watched (no page made read-only there)\n", nww, g_nxr);
     LOG("r1: LS-X: %d extras ranges of %u KB or more tracked: %lld pages (%.1f MB) of %zu extras pages made read-only in %.1f ms\n", g_nxr, XLS_MIN >> 10, pages, pages * (double)PG / 1048576.0, g_xn, now_ms() - t0);
 }
+volatile LONG64 g_xls_out_commit, g_xls_out_write; static volatile LONG g_xls_out_lines;      /* pages outside everything the ring saves: committed / written by the game or the host during a fight */
 static void xls_range_page(uint64_t p, int what) {       /* ls_range_event for an address outside the windows: 0 a host write, 1 decommit, 2 commit */
-    size_t e; if (g_nxr <= 0 || !xls_find((const uint8_t *)(uintptr_t)p, &e) || e >= g_xn) return;
+    size_t e; if (g_nxr <= 0) return;
+    if (!xls_find((const uint8_t *)(uintptr_t)p, &e) || e >= g_xn) {      /* a page the ring does not know: committed or written after the base save, outside window 1 and window 2 */
+        if (what == 2) { InterlockedIncrement64(&g_xls_out_commit); if (InterlockedIncrement(&g_xls_out_lines) <= 6) LOG("r1: LS-X: a page committed in a fight is not in the ring: %llx (not saved or restored)\n", (unsigned long long)p); }
+        else if (what == 0) InterlockedIncrement64(&g_xls_out_write);
+        return;
+    }
     if (g_xww_act && g_xwd && e < g_xw_cap) { g_xwd[e] = 1; return; }      /* (the OS does not report a decommit / commit: the page counts as written at the next poll) */
     uint8_t s = g_xst[e];
     if (what == 0 || what == 1) { if (s == 1 || s == 3 || s == 4) xls_open(e, (uint8_t *)(uintptr_t)p, NULL); }
@@ -426,15 +432,23 @@ static LONG CALLBACK ls_write_fault_handler(EXCEPTION_POINTERS *e) {
 static void ls_protect_id_range(size_t a, size_t b) {
     if (a >= b) return;
     DWORD old;
-    if (VirtualProtect(ls_page_address(a), (b - a) * PG, PAGE_READONLY, &old)) { for (size_t i = a; i < b; i++) g_ls_page_state[i] = 1; g_ls_prot_pages += (long long)(b - a); return; }
-    for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_page_address(i), PG, PAGE_READONLY, &old)) { g_ls_page_state[i] = 1; g_ls_prot_pages++; } else g_ls_protfail++; }
+    /* The state is 1 BEFORE the page is read-only: a host thread (the renderer, a loader) that is not held and writes the page the moment it becomes read-only faults into
+     * ls_open_page, which needs state 1 to open it. With the state set after the protect (as before) that write saw state 0, was not handled and ended the game; it never
+     * showed at the start of a fight (nothing writes then) but does in a base made again during one. */
+    for (size_t i = a; i < b; i++) g_ls_page_state[i] = 1;
+    MemoryBarrier();
+    if (VirtualProtect(ls_page_address(a), (b - a) * PG, PAGE_READONLY, &old)) { g_ls_prot_pages += (long long)(b - a); return; }
+    for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_page_address(i), PG, PAGE_READONLY, &old)) g_ls_prot_pages++; else { g_ls_page_state[i] = 0; g_ls_protfail++; } }
 }
 /* At a new base, with the guest threads held: empties the learned set and makes every committed read-write simulation page
  * of both windows read-only (state 1), going by the ranges r1 collected (g_memory_map.ranges). Pages marked not-simulation are left
  * alone. Sets g_ls_active. */
 static void ls_protect_all_pages(void) {
     double t0 = now_ms(); long long before = g_ls_prot_pages;
-    memset((void *)g_ls_page_state, 0, g_ls_total_pages); g_ls_learned_count = 0; g_ls_list_overflow = 0;
+    /* A base made again while the learned set is active (a rebase in a fight): the table is NOT zeroed. Pages that are read-only now must keep a state that the fault handler
+     * accepts while this runs; every page of the ranges below gets state 1 and is protected again. */
+    if (!g_ls_active) memset((void *)g_ls_page_state, 0, g_ls_total_pages);
+    g_ls_learned_count = 0; g_ls_list_overflow = 0;
     for (int i = 0; i < g_memory_map.range_count; i++) {
         size_t id0, idn; uint8_t *a = g_memory_map.ranges[i].a; size_t np = g_memory_map.ranges[i].n / PG;
         if (!ls_page_id(a, &id0) || !ls_page_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;      /* not (wholly) in one window */

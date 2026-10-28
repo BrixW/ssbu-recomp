@@ -59,6 +59,10 @@ static void os_GetSystemTickFrequency(Ctx *c) { RET(TICK_HZ); }
 
 /* ---- nn::os: thread-local storage slots (single guest thread for now) */
 static uint64_t g_tls_values[64];
+/* The snapshot ring (rollback/model/snapshot_ring.c) keeps these with each state: they are guest state that lives in the host (one table for every guest thread), so a load that
+ * put back the guest memory but not these handed the first GetTlsValue after it a value from the future. */
+void nnsdk_tls_save(uint64_t *out) { memcpy(out, g_tls_values, sizeof g_tls_values); }
+void nnsdk_tls_load(const uint64_t *in) { memcpy(g_tls_values, in, sizeof g_tls_values); }
 static uint32_t g_tls_next;
 static void os_AllocateTlsSlot(Ctx *c) { wr32(A0, g_tls_next < 63 ? g_tls_next++ : 63); RET(0); }
 static void os_GetTlsValue(Ctx *c) { RET(g_tls_values[A0 & 63]); }

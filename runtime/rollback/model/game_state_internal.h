@@ -84,6 +84,10 @@ void rg_roundtrip_after_load(void);          /* debug/ring_audit.c (SSBU_RB_ROUN
 void osobj_capture(long long frame);        /* model/os_objects_state.c (SSBU_STATE_OBJS=1): record the events and semaphores at a capture */
 void osobj_load(long long frame);           /* ... and put them back at the load of that capture */
 int os_r1_obj_set(uint64_t key, int signaled, int count);      /* os_threads.c: set one object's signalled flag / count, wake its waiters */
+/* controller/fault_recovery.c: the safety net (absorb a fault in a leaf helper, reload the last healthy state at the end of the pass) */
+int rb_fault_pending(void); int rb_fault_recover(long long i, Ctx *c, long long *best_out); void rb_fault_pass_clean(void); void rb_fault_give_up(void); void rb_fault_report(void); void rb_fault_test_tick(void);
+void nnsdk_tls_save(uint64_t *out); void nnsdk_tls_load(const uint64_t *in);      /* nnsdk.c */
+void call_trace_poll(void);                 /* debug/call_trace.c: retries the SSBU_TRACE_BADLR hook until its module is loaded (called each pass) */
 void call_trace_init(void);                 /* debug/call_trace.c (SSBU_TRACE_CALL=<function>,<call site>): log the calls of one guest function from one call site */
 void sm_capture(long long frame);            /* debug/state_measure.c (SSBU_STATE_MEASURE=1): fingerprints of threads and objects at a capture */
 void sm_load(long long frame);               /* ... and the comparison at a load, before anything is restored */
@@ -96,6 +100,7 @@ int xls_skip(size_t e);                      /* 1 when extras page e was not wri
 void xls_decay(const uint32_t *xjob, const uint8_t *xdiff, size_t nxj);      /* after a capture's compare: pages that stopped changing leave the set */
 void xww_poll(void);                         /* ask the OS which extras pages were written since the last poll (SSBU_LS_X_WW=1) */
 extern volatile LONG64 g_cp_fault;           /* page jobs skipped because the page was gone (write_marks.c) */
+extern volatile int g_cp_restore; extern volatile LONG64 g_cp_recommitted;   /* write_marks.c: 1 while a restore copies pages back; the pages it committed again */
 extern int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *);      /* compare one page through a pointer so a fault is caught by __try (write_marks.c) */                       /* sets up the presentation pool (once, from r1_init) */
 
 
@@ -207,6 +212,7 @@ typedef struct {
     Fib *fib; int nfib; uint8_t *fpool; size_t fpool_used, fpool_com;
     int ncbs; uint8_t *cbs; uint8_t *cbd; size_t cbd_used, cbd_com;
     size_t pages, xpages;
+    uint64_t tls[64];                                   /* nn::os thread-local storage slots (nnsdk.c: one host table), as at the capture */
 } RgSlot;
 
 typedef struct { uint64_t blk; long long n[3]; } RgPageCount;
