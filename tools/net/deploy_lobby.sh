@@ -17,12 +17,21 @@
 #   That needs TCP 80 and 443 open in the cloud firewall too (Oracle: two more ingress rules, protocol TCP).
 #   Without DOMAIN, Caddy is skipped; run the script again later with DOMAIN=... to add it.
 #   Then set STATUS_URL = "https://<domain>/status" in the site's config.js.
-# Remove: systemctl disable --now ssbu-lobby; rm -r /opt/ssbu-lobby (and, if it was added: apt-get remove caddy)
+# Ranked ladder (ladder.py, next to ssbu_lobby.py): on when ladder.py is there (LADDER=on: required), by invitation, its sqlite file in
+#   /var/lib/ssbu-lobby/ladder.db; with DOMAIN the table is published as https://<domain>/ladder.
+#       sudo LADDER=off bash deploy_lobby.sh          no ladder
+#       sudo LADDER_OPEN=1 bash deploy_lobby.sh       any new player is ranked (no invitation needed)
+#       sudo ssbu-ladder-invite <name>                a one-use invitation code for a player (it goes in the game's
+#                                                     graphics.ini as ladder_invite = <code>)
+# Remove: systemctl disable --now ssbu-lobby; rm -r /opt/ssbu-lobby /usr/local/bin/ssbu-ladder-invite; userdel ssbu-lobby
+#   (the ladder's data: rm -r /var/lib/ssbu-lobby) (and, if it was added: apt-get remove caddy)
 set -euo pipefail
 PORT="${1:-39500}"
 STATUS_PORT="${STATUS_PORT:-8080}"
 DOMAIN="${DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
+LADDER="${LADDER:-auto}"
+LADDER_OPEN="${LADDER_OPEN:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 [ -f "$HERE/ssbu_lobby.py" ] || { echo "ssbu_lobby.py not found next to this script"; exit 1; }
@@ -36,6 +45,25 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || { echo "python 3
 
 install -d -m 755 /opt/ssbu-lobby
 install -m 644 "$HERE/ssbu_lobby.py" /opt/ssbu-lobby/ssbu_lobby.py
+LADDER_ARGS=""
+if [ "$LADDER" = auto ] && [ ! -f "$HERE/ladder.py" ]; then
+    echo "note: ladder.py is not next to this script: no ranked ladder"; LADDER=off
+fi
+if [ "$LADDER" != off ] && [ "$LADDER" != 0 ]; then
+    [ -f "$HERE/ladder.py" ] || { echo "ladder.py not found next to this script (LADDER=off: no ladder)"; exit 1; }
+    install -m 644 "$HERE/ladder.py" /opt/ssbu-lobby/ladder.py
+    LADDER_ARGS=" --ladder-db /var/lib/ssbu-lobby/ladder.db"
+    [ -n "$LADDER_OPEN" ] && [ "$LADDER_OPEN" != 0 ] && LADDER_ARGS="$LADDER_ARGS --ladder-open"
+fi
+# a fixed system user (not DynamicUser): the ladder's database is written both by the service and by ssbu-ladder-invite
+id ssbu-lobby >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ssbu-lobby
+cat > /usr/local/bin/ssbu-ladder-invite <<'EOF'
+#!/bin/sh
+# a one-use invitation code for the lobby's ranked ladder: ssbu-ladder-invite <player name>
+[ -n "$1" ] || { echo "usage: ssbu-ladder-invite <player name>"; exit 1; }
+exec sudo -u ssbu-lobby /usr/bin/python3 /opt/ssbu-lobby/ssbu_lobby.py --ladder-db /var/lib/ssbu-lobby/ladder.db --ladder-invite "$1"
+EOF
+chmod 755 /usr/local/bin/ssbu-ladder-invite
 
 cat > /etc/systemd/system/ssbu-lobby.service <<EOF
 [Unit]
@@ -44,10 +72,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/ssbu-lobby/ssbu_lobby.py --bind 0.0.0.0 --port $PORT --status-port $STATUS_PORT --status-bind 127.0.0.1
+ExecStart=/usr/bin/python3 /opt/ssbu-lobby/ssbu_lobby.py --bind 0.0.0.0 --port $PORT --status-port $STATUS_PORT --status-bind 127.0.0.1$LADDER_ARGS
 Restart=always
 RestartSec=3
-DynamicUser=yes
+User=ssbu-lobby
+Group=ssbu-lobby
+StateDirectory=ssbu-lobby
+StateDirectoryMode=0750
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -78,6 +109,7 @@ systemctl --no-pager status ssbu-lobby | head -5
 echo "lobby running on UDP $PORT. Logs: journalctl -u ssbu-lobby -f"
 echo "remember the cloud firewall (Oracle: VCN Security List ingress rule, UDP $PORT)"
 echo "status endpoint (local only): curl -s http://127.0.0.1:$STATUS_PORT/status"
+if [ -n "$LADDER_ARGS" ]; then echo "ladder on: invite a player with  sudo ssbu-ladder-invite <name>  (table: curl -s http://127.0.0.1:$STATUS_PORT/ladder.json)"; fi
 
 # ---- optional: https://DOMAIN/status through Caddy (automatic TLS)
 if [ -z "$DOMAIN" ]; then
@@ -109,10 +141,16 @@ GLOBAL=""
 }
 "
 cat > /etc/caddy/Caddyfile <<EOF
-${GLOBAL}# written by deploy_lobby.sh: the lobby's status endpoint (counts only), nothing else
+${GLOBAL}# written by deploy_lobby.sh: the lobby's status endpoint (counts only) and the ladder's table (names and ratings), nothing else
 $DOMAIN {
 	encode gzip
 	handle /status {
+		reverse_proxy 127.0.0.1:$STATUS_PORT
+	}
+	handle /ladder* {
+		reverse_proxy 127.0.0.1:$STATUS_PORT
+	}
+	handle /player/* {
 		reverse_proxy 127.0.0.1:$STATUS_PORT
 	}
 	handle {
@@ -141,3 +179,4 @@ echo
 echo "Caddy serves https://$DOMAIN/status (the certificate is fetched on first use; DNS must already point here)."
 echo "Open TCP 80 and 443 in the cloud firewall too. Check: curl -s https://$DOMAIN/status"
 echo "Site: set STATUS_URL = \"https://$DOMAIN/status\" in config.js."
+if [ -n "$LADDER_ARGS" ]; then echo "Ladder table: https://$DOMAIN/ladder"; fi

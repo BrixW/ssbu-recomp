@@ -7,7 +7,7 @@ pad arrives and differs, the game state is put back to before that frame and the
 |---|---|---|---|
 | Controller | `controller/` | The per-tick loop: read pads, run a frame, notice a wrong guess, order a load, run the frames again | model, services |
 | Model | `model/` | The data: pad history (`input_history.c`), the saved game state (`game_state.c`), the ring of the last 8 states (`snapshot_ring.c`), which pages the game writes (`page_tracker_learned.c`) | nothing above it |
-| Services | `services/` | Things the controller uses that know nothing about memory: wire format, clock sync, the network session and match handshake | nothing above it |
+| Services | `services/` | Things the controller uses that know nothing about memory: wire format, clock sync, the network session and match handshake, the ranked ladder's match result (`ladder_report.c`) | nothing above it |
 
 Public contract of the game-free parts: `rollback.h`. What `page_tracker_learned.c` shares with `game_state.c` / `snapshot_ring.c`:
 `model/game_state_internal.h`.

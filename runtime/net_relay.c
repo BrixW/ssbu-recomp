@@ -35,6 +35,9 @@
  *                         open), the other player's address u32, its name[32], players searching u16, players u16 (both of
  *                         this build and code), seconds waited u16
  *   PONG may end with: players searching u16 (this build and code), players u16 (every build of this code)
+ * Ladder (lobby 1.5, tools/net/ladder.py): JOIN may end, after the 'M' 'S' block, with 'L' 'D' + the ladder identity, and WELCOME
+ * with 'L' 'D' + this player's standing (see ladder_block / ladder_welcome); RESULT / RESULT_ACK (22 / 23) carry a rollback
+ * match's result (see net_ladder_result). An older lobby ignores all of it.
  * R3 net3 (lobby 1.4): MATCH op 2 = a search for a ROLLBACK match (rb_net.c: Smash versus with rollback on, no room code, no
  * Local Wireless room): paired only with another op 2 search, the one that waited longer is player 1 (role 1); the lobby
  * says TOGETHER once it relayed rollback messages both ways between the two. An older lobby ignores op 2 (= older lobby).
@@ -135,6 +138,134 @@ static int ini_value(const char *key, char *out, size_t n) {     /* "key = value
     return found;
 }
 static int is_off(const char *v) { return !*v || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"); }
+
+/* ---------------------------------------------------------------- ladder (lobby 1.5, tools/net/ladder.py): who this player is
+ * graphics.ini (written once, the first time online play is on): ladder_id = 32 hex (random), ladder_key = 64 hex (random,
+ * never shown); ladder_registered = 1 once a lobby said "ranked" (the key is not sent any more); ladder_invite = the code
+ * the lobby's admin gave (ssbu_lobby.py --ladder-invite; SSBU_LADDER_INVITE wins). SSBU_LADDER=0: no ladder block. */
+#define LD_ID 16
+#define LD_KEY 32
+#define LD_INVITE 40
+typedef struct { uint32_t h[8]; uint8_t b[64]; uint64_t len; int n; } Sha256;
+static const uint32_t k_sha256[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+#define ROR32(x, n) ((x) >> (n) | (x) << (32 - (n)))
+static void sha256_block(Sha256 *s, const uint8_t *p) {
+    uint32_t w[64], v[8];
+    for (int i = 0; i < 16; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+    for (int i = 16; i < 64; i++)
+        w[i] = w[i - 16] + (ROR32(w[i - 15], 7) ^ ROR32(w[i - 15], 18) ^ w[i - 15] >> 3) + w[i - 7] + (ROR32(w[i - 2], 17) ^ ROR32(w[i - 2], 19) ^ w[i - 2] >> 10);
+    memcpy(v, s->h, sizeof v);
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = v[7] + (ROR32(v[4], 6) ^ ROR32(v[4], 11) ^ ROR32(v[4], 25)) + ((v[4] & v[5]) ^ (~v[4] & v[6])) + k_sha256[i] + w[i];
+        uint32_t t2 = (ROR32(v[0], 2) ^ ROR32(v[0], 13) ^ ROR32(v[0], 22)) + ((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]));
+        memmove(v + 1, v, 7 * sizeof *v);
+        v[4] += t1; v[0] = t1 + t2;
+    }
+    for (int i = 0; i < 8; i++) s->h[i] += v[i];
+}
+static void sha256_init(Sha256 *s) {
+    static const uint32_t h0[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    memcpy(s->h, h0, sizeof h0); s->len = 0; s->n = 0;
+}
+static void sha256_add(Sha256 *s, const void *data, size_t n) {
+    const uint8_t *p = data;
+    s->len += n;
+    while (n--) { s->b[s->n++] = *p++; if (s->n == 64) { sha256_block(s, s->b); s->n = 0; } }
+}
+static void sha256_end(Sha256 *s, uint8_t out[32]) {
+    uint64_t bits = s->len * 8;
+    uint8_t one = 0x80, zero = 0, l[8];
+    sha256_add(s, &one, 1);
+    while (s->n != 56) sha256_add(s, &zero, 1);
+    for (int i = 0; i < 8; i++) l[i] = (uint8_t)(bits >> (56 - 8 * i));
+    sha256_add(s, l, 8);
+    for (int i = 0; i < 8; i++) { out[4 * i] = (uint8_t)(s->h[i] >> 24); out[4 * i + 1] = (uint8_t)(s->h[i] >> 16); out[4 * i + 2] = (uint8_t)(s->h[i] >> 8); out[4 * i + 3] = (uint8_t)s->h[i]; }
+}
+static void hmac_sha256(const uint8_t *key, size_t kn, const uint8_t *msg, size_t n, uint8_t out[32]) {     /* (kn <= 64) */
+    uint8_t pad[64], inner[32];
+    Sha256 s;
+    for (int pass = 0; pass < 2; pass++) {
+        memset(pad, 0, sizeof pad); memcpy(pad, key, kn);
+        for (int i = 0; i < 64; i++) pad[i] ^= pass ? 0x5c : 0x36;
+        sha256_init(&s); sha256_add(&s, pad, 64);
+        if (pass) sha256_add(&s, inner, 32); else sha256_add(&s, msg, n);
+        sha256_end(&s, pass ? out : inner);
+    }
+}
+static int g_ld_on;                                     /* the 'L''D' block goes with JOIN */
+static uint8_t g_ld_id[LD_ID], g_ld_key[LD_KEY];
+static volatile LONG g_ld_registered;
+static char g_ld_invite[LD_INVITE + 1];
+static SRWLOCK g_ld_lock = SRWLOCK_INIT;
+static NetLadder g_ld;                                  /* (g_ld_lock) what the lobby said: WELCOME, RESULT_ACK */
+static int hex_bytes(const char *t, uint8_t *out, int n) {
+    if ((int)strlen(t) != 2 * n) return 0;
+    for (int i = 0; i < n; i++) { unsigned v; if (!isxdigit((unsigned char)t[2 * i]) || !isxdigit((unsigned char)t[2 * i + 1]) || sscanf(t + 2 * i, "%2x", &v) != 1) return 0; out[i] = (uint8_t)v; }
+    return 1;
+}
+static void hex_text(const uint8_t *b, int n, char *out) { for (int i = 0; i < n; i++) sprintf(out + 2 * i, "%02x", b[i]); }
+static void ladder_config(void) {
+    char v[160], t[2 * LD_KEY + 1];
+    const char *e = getenv("SSBU_LADDER");
+    g_ld.state = NET_LADDER_OFF; g_ld.last_outcome = -1;
+    if (e && is_off(e)) return;
+    if (!(ini_value("ladder_id", v, sizeof v) && hex_bytes(v, g_ld_id, LD_ID)) || !(ini_value("ladder_key", v, sizeof v) && hex_bytes(v, g_ld_key, LD_KEY))) {
+        for (int i = 0; i < LD_ID; i += 8) { uint64_t r = rnd64(); memcpy(g_ld_id + i, &r, 8); }
+        for (int i = 0; i < LD_KEY; i += 8) { uint64_t r = rnd64(); memcpy(g_ld_key + i, &r, 8); }
+        hex_text(g_ld_id, LD_ID, t);
+        int ok = gfx_ini_set("ladder_id", t);
+        hex_text(g_ld_key, LD_KEY, t);
+        ok &= gfx_ini_set("ladder_key", t);
+        gfx_ini_set("ladder_registered", "0");
+        if (!ok) { printf("[online] ladder: graphics.ini cannot be written: no ladder identity\n"); fflush(stdout); return; }
+        printf("[online] ladder: a new ladder identity was made (graphics.ini ladder_id / ladder_key; keep them to keep your rating)\n");
+    }
+    g_ld_registered = ini_value("ladder_registered", v, sizeof v) && !is_off(v);
+    if ((e = getenv("SSBU_LADDER_INVITE")) && *e) snprintf(g_ld_invite, sizeof g_ld_invite, "%s", e);
+    else if (ini_value("ladder_invite", v, sizeof v)) snprintf(g_ld_invite, sizeof g_ld_invite, "%s", v);
+    g_ld_on = 1;
+    g_ld.state = NET_LADDER_UNKNOWN;
+}
+/* JOIN's 'L''D' block (after the 'M''S' block): version 1, id[16], HMAC-SHA256(key, nonce as sent)[32], flags u8 (1: the
+ * sign-up follows: key[32], invitation length u8, invitation) */
+static int ladder_block(uint8_t *p, const uint8_t *nonce) {
+    if (!g_ld_on) return 0;
+    int n = 0, il = (int)strlen(g_ld_invite);
+    p[n++] = 'L'; p[n++] = 'D'; p[n++] = 1;
+    memcpy(p + n, g_ld_id, LD_ID); n += LD_ID;
+    hmac_sha256(g_ld_key, LD_KEY, nonce, 8, p + n); n += 32;
+    if (g_ld_registered) { p[n++] = 0; return n; }
+    p[n++] = 1;
+    memcpy(p + n, g_ld_key, LD_KEY); n += LD_KEY;
+    p[n++] = (uint8_t)il;
+    memcpy(p + n, g_ld_invite, (size_t)il);
+    return n + il;
+}
+static void ladder_numbers(const uint8_t *p) {          /* rating, RD, wins, losses, place (u16 each); g_ld_lock held */
+    g_ld.rating = g16(p); g_ld.rd = g16(p + 2); g_ld.wins = g16(p + 4); g_ld.losses = g16(p + 6); g_ld.place = g16(p + 8);
+}
+static void ladder_welcome(const uint8_t *p, int n) {   /* WELCOME's 'L''D' tail: status u8, numbers, text[32] */
+    if (!g_ld_on || n < 3 + 10 + NAME_LEN || p[0] != 'L' || p[1] != 'D') return;
+    int st = p[2];
+    char text[NAME_LEN + 1];
+    for (int k = 0; k < NAME_LEN; k++) text[k] = p[13 + k] && p[13 + k] < 0x20 ? '?' : (char)p[13 + k];
+    text[NAME_LEN] = 0;
+    AcquireSRWLockExclusive(&g_ld_lock);
+    int was = g_ld.state;
+    g_ld.state = st == 1 ? NET_LADDER_RANKED : NET_LADDER_UNRANKED;
+    ladder_numbers(p + 3);
+    memcpy(g_ld.text, text, sizeof g_ld.text);
+    ReleaseSRWLockExclusive(&g_ld_lock);
+    if (st == 1 && !g_ld_registered) { InterlockedExchange(&g_ld_registered, 1); gfx_ini_set("ladder_registered", "1"); if (g_ld_invite[0]) gfx_ini_set("ladder_invite", ""); g_ld_invite[0] = 0; }
+    if (st == 2 && g_ld_registered) { InterlockedExchange(&g_ld_registered, 0); gfx_ini_set("ladder_registered", "0"); }   /* (a new ladder: sign up again) */
+    if (was != g_ld.state || st == 2) { printf("[online] ladder: %s%s%s\n", st == 1 ? "ranked as " : "not ranked: ", text, st == 1 ? "" : st == 2 ? " (signing up)" : ""); fflush(stdout); }
+}
 
 /* ---------------------------------------------------------------- O1: the mod set this game loads
  * What the runtime loads (read, never changed; only while online play is on):
@@ -338,6 +469,7 @@ static void configure(void) {
     }
     if ((e = getenv("SSBU_ONLINE_LIST_OTHER"))) g_list_other = !is_off(e);
     else if (ini_value("online_list_other", v, sizeof v)) g_list_other = !is_off(v);
+    ladder_config();
     g_cfg = 1;
     static const char *mode_names[] = {"lobby", "lan (no server)", "host (no server)", "join (no server)"};
     printf("[online] on: mode %s%s, lobby %s, code %s, name %s, direct paths %s, build %s\n", mode_names[g_mode], g_auto ? " (auto)" : "",
@@ -487,6 +619,64 @@ int net_rb_send(const void *p, int n) {
     memcpy(b + 16, p, (size_t)n);
     tx(b, 16 + n, &g_lobby);
     return 1;
+}
+
+/* ladder (lobby 1.5): the result of a rollback match (ladder_report.c), sent every 2 s until the lobby acknowledges it
+ * (RESULT_ACK) or LD_TRIES times (an older lobby, or the in-game lobbies of HOST / LAN / JOIN: no ladder there).
+ *   22 RESULT     client: cookie u64, match seed u64, the other player's address u32, slot u8, rule kind u8, stocks of the
+ *                         rule u8, flags u8, stage u32, chara u64 x 2, stocks left u8 x 2, damage (tenths) u16 x 2, frames u32,
+ *                         desyncs u32
+ *   23 RESULT_ACK lobby:  match seed u64, outcome u8 (0 waiting for the other game, 1 counted, 2 draw, 3 disputed, 4 not
+ *                         ranked), rating u16, RD u16, wins u16, losses u16, place u16, set score (mine u8, the other's u8) */
+#define T_RESULT 22
+#define T_RESULT_ACK 23
+#define LD_TRIES 30
+static uint8_t g_ld_res[62];
+static volatile LONG g_ld_res_left;                     /* sends left (0: nothing to send) */
+static uint64_t g_ld_res_seed, g_ld_res_tx;
+void net_ladder_result(const NetLadderResult *r) {
+    uint32_t dst = nnldn_other_ip();
+    if (!dst) dst = g_rb_match_peer;
+    if (!dst) dst = g_rb_peer;
+    if (!g_ld_on || !net_rb_ready() || !dst || !r->seed) return;
+    uint8_t *p = g_ld_res;
+    InterlockedExchange(&g_ld_res_left, 0);
+    hdr(p, T_RESULT); s64(p + 4, g_cookie); s64(p + 12, r->seed); s32(p + 20, dst);
+    p[24] = (uint8_t)r->slot; p[25] = (uint8_t)r->rule_kind; p[26] = (uint8_t)r->stock; p[27] = (uint8_t)r->flags;
+    s32(p + 28, r->stage); s64(p + 32, r->chara[0]); s64(p + 40, r->chara[1]);
+    p[48] = (uint8_t)r->stocks[0]; p[49] = (uint8_t)r->stocks[1]; s16(p + 50, (uint16_t)r->dmg10[0]); s16(p + 52, (uint16_t)r->dmg10[1]);
+    s32(p + 54, r->frames); s32(p + 58, r->desyncs);
+    g_ld_res_seed = r->seed; g_ld_res_tx = 0;
+    AcquireSRWLockExclusive(&g_ld_lock); g_ld.last_outcome = -1; g_ld.set_mine = g_ld.set_theirs = 0; ReleaseSRWLockExclusive(&g_ld_lock);
+    InterlockedExchange(&g_ld_res_left, LD_TRIES);
+    say("ladder: result of match %016llx sent: player %d, stocks %d / %d, damage %.1f / %.1f%%, %u frames, %u desyncs, flags %d", (unsigned long long)r->seed, r->slot + 1,
+        r->stocks[0], r->stocks[1], r->dmg10[0] / 10.0, r->dmg10[1] / 10.0, r->frames, r->desyncs, r->flags);
+}
+static void ladder_tick(uint64_t t) {                   /* (client thread, joined) */
+    if (g_ld_res_left <= 0 || t - g_ld_res_tx < 2000) return;
+    s64(g_ld_res + 4, g_cookie);                        /* (joined again since: the new cookie) */
+    tx(g_ld_res, sizeof g_ld_res, &g_lobby);
+    g_ld_res_tx = t;
+    if (InterlockedDecrement(&g_ld_res_left) == 0) say("ladder: no answer to the result (an older lobby, or no ladder there)");
+}
+static void ladder_ack(const uint8_t *p, int n) {       /* (client thread) a RESULT_ACK body */
+    if (n < 9 + 10 + 2 || g64(p) != g_ld_res_seed) return;
+    static const char *const out[] = {"waiting for the other game's result", "counted", "a draw (not counted)", "disputed (not counted)", "not ranked"};
+    int o = p[8] <= 4 ? p[8] : 4;
+    InterlockedExchange(&g_ld_res_left, 0);
+    AcquireSRWLockExclusive(&g_ld_lock);
+    int was = g_ld.last_outcome;
+    g_ld.last_outcome = o;
+    if (g_ld.state == NET_LADDER_RANKED) ladder_numbers(p + 9);
+    g_ld.set_mine = p[19]; g_ld.set_theirs = p[20];
+    ReleaseSRWLockExclusive(&g_ld_lock);
+    if (was != o) say("ladder: match %016llx: %s; set %d-%d", (unsigned long long)g64(p), out[o], p[19], p[20]);
+}
+void net_ladder_get(NetLadder *o) {
+    AcquireSRWLockShared(&g_ld_lock);
+    *o = g_ld;
+    ReleaseSRWLockShared(&g_ld_lock);
+    if (g_cfg <= 0) o->state = NET_LADDER_OFF;
 }
 
 /* ---------------------------------------------------------------- direct paths */
@@ -1360,7 +1550,7 @@ static int setup(void) {                        /* (client thread) where the lob
 
 static void send_join(void) {
     enum { BASE = 4 + 8 + 2 * NAME_LEN + BUILD_LEN + 4 + 2 + 1 };
-    uint8_t p[BASE + 2 + sizeof g_mods_wire] = {0};
+    uint8_t p[BASE + 2 + sizeof g_mods_wire + 3 + LD_ID + 32 + 1 + LD_KEY + 1 + LD_INVITE] = {0};
     hdr(p, T_JOIN);
     s64(p + 4, g_nonce);
     memcpy(p + 12, g_code, strlen(g_code));
@@ -1371,7 +1561,9 @@ static void send_join(void) {
     p[18 + 2 * NAME_LEN + BUILD_LEN] = (uint8_t)g_direct;
     p[BASE] = 'M'; p[BASE + 1] = 'S';                  /* O1: this game's mod set (an older lobby reads only BASE bytes) */
     memcpy(p + BASE + 2, g_mods_wire, (size_t)g_mods_wire_len);
-    tx(p, BASE + 2 + g_mods_wire_len, &g_lobby);
+    int n = BASE + 2 + g_mods_wire_len;
+    n += ladder_block(p + n, p + 4);                   /* ladder (lobby 1.5): who this player is (an older lobby ignores it) */
+    tx(p, n, &g_lobby);
 }
 
 static DWORD WINAPI client_thread(LPVOID unused) {
@@ -1419,6 +1611,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         if (g_joined && t - last_tick >= 50) { peers_tick(t); last_tick = t; }
         if (g_joined && t - (uint64_t)g_rooms_wanted < 5000 && t - g_rooms_sent >= 2000) rooms_ask(t);     /* O1: while someone looks */
         if (g_joined) mm_tick(t);                                                                         /* O2 */
+        if (g_joined) ladder_tick(t);                                                                     /* ladder: a match result until acknowledged */
         struct sockaddr_in from;
         int flen = sizeof from;
         int n = recvfrom(g_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -1439,6 +1632,10 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             last_ping = 0;
             if (!g_joined) { char a[16]; say("joined the lobby %s:%u as 10.13.%u.%u (code %s)", ip_text(ntohl(g_lobby.sin_addr.s_addr), a), ntohs(g_lobby.sin_port), g_ip >> 8 & 255, g_ip & 255, g_code); }
             InterlockedExchange(&g_joined, 1);
+            if (n > 24) { int reg = g_ld_registered; ladder_welcome(buf + 24, n - 24); if (reg && !g_ld_registered) send_join(); }   /* (ladder: an unknown id signs up at once) */
+            break;
+        case T_RESULT_ACK:
+            if (g_joined) ladder_ack(buf + 4, n - 4);
             break;
         case T_REJECT:
             if (n >= 12 && g64(buf + 4) == g_nonce) {

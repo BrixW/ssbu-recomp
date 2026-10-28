@@ -477,6 +477,7 @@ void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
 void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     rb_fault_report();                                  /* once per match: the safety net and the quiet states (fault_recovery.c, snapshot_ring.c) */
+    { void ladder_fight_off(void); if (g_rbg_in_match == 1) ladder_fight_off(); }   /* (lobby 1.5) an agreed rollback match: its result to the ladder (ladder_report.c) */
     if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);

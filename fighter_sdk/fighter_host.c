@@ -1230,6 +1230,8 @@ static void fh_hook(Ctx *c, void *user) {
             }
         }
         if (k < g_fh_n && !g_fh_out) ++g_fh_f[k].frame;
+        {   int ladder_wants_damage(void); void ladder_note_damage(int entry, float dmg);      /* (lobby 1.5) ladder_report.c: each player's damage in this pass */
+            if (k < g_fh_n && !g_fh_out && ladder_wants_damage()) { float d = 0; fd_call(c, FD_N("25DamageModule__damage_impl") "i", boma, 0, 0, 0, 0, 0, 0, &d); ladder_note_damage(g_fh_f[k].entry, d); } }
         if (k < g_fh_n && g_fh_out) {
             long long f = ++g_fh_f[k].frame;
             float x = 0, y = 0, mf = 0, dmg = 0;
@@ -1239,6 +1241,7 @@ static void fh_hook(Ctx *c, void *user) {
             fd_call(c, FD_N("25PostureModule__pos_x_impl"), boma, 0, 0, 0, 0, 0, 0, &x);
             fd_call(c, FD_N("25PostureModule__pos_y_impl"), boma, 0, 0, 0, 0, 0, 0, &y);
             fd_call(c, FD_N("25DamageModule__damage_impl") "i", boma, 0, 0, 0, 0, 0, 0, &dmg);
+            { void ladder_note_damage(int entry, float dmg); ladder_note_damage(g_fh_f[k].entry, dmg); }
             uint64_t rb = fh_rng_base(), rh = 0xcbf29ce484222325ull; uint32_t rc = 0, w[45];
             if (rb) { for (int i = 0; i < 45; i++) w[i] = rd32(rb + 4ull * i); for (int i = 0; i < 9; i++) rc += w[i * 5 + 4]; rh = fh_fnv(rh, w, sizeof w); }
             struct { long long f; int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } rec;

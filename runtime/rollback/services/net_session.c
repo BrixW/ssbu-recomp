@@ -794,7 +794,9 @@ static uint64_t hash_pads(uint64_t h) {
     }
     return h;
 }
+void ladder_pass(long long f); void ladder_final(long long f);      /* ladder_report.c (lobby 1.5: a ranked match's result) */
 void rbn_pass_hash(long long f) {
+    ladder_pass(f);
     if (g_hlines && f > 0) { g_hash[f % HR] = hash_pads(g_hacc); g_hframe[f % HR] = f; }
     if (f > 0) { int x = (int)(f % HR2);
         for (int q = 0; q < 2; q++) { g_upad[x][q] = g_acc_pad[q]; g_un[x][q] = g_acc_n[q]; g_uvar[x][q] = g_acc_var[q]; }
@@ -830,6 +832,7 @@ void rbn_finalize(long long cur) {
         if (g_hlog && g_hframe[f % HR] == f) fprintf(g_hlog, "f %lld h %016llx\n", f, (unsigned long long)g_hash[f % HR]);
         detail_frame(f);
         g_hfinal_upto = f;
+        ladder_final(f);
     }
     if (g_hlog && (upto & 63) == 0) fflush(g_hlog);
     if (g_peer_check_f > 0 && g_peer_check_f <= g_hfinal_upto) { long long cf = g_peer_check_f; g_peer_check_f = 0; on_check(cf, g_peer_check); }
@@ -891,6 +894,7 @@ void rbn_match_reset(void) {
     fflush(stdout);
 }
 int rbn_match_number(void) { return g_match_n; }
+long long rbn_desyncs(void) { return g_desync; }       /* (ladder_report.c) checksum mismatches of this match so far */
 void rbn_report(FILE *o, long long frames) {
     if (g_on <= 0) return;
     if (g_hlog) fflush(g_hlog);

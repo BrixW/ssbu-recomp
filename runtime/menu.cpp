@@ -1107,6 +1107,14 @@ static void sec_online(void) {
     if (ns.state == NET_CONNECTED) ImGui::TextColored(col, "%s - %s, %d player%s%s", st[2], k_online_name[O0.mode], ns.players, ns.players == 1 ? "" : "s", "");
     else ImGui::TextColored(col, "%s%s%s", ns.state >= 0 && ns.state <= 3 ? st[ns.state] : "?", O0.mode ? " - " : "", O0.mode ? k_online_name[O0.mode] : "");
     if (ns.state == NET_CONNECTED && ns.ping_ms >= 0) { ImGui::SameLine(); ImGui::Text("  ping %d ms", ns.ping_ms); }
+    {   NetLadder ld; net_ladder_get(&ld);              /* ranked ladder (lobby 1.5): what the lobby said at the join and after each match */
+        static const char *const out[] = {"waiting for the other game", "counted", "draw (not counted)", "disputed (not counted)", "not ranked"};
+        if (ld.state == NET_LADDER_RANKED) {
+            ImGui::Text("Ladder:"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1), "%s  %d (+/- %d)  #%d  sets %d-%d", ld.text, ld.rating, ld.rd, ld.place, ld.wins, ld.losses);
+            if (ld.last_outcome >= 0 && ld.last_outcome <= 4) { ImGui::SameLine(); ImGui::TextDisabled("  last match: %s, set %d-%d", out[ld.last_outcome], ld.set_mine, ld.set_theirs); }
+        } else if (ld.state == NET_LADDER_UNRANKED) ImGui::TextDisabled("Ladder: not ranked (%s)", ld.text);
+    }
     ImGui::Indent();
     ImGui::SetWindowFontScale(1.2f);
     int changed = 0;

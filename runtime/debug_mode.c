@@ -706,3 +706,15 @@ void debug_mode_init(void) {
     if (getenv("SSBU_DEBUG_RESEARCH")) printf("debug research: hook on the entry set-up: id %d\n", hook_install(FN_ENTRY_SETUP, research_entry_setup, NULL, &g_orig_entry_setup));
     if (getenv("SSBU_DEBUG_DUMP") || g_dm.text[0] || g_end_limit ||getenv("SSBU_DEBUG_RESEARCH") || getenv("SSBU_DEBUG_WATCHENTRY")) CreateThread(NULL, 0, dump_thread, NULL, 0, NULL);
 }
+
+/* (lobby 1.5) ladder_report.c: what a ranked result needs of this match. 1 = an online match agreed by the handshake: its rule
+ * kind and stocks, the two characters (the agreed ui_chara ids) and the stage played (match block + 0x420); 0 = none */
+int dm_ladder_match(int *rule_kind, int *stock, uint64_t chara[2], uint32_t *stage) {
+    if (!g_hs_ok || g_hs_local) return 0;
+    *rule_kind = g_hs_m.rule_kind; *stock = g_hs_m.stock;
+    chara[0] = g_hs_m.chara[0]; chara[1] = g_hs_m.chara[1];
+    *stage = rd32(MELEE_INFO + 0x420);
+    return 1;
+}
+/* the stocks left of the fighter of entry 0 / 1 (its information record + 0xd8), -1 = no record */
+int dm_ladder_stocks(int entry) { uint64_t r = fighter_info_record(entry); return r ? (int)rd32(r + 0xd8) : -1; }

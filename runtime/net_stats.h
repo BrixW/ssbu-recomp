@@ -58,6 +58,31 @@ void net_match_get(NetMatch *out);          /* never blocks */
  * a Local Wireless room): paired only with another such search; MM_MATCHED / MM_TOGETHER = the opponent is known, its
  * address is where the rollback messages go (net_rb_send) until the next search. */
 void net_match_find_rb(void);
+
+/* Ranked ladder (lobby 1.5, tools/net/ladder.py): this player's standing as the lobby last said it (WELCOME, RESULT_ACK;
+ * F1 > Online), and the result of a rollback match that ladder_report.c hands over at its end (sent until acknowledged). */
+enum { NET_LADDER_OFF = 0, NET_LADDER_UNKNOWN, NET_LADDER_UNRANKED, NET_LADDER_RANKED };
+typedef struct {
+    int state;                              /* NET_LADDER_*: off (SSBU_LADDER=0 / online off), not told yet (an older lobby says nothing) */
+    int rating, rd, wins, losses, place;    /* (ranked) Glicko-2 rating and deviation, sets won and lost, place in the table */
+    char text[33];                          /* the ladder name (ranked) or why not ranked */
+    int last_outcome;                       /* the last match's result: -1 none, 0 waiting for the other game, 1 counted, 2 draw,
+                                               3 disputed, 4 not ranked */
+    int set_mine, set_theirs;               /* the set's games won by each, after that result */
+} NetLadder;
+void net_ladder_get(NetLadder *out);        /* never blocks */
+enum { NET_LADDER_F_ABANDON = 1, NET_LADDER_F_DISCONNECT = 2 };
+typedef struct {
+    uint64_t seed;                          /* the match handshake's seed: the same on both games */
+    int slot;                               /* this game's player: 0 = player 1 */
+    int rule_kind, stock;                   /* the agreed rules (1 = stock, stocks each) */
+    int flags;                              /* NET_LADDER_F_* */
+    uint32_t stage;                         /* the stage played (match block + 0x420) */
+    uint64_t chara[2];                      /* the agreed ui_chara ids of player 1 and 2 */
+    int stocks[2], dmg10[2];                /* stocks left, damage in tenths of a percent, at the last final frame */
+    uint32_t frames, desyncs;               /* fight frames to that frame; checksum mismatches seen in the match */
+} NetLadderResult;
+void net_ladder_result(const NetLadderResult *r);
 #ifdef __cplusplus
 }
 #endif
