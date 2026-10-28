@@ -347,11 +347,27 @@ static void rgv_after(void) {                               /* right after the c
 }
 int rgs_skip_now(void) { return g_rgs_on > 0 && g_ra_phase == 2 && (g_rgs_left > 1 || g_rgs_lastlite) ? g_rgs_skip : 0; }
 int rgs_poll(void) { g_rgs_polls_cur++; return g_ra_phase == 2; }    /* a re-run pass: the input sequence waits */
+/* SSBU_RB_SIM_PERTURB=<percent> (default 0 = off): in a re-run pass of the simulation, that percentage of the player's pads are changed (one
+ * button toggled, the left stick set to a random value) instead of replayed. The forced-rollback simulation replays the SAME pads, so a page
+ * that a load left stale is written again with the same values and nothing reads it wrongly; a rollback in a real match replays DIFFERENT
+ * pads (the guess was wrong), and the game then runs code it did not run the first time. This makes the simulation do the same. The timeline
+ * after such a pass is simply the new one; there is no reference to compare against, so it finds crashes, not wrong values. */
+static int g_rgs_perturb = -1; static uint32_t g_rgs_prng = 2463534242u;
+static void rgs_perturb_pad(uint64_t *b, int *lx, int *ly) {
+    if (g_rgs_perturb < 0) { const char *e = getenv("SSBU_RB_SIM_PERTURB"); g_rgs_perturb = e ? atoi(e) : 0; if (g_rgs_perturb > 0) LOG("r1: RB SIM: %d%% of the re-run pads are changed (SSBU_RB_SIM_PERTURB)\n", g_rgs_perturb); }
+    if (g_rgs_perturb <= 0) return;
+    g_rgs_prng = g_rgs_prng * 1664525u + 1013904223u;
+    if ((int)((g_rgs_prng >> 16) % 100) >= g_rgs_perturb) return;
+    g_rgs_prng = g_rgs_prng * 1664525u + 1013904223u;
+    uint32_t r = g_rgs_prng >> 8;
+    *b ^= 1ull << (r % 12);                                       /* one of the 12 lowest button bits */
+    *lx = (int)((r >> 4) & 0xffff) - 32768; *ly = (int)((r >> 12) & 0xffff) - 32768;
+}
 void rgs_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (rbg_on()) { rbg_pad(0, b, lx, ly, rx, ry); return; }      /* R3 */
     long long p = g_rgs_next; int x = (int)(p & 255);
     if (g_ra_phase == 2) {
-        if (g_rgs_padf[x] == p) { PadRec r = g_rgs_pad[x]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; } else g_rgs_padmiss++;
+        if (g_rgs_padf[x] == p) { PadRec r = g_rgs_pad[x]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; rgs_perturb_pad(b, lx, ly); } else g_rgs_padmiss++;
     } else { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_rgs_pad[x] = r; g_rgs_padf[x] = p; }
 }
 
