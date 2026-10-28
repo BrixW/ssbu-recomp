@@ -145,7 +145,7 @@ typedef struct { uint64_t key; int sig, cnt; uint64_t len; } OsRec;
 
 typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; } Th;
 
-typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
+typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; int rok; } Fib;      /* rok: put back by the last fibers_restore_all */
 
 /* The other guest threads while memory is copied (threads.c). The ring holds each at a wait (parks it), copies, and lets it go. */
 typedef struct {

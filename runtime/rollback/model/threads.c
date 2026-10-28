@@ -256,6 +256,16 @@ void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb);      /* (
 int g_r1_ctr = -1;
 
 /* snapshot_ring.c load recorder, right after fibers_restore_all: fiber objects that exist now and not in the state just loaded (made after it) */
+/* snapshot_ring.c rg_gstk_load: is some context that runs now, and was not put back by the load, using guest stack [lo, hi)? (a born fiber running now, or a fiber not put back) */
+int fibers_live_sp_in(uint64_t lo, uint64_t hi) {
+    for (int j = 0; j < g_ncur; j++) {
+        if (!g_cur[j].tid || !g_cur[j].c) continue;
+        int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == g_cur[j].key) break;
+        if (i < g_guest_fibers.count && g_guest_fibers.table[i].rok) continue;
+        uint64_t sp = g_cur[j].c->x[31]; if (sp >= lo && sp < hi) return 1;
+    }
+    return 0;
+}
 int fibers_born_count(char *buf, size_t n) {
     int born = 0; size_t o = 0; if (n) buf[0] = 0;
     for (int j = 0; j < g_ncur; j++) {
@@ -279,7 +289,7 @@ void fibers_restore_all(void) {
     if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); }
     live_rsps();
     for (int i = 0; i < g_guest_fibers.count; i++) {
-        Fib *f = &g_guest_fibers.table[i];
+        Fib *f = &g_guest_fibers.table[i]; f->rok = 0;
         int j; for (j = 0; j < g_ncur; j++) if (g_cur[j].key == f->key) break;
         void *cf = j < g_ncur ? g_cur[j].fiber : NULL; Ctx *cc = j < g_ncur ? g_cur[j].c : NULL;
         os_r1_fiber_put(f->key, f->obj);                     /* entry, argument, stack, host fiber, context as at the save */
@@ -309,12 +319,12 @@ void fibers_restore_all(void) {
             memcpy(f->fiber, f->blk, FIB_BLOCK);
             if (f->fls) memcpy(f->fls, f->flsb, sizeof f->flsb);
             *f->c = f->regs;
-            g_guest_fibers.restored++;
+            g_guest_fibers.restored++; f->rok = 1;
         } else if (!f->susp && cf == f->fiber && cc == f->c && cc->in_import == f->imp && cc->import_from == f->from && cc->x[31] == f->sp) {
             R1_CTR("restore: fiber running at the save: registers only (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             for (int r = 19; r < 32; r++) cc->x[r] = f->regs.x[r];
             for (int r = 8; r < 16; r++) cc->v[r] = f->regs.v[r];
-            g_guest_fibers.restored++;
+            g_guest_fibers.restored++; f->rok = 1;
         } else {
             g_guest_fibers.not_restored++; R1_CTR("restore: fiber NOT restored (key, fiber)", f->key, (uint64_t)(uintptr_t)f->fiber);
             LOG("r1:   fiber %llx NOT restored: now %s, at the save %s @%llx sp %llx (switched away then: %d, same host fiber: %d)\n", (unsigned long long)f->key,

@@ -300,6 +300,8 @@ void rg_quiet_report(void) {
  * address: the throw that could not be walked, the cascades, Lua's index2value). Each capture now copies, for every fiber that has run, the live part of its guest stack [sp, top); a load writes
  * it back. Tens of fibers with shallow stacks: a few hundred KB per capture. SSBU_R1_GSTACK=0: off. */
 static int g_gstk_on = -1; static long long g_gstk_caps, g_gstk_bytes, g_gstk_fail, g_gstk_loads;
+static long long g_gstk_skip;
+#define GSH 48                                              /* entry header: key, stack lo, stack hi, copy start, copy length, (pad) */
 static void rg_gstk_capture(RgSlot *s) {
     if (g_gstk_on < 0) { const char *e = getenv("SSBU_R1_GSTACK"); g_gstk_on = !(e && e[0] == '0'); }
     s->gstk_used = 0;
@@ -309,22 +311,28 @@ static void rg_gstk_capture(RgSlot *s) {
         if (!f->c) continue;                                    /* never ran: nothing on its stack yet */
         uint64_t lo = f->obj[4], hi = f->obj[4] + f->obj[5], sp = f->sp;
         if (!f->obj[5] || sp < lo || sp >= hi) continue;
-        uint64_t a = sp & ~(uint64_t)15; size_t n = (size_t)(hi - a), need = s->gstk_used + 16 + ((n + 15) & ~(size_t)15);
+        uint64_t a = sp & ~(uint64_t)15; size_t n = (size_t)(hi - a), need = s->gstk_used + GSH + ((n + 15) & ~(size_t)15);
         if (n > (16u << 20) || !rg_vcom(s->gstk, &s->gstk_com, need, 1u << 20)) { g_gstk_fail++; break; }
-        uint8_t *o = s->gstk + s->gstk_used;
-        ((uint64_t *)o)[0] = a; ((uint64_t *)o)[1] = n;
-        memcpy(o + 16, (const void *)(uintptr_t)a, n);
+        uint64_t *h = (uint64_t *)(s->gstk + s->gstk_used);
+        h[0] = f->key; h[1] = lo; h[2] = hi; h[3] = a; h[4] = n; h[5] = 0;
+        memcpy((uint8_t *)h + GSH, (const void *)(uintptr_t)a, n);
         s->gstk_used = need;
     }
     g_gstk_caps++; g_gstk_bytes += (long long)s->gstk_used;
-    if (g_gstk_caps == 1 || g_gstk_caps % 2000 == 0) LOG("r1: GSTACK: %lld captures, %.1f KB of fiber guest stacks each on average, %lld that ran out of room\n", g_gstk_caps, g_gstk_bytes / 1024.0 / g_gstk_caps, g_gstk_fail);
+    if (g_gstk_caps == 1 || g_gstk_caps % 2000 == 0) LOG("r1: GSTACK: %lld captures, %.1f KB of fiber guest stacks each on average, %lld that ran out of room, %lld stacks not written back at loads (in use / not put back)\n", g_gstk_caps, g_gstk_bytes / 1024.0 / g_gstk_caps, g_gstk_fail, g_gstk_skip);
 }
+int fibers_live_sp_in(uint64_t lo, uint64_t hi);          /* threads.c */
+/* Called right after fibers_restore_all. A fiber's guest stack is written back only when the load put that fiber back (its registers / host stack are the capture's too), and never under a
+ * context that runs now on that memory (a fiber born since, or one not put back, using a stack the game reused): that clobbered live frames (a dense run: both render dispatch threads
+ * called std::terminate after the first version of this wrote stacks unconditionally). */
 static void rg_gstk_load(const RgSlot *s) {
     if (!g_gstk_on || !s->gstk) return;
-    for (size_t off = 0; off + 16 <= s->gstk_used; ) {
-        const uint8_t *o = s->gstk + off; uint64_t a = ((const uint64_t *)o)[0]; size_t n = (size_t)((const uint64_t *)o)[1];
-        memcpy((void *)(uintptr_t)a, o + 16, n);
-        off += 16 + ((n + 15) & ~(size_t)15);
+    for (size_t off = 0; off + GSH <= s->gstk_used; ) {
+        const uint64_t *h = (const uint64_t *)(s->gstk + off); uint64_t key = h[0], lo = h[1], hi = h[2], a = h[3]; size_t n = (size_t)h[4];
+        off += GSH + ((n + 15) & ~(size_t)15);
+        int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == key) break;
+        if (i == g_guest_fibers.count || !g_guest_fibers.table[i].rok || fibers_live_sp_in(lo, hi)) { g_gstk_skip++; continue; }
+        memcpy((void *)(uintptr_t)a, (const uint8_t *)h + GSH, n);
     }
     g_gstk_loads++;
 }
