@@ -38,6 +38,7 @@ static int fr_enabled(void) {
 /* The marks of an absorbed fault, shared by both ways in (a leaf helper and a bad indirect call). Returns 0 when the net must not absorb this one. */
 static int fr_note(const char *what, uint64_t where_, uint64_t addr) {
     if (InterlockedIncrement(&g_fr_in_pass) > FR_MAX_PER_PASS) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: more than %d faults in one pass: the net lets go\n", FR_MAX_PER_PASS); return 0; }
+    { void rg_dump_recent_loads(const char *why); if (g_fr_in_pass == 1 && g_fr_total < 20) rg_dump_recent_loads("a fault in this pass (before the safety net acts)"); }
     InterlockedIncrement64(&g_fr_total); InterlockedExchange(&g_fr_pending, 1);
     if (InterlockedIncrement(&g_fr_lines) <= 40)
         LOG("r1: FAULT RECOVERY: absorbed fault #%lld (%s) at %llx, address %llx, pass %lld%s\n", (long long)g_fr_total, what, (unsigned long long)where_, (unsigned long long)addr, g_rgs_next, g_ra_phase == 2 ? " RE-RUN" : "");

@@ -255,6 +255,17 @@ int rest_stack(uint64_t a) { for (int i = 0; i < g_nrest; i++) if (a >= g_rest_l
 void nnunwind_trace_note(const char *what, uint64_t cfa, uint64_t jb);      /* (hs15) nnunwind.c, SSBU_UNWIND_TRACE */
 int g_r1_ctr = -1;
 
+/* snapshot_ring.c load recorder, right after fibers_restore_all: fiber objects that exist now and not in the state just loaded (made after it) */
+int fibers_born_count(char *buf, size_t n) {
+    int born = 0; size_t o = 0; if (n) buf[0] = 0;
+    for (int j = 0; j < g_ncur; j++) {
+        int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == g_cur[j].key) break;
+        if (i < g_guest_fibers.count) continue;
+        born++;
+        if (o + 48 < n) o += (size_t)snprintf(buf + o, n - o, " %llx%s", (unsigned long long)g_cur[j].key, g_cur[j].tid ? "(running)" : "");
+    }
+    return born;
+}
 void fibers_restore_all(void) {
     g_nrest = 0;
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);

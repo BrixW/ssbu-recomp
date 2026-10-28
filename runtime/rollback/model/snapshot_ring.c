@@ -613,6 +613,32 @@ void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb); void nnunwind_catch_fre
  * again on a new host fiber, or the fiber exists only in states thrown away): dropped instead of kept for ever. These dead
  * records piled up at the same CFA (h15e0: 25 of one frame) and, with the old hash, overwrote live ones (pp3h). */
 static uint64_t g_rgc_live[2048]; static int g_rgc_nlive; long long g_rgc_dead;
+/* ---- LOAD FLIGHT RECORDER (measurement for option 2). Every ring load, the state of the Windows "workers" (job fibers) and of the C++ catch table: fibers put back, not put back, replaced,
+ * fibers BORN since that state (they exist now and not in it: the ring leaves them as they are, and nothing counted them before), threads not at their wait, catch records kept / dropped. The last
+ * 16 loads are kept in memory and written to the log when the safety net absorbs a fault or the game is about to end (rg_dump_recent_loads), so a crash says what the loads before it did. Loads
+ * with anything unusual are also logged as they happen (first 40). */
+#define LR_N 16
+static char g_lr[LR_N][320]; static long long g_lr_n;
+static long long g_lr_born_total, g_lr_unusual;
+int fibers_born_count(char *buf, size_t n);             /* threads.c: right after fibers_restore_all */
+static void rg_load_note(long long frame, int k, long long kept0, long long dropped0, long long dead0) {
+    char bb[200]; int born = fibers_born_count(bb, sizeof bb);
+    long long kept = g_rgc_kept - kept0, dropped = g_rgc_dropped - dropped0, dead = g_rgc_dead - dead0;
+    int unusual = born || g_guest_fibers.not_restored || g_guest_fibers.replaced || g_guest_threads.mismatch;
+    g_lr_born_total += born; if (unusual) g_lr_unusual++;
+    char *o = g_lr[g_lr_n % LR_N];
+    snprintf(o, 320, "load %lld: frame %lld (%d states back), pass %lld%s: fibers put back %d, NOT put back %d, replaced %d, born since %d%s; threads not at their wait %d; catch records kept %lld dropped %lld dead %lld",
+             g_lr_n + 1, frame, k, g_rgs_next, g_ra_phase == 2 ? " (re-run)" : "", g_guest_fibers.restored, g_guest_fibers.not_restored, g_guest_fibers.replaced, born, born ? bb : "",
+             g_guest_threads.mismatch, kept, dropped, dead);
+    g_lr_n++;
+    if (unusual && g_lr_unusual <= 40) LOG("r1: LOADREC unusual %s\n", o);
+}
+void rg_dump_recent_loads(const char *why) {
+    static volatile LONG dumping; if (InterlockedExchange(&dumping, 1)) return;
+    LOG("r1: LOADREC: %s; the last %d loads (of %lld; %lld unusual, %lld fibers born in all):\n", why, (int)(g_lr_n < LR_N ? g_lr_n : LR_N), g_lr_n, g_lr_unusual, g_lr_born_total);
+    for (long long i = g_lr_n > LR_N ? g_lr_n - LR_N : 0; i < g_lr_n; i++) LOG("r1:   %s\n", g_lr[i % LR_N]);
+    InterlockedExchange(&dumping, 0);
+}
 static void rgc_live_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
     (void)key; (void)c; (void)stack; (void)size;
     if (fiber && g_rgc_nlive < 2048) g_rgc_live[g_rgc_nlive++] = *(uint64_t *)((uint8_t *)fiber + 0x20);
@@ -731,8 +757,10 @@ int r1_ring_load(long long frame, Ctx *c) {
     g_guest_fibers.pool_used = g->fpool_used;
     { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_R1_TLS"); on = !(e && e[0] == '0'); } if (on) nnsdk_tls_load(g->tls); }      /* (SSBU_R1_TLS=0: not restored, to compare) */
     restore_thread_regs(); double t2a = now_ms();
+    long long lr_kept0 = g_rgc_kept, lr_dropped0 = g_rgc_dropped, lr_dead0 = g_rgc_dead;
     fibers_restore_all(); double t2b = now_ms();
     rgc_after(); double t2c = now_ms();
+    rg_load_note(frame, k, lr_kept0, lr_dropped0, lr_dead0);       /* (measurement) what this load did to the workers and the catch table */
     rg_cb_load(g);
     osobj_load(frame);                                      /* (SSBU_STATE_OBJS) events and semaphores back to what this capture recorded */
     rg_roundtrip_after_load();                              /* (debug, SSBU_RB_ROUNDTRIP) every page must now be what the ring recorded at this frame */

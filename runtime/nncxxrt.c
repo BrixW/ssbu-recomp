@@ -618,6 +618,9 @@ void eh_enter_pad(Ctx *c, const EhPad *pad) {
 /* ---- terminate and raise */
 static uint64_t g_ti_exception[2];
 void eh_terminate(Ctx *c, const char *why) {
+#ifdef _WIN32
+    { void rg_dump_recent_loads(const char *w); rg_dump_recent_loads("the game is about to end (std::terminate)"); }
+#endif
     EhState *st = eh_state(c);
     uint64_t exc = st->in_flight ? st->in_flight : st->caught;
     ExcHeader *h = exc_header(exc);
