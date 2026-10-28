@@ -81,6 +81,9 @@ uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeep
 extern volatile LONG g_rb_audio_off;         /* hostrt.c: 1 = the audio threads are stopped (SSBU_RB_AUDIO_OFF=1, for the length of a fight) */
 int rb_norollback_asked(void);              /* memory_map.c: SSBU_RB_NET_NOROLLBACK=1, play the match delay-based, without rollback */
 void rg_roundtrip_after_load(void);          /* debug/ring_audit.c (SSBU_RB_ROUNDTRIP=<n>): after a load, every page must be as recorded at that frame */
+void osobj_capture(long long frame);        /* model/os_objects_state.c (SSBU_STATE_OBJS=1): record the events and semaphores at a capture */
+void osobj_load(long long frame);           /* ... and put them back at the load of that capture */
+int os_r1_obj_set(uint64_t key, int signaled, int count);      /* os_threads.c: set one object's signalled flag / count, wake its waiters */
 void sm_capture(long long frame);            /* debug/state_measure.c (SSBU_STATE_MEASURE=1): fingerprints of threads and objects at a capture */
 void sm_load(long long frame);               /* ... and the comparison at a load, before anything is restored */
 void sm_report(int final);                   /* ... the tables, every 100 loads and at the end */

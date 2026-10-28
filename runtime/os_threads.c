@@ -344,6 +344,21 @@ void os_r1_objs(void (*cb)(uint64_t key, int signaled, int count, uint64_t len, 
         for (Obj *o = g_table[h]; o; o = o->next)
             cb(o->key, o->signaled, o->count, o->len, (uint64_t)(uintptr_t)o->thread | (uint64_t)(uintptr_t)o->fiber, o->thread ? o->stack : 0, o->thread ? o->stack_size : 0);
 }
+/* Rollback (SSBU_STATE_OBJS): the scalar state of the wait object `key` as a capture recorded it (an event's signalled flag, a semaphore's count),
+ * put back at a load; the object's waiters are woken so they test it again. Every guest thread is held when this runs (a thread suspended inside
+ * a wait may be holding the object's lock for an instant: then the object is skipped, and 0 is returned). Returns 1 = changed, 2 = was already
+ * equal, 0 = skipped (no such object, or its lock is taken). Reading the fields without the lock is safe because nothing runs. */
+int os_r1_obj_set(uint64_t key, int signaled, int count) {
+    unsigned h = (unsigned)((key >> 3) * 2654435761u) & (BUCKETS - 1);
+    Obj *o = g_table[h]; while (o && o->key != key) o = o->next;
+    if (!o) return 0;
+    if (o->signaled == signaled && o->count == count) return 2;
+    if (!TryEnterCriticalSection(&o->cs)) return 0;
+    o->signaled = signaled; o->count = count;
+    LeaveCriticalSection(&o->cs);
+    WakeAllConditionVariable(&o->cv);
+    return 1;
+}
 /* R1: every fiber that has run: its guest context and stack */
 /* (R2 round 3) the objects that have a host fiber are cached in table order: the full walk of the 65,536 buckets cost
  * ~0.15 ms per call, 3 calls per ring capture. The cache is rebuilt when a fiber is made or handed back (g_fib_gen). */

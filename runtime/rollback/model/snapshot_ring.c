@@ -398,6 +398,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
     fibers_save(); double t3a = now_ms();
     nvn_r1_cb_save(); double t3b = now_ms();
     rg_meta_capture(s, c);
+    osobj_capture(frame);                                   /* (SSBU_STATE_OBJS) events and semaphores at this capture */
     sm_capture(frame);                                      /* (debug, SSBU_STATE_MEASURE) fingerprints of the threads and objects at this capture */
     double t4 = now_ms();
     if (g_rg_keep) g_rg_kept = 1;                          /* a load follows at once (r1_ring_load / r1_ring_let_go lets them go) */
@@ -649,6 +650,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     fibers_restore_all(); double t2b = now_ms();
     rgc_after(); double t2c = now_ms();
     rg_cb_load(g);
+    osobj_load(frame);                                      /* (SSBU_STATE_OBJS) events and semaphores back to what this capture recorded */
     rg_roundtrip_after_load();                              /* (debug, SSBU_RB_ROUNDTRIP) every page must now be what the ring recorded at this frame */
     double t3 = now_ms();
     unpark();
