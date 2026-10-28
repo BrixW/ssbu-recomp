@@ -596,8 +596,43 @@ static int absorb_by_host_stack(Ctx *c, uint64_t exc) {
     if (g_host_catches <= 20) printf("unwind: %s thrown at 0x%llx could not be walked: delivered to its handler f_%llx through the host stack (%ld so far)\n", tn, (unsigned long long)c->x[30] - 4, (unsigned long long)g_hfn[h], g_host_catches);
     longjmp(best->jb, 1);
 }
+static long g_host_reloads;
+/* When the net is active and a throw would end the process (no handler found, or the handler search ran away past 4096 frames), unwind the HOST C stack to the innermost nro_catch_call frame on THIS
+ * thread's stack and return from it as if its function had completed; then the pass is marked tainted and the ring reloads the last healthy state, which discards this bogus return. No semantic handler
+ * is entered and no landing pad is run: that skipped clean-ups and deadlocked before (SSBU_RB_UNWIND_HOSTCATCH). Here the reload is what repairs the guest; the only host state that must be put right by
+ * hand is the mutexes the skipped frames held (os_threads.c), or a sim thread waiting on one would hang. SSBU_RB_UNWIND_RELOAD=0 turns it off. */
+static int reload_via_host_catch(Ctx *c, uint64_t exc) {
+    { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_UNWIND_RELOAD"); on = !(e && e[0] == '0'); } if (!on) return 0; }
+    if (!rb_fault_net_active()) return 0;
+    volatile char here = 0; uint64_t rsp = (uint64_t)(uintptr_t)&here;
+    CatchFrame *best = NULL;
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++) {
+        if (g_catch[i].cfa <= 1 || !g_catch[i].jb) continue;
+        uint64_t a = (uint64_t)(uintptr_t)g_catch[i].jb;
+        if (a <= rsp || !catch_here(g_catch[i].jb) || !cxxrt_readable(a, sizeof(CatchFrame))) continue;
+        CatchFrame *cf = (CatchFrame *)(uintptr_t)a;
+        if (cf->cfa != g_catch[i].cfa) continue;           /* a real nro_catch_call frame: its stored cfa agrees with the record */
+        if (!best || a < (uint64_t)(uintptr_t)best) best = cf;   /* the innermost one: the least host stack to unwind */
+    }
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    if (!best) return 0;                                   /* no catch frame on this stack: let it terminate as before */
+    if (!rb_fault_absorb_unwind(c)) return 0;              /* taints the pass (ring reloads at its safe point); may refuse (net off / too many faults in the pass) */
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++)             /* drop the target's record and those of every frame below it on this stack (they are being skipped) */
+        if (g_catch[i].cfa > 1 && g_catch[i].jb && catch_here(g_catch[i].jb) && (uintptr_t)g_catch[i].jb <= (uintptr_t)best) catch_free_slot(i);
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    os_release_held_down_to(best->held);
+    { EhPad pad; memset(&pad, 0, sizeof pad); pad.exception = exc; eh_enter_pad(c, &pad); }      /* the exception is no longer in flight */
+    InterlockedIncrement(&g_host_reloads);
+    if (g_host_reloads <= 20) printf("unwind: %s at 0x%llx would terminate: host stack unwound to f_%llx, the pass will be reloaded (%ld so far)\n",
+                                     eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)guest_function_of((uint64_t)(uintptr_t)best->body), (long)g_host_reloads);
+    longjmp(best->jb, 1);                                  /* nro_catch_call's setjmp != 0 branch: restores in_import and returns to the guest caller */
+    return 1;                                              /* not reached */
+}
 #else
 static int absorb_by_host_stack(Ctx *c, uint64_t exc) { (void)c; (void)exc; return 0; }
+static int reload_via_host_catch(Ctx *c, uint64_t exc) { (void)c; (void)exc; return 0; }
 #endif
 
 static void eh_raise(Ctx *c, int reason) {
@@ -660,6 +695,7 @@ static void eh_raise(Ctx *c, int reason) {
             eh_terminate(c, "the handler cannot be entered");
         }
         if (!found) {
+            if (reload_via_host_catch(c, exc)) return;   /* net active: unwind the host stack to a catch frame and reload, instead of ending the game */
             if (absorb_by_host_stack(c, exc)) return;      /* (does not come back when it takes the exception) */
             printf("\nunwind: %s thrown at 0x%llx: no handler in %d frames (%s)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, depth, stop);
             printf("unwind: registers at the throw: sp %llx (%s), x29 %llx (%s), x30 %llx, x19 %llx, x20 %llx\n", (unsigned long long)c->x[31], r1_addr_class(c->x[31]),
