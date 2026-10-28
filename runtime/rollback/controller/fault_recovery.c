@@ -177,6 +177,8 @@ void rb_fault_note_repair(uint64_t where_) {
     InterlockedIncrement64(&g_fr_total); InterlockedExchange(&g_fr_pending, 1);
     if (InterlockedIncrement(&g_fr_lines) <= 40) LOG("r1: FAULT RECOVERY: x29 repaired from sp at %llx, pass %lld%s\n", (unsigned long long)where_, g_rgs_next, g_ra_phase == 2 ? " RE-RUN" : "");
 }
+/* os_threads.c and other runtime code: a bad request refused there taints the pass like an absorbed fault */
+void rb_fault_note_external(const char *what, uint64_t where_, uint64_t addr) { if (fr_enabled()) fr_note(what, where_, addr); }
 int rb_fault_net_active(void) { return fr_enabled(); }
 int rb_fault_pending(void) { return g_fr_pending != 0; }
 

@@ -745,6 +745,7 @@ static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 
 /* ---------------------------------------------------------------- fibers */
 void (*g_r1_fiber_born)(void *fiber);                 /* r1_state.c (R3 hs13): a new host fiber's stack is left out of the guest windows' state */
+static int fib_bad_target(uint64_t next, uint64_t from);
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
     Ctx *c = new_ctx(o->stack + o->stack_size);
@@ -756,6 +757,7 @@ static void CALLBACK fiber_main(void *arg) {
         hitch_cur_ctx(c);
         call_guest(c, o->fn);                         /* returns the fiber to switch to next, or null */
         uint64_t next = c->x[0];
+        if (fib_bad_target(next, o->fn)) next = 0;          /* (the fiber's function returned a fiber that does not exist: back to the thread's own context) */
         if (next) obj(next)->tp = c->tpidr;
         fiber_set_cur(next);
         if (g_r1_keep_fibers) { o->run_tid = 0; if (g_r1_fls_idx != 0xFFFFFFFF) { o->fls = FlsGetValue(g_r1_fls_idx); o->fls_fiber = GetCurrentFiber(); } if (next) obj(next)->run_tid = GetCurrentThreadId(); }
@@ -771,7 +773,19 @@ static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, s
     if (g_r1_keep_fibers) { o->fctx = NULL; o->fls = NULL; o->fls_fiber = NULL; o->run_tid = 0; }      /* (R2) a new host fiber: no context, no block yet */
     RET(0);
 }
+/* A switch to a fiber that was never set up (no host fiber: a garbage FiberType* from a state that went wrong) would call Windows' SwitchToFiber(NULL) and end the process inside
+ * KERNELBASE (seen twice in real online matches, 2026-10-28, right after the rollback's safety net had delivered a throw). The switch is refused instead: the guest's call returns, the fiber
+ * stays where it is, and the pass is marked tainted so the snapshot ring reloads the last healthy state at its safe point (rollback/controller/fault_recovery.c). */
+static int fib_bad_target(uint64_t next, uint64_t from) {
+    if (!next || obj(next)->fiber) return 0;
+    static volatile LONG said; if (InterlockedIncrement(&said) <= 20) printf("nn::os: SwitchToFiber to %llx, which is not a fiber (never set up): refused (called from %llx)\n", (unsigned long long)next, (unsigned long long)from);
+#ifdef _WIN32
+    { void rb_fault_note_external(const char *what, uint64_t where_, uint64_t addr); rb_fault_note_external("switch to a fiber that does not exist", from, next); }
+#endif
+    return 1;
+}
 static void fib_switch(Ctx *c) {
+    if (fib_bad_target(A0, c->x[30] - 4)) return;
     void *own = thread_fiber();
     uint64_t next = A0, self = fiber_cur();
     DWORD tid = GetCurrentThreadId();
