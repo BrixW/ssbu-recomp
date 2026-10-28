@@ -579,7 +579,12 @@ volatile LONG g_rb_audio_off;
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 void rb_audio_off_gate(Ctx *c) {
     static __declspec(thread) int is_audio = -1;
-    if (is_audio < 0) { const char *n = guest_thread_name_of(GetCurrentThreadId()); if (!n) return; is_audio = (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")) ? 1 : 0; }
+    static __declspec(thread) unsigned asked;           /* a thread with no name (the main thread) asks again only every 4096th import: the lookup takes a lock */
+    if (is_audio < 0) {
+        if ((asked++ & 4095) != 0) return;
+        const char *n = guest_thread_name_of(GetCurrentThreadId()); if (!n || n[0] == '?') return;      /* not a guest thread, or not named yet */
+        is_audio = (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")) ? 1 : 0;
+    }
     if (!is_audio) return;
     const char *saved_name = c->in_import; uint64_t saved_from = c->import_from;
     c->in_import = "nn::os::WaitEvent (rollback: audio thread stopped)"; c->import_from = 0;
