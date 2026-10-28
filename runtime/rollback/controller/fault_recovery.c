@@ -114,14 +114,21 @@ int rb_fault_try_absorb(EXCEPTION_POINTERS *ep) {
     const uint8_t *ip = (const uint8_t *)(uintptr_t)cx->Rip;
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery(ip, &mi, sizeof mi) || !(mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) || (uintptr_t)ip + 8 > (uintptr_t)mi.BaseAddress + mi.RegionSize) return 0;
-    {   /* a cascade: past FR_BAIL faults in this pass the thread is likely looping on garbage; send it to nnunwind_bail_trampoline (unwinds to a catch frame on its own stack) instead of
-         * absorbing again. Only for faults in the game's code (guest_function_of), never in the runtime's own code, which may hold host locks. */
+    {   /* CUT instead of absorb (send the thread to nnunwind_bail_trampoline: its host stack unwound to a catch frame of its own stack, the pass reloaded at its safe point) when
+         *  - the pass is already tainted: after one intervention the thread runs on garbage, and absorbing more only lets it go further (a real match, 2026-10-28: after a throw was
+         *    delivered it called address 1, then into KERNELBASE with garbage, and died there),
+         *  - past FR_BAIL faults in one pass (looping on garbage),
+         *  - or the fault is not in the game's own code (Windows, the runtime): those are never stepped over (an instruction of KERNELBASE "absorbed" is exactly how that match ended).
+         * Without a catch frame on the stack: a fault in the game's code is still absorbed, one outside it ends the game as before. */
         extern int nnunwind_has_bail_target(uint64_t rsp); extern void nnunwind_bail_trampoline(void); extern uint64_t guest_function_of(uint64_t rip);
-        if (g_fr_in_pass >= FR_BAIL && guest_function_of(cx->Rip) && nnunwind_has_bail_target(cx->Rsp) && fr_note("cascade cut", cx->Rip, er->ExceptionInformation[1])) {
+        int in_game = guest_function_of(cx->Rip) != 0;
+        if ((g_fr_pending || g_fr_in_pass >= FR_BAIL || !in_game) && nnunwind_has_bail_target(cx->Rsp)) {
+            if (!fr_note(in_game ? "cut (pass already tainted)" : "cut (fault outside the game's code)", cx->Rip, er->ExceptionInformation[1])) return 0;
             cx->Rsp = ((cx->Rsp - 256) & ~(DWORD64)15) - 8;      /* as at a function's entry; the trampoline never returns, the dispatcher's frames below are given up */
             cx->Rip = (DWORD64)(uintptr_t)nnunwind_bail_trampoline;
             return 1;
         }
+        if (!in_game) { InterlockedIncrement64(&g_fr_not_absorbable); LOG("r1: FAULT RECOVERY: a fault at %p is outside the game's code and this thread has no catch frame: not absorbable\n", (void *)ip); return 0; }
     }
     if (!fr_leaf_len(ip)) {                              /* not a leaf helper: a plain memory move inside a bigger function can still be stepped over */
         if ((uintptr_t)ip + 16 <= (uintptr_t)mi.BaseAddress + mi.RegionSize) {
@@ -146,7 +153,13 @@ int rb_fault_try_absorb(EXCEPTION_POINTERS *ep) {
 
 /* call_indirect on an address that is not a function (hostrt.c): skip the call, x0 = 0. */
 int rb_fault_absorb_icall(Ctx *c, uint64_t addr) {
-    if (!fr_enabled() || !fr_note("indirect call", c->x[30] - 4, addr)) return 0;
+    if (!fr_enabled()) return 0;
+    {   /* the pass is already tainted: this thread is running on garbage; cut it back to a catch frame of its own stack instead of skipping the call and going on */
+        extern int nnunwind_has_bail_target(uint64_t rsp); extern void nnunwind_bail_trampoline(void);
+        volatile char here = 0;
+        if (g_fr_pending && nnunwind_has_bail_target((uint64_t)(uintptr_t)&here) && fr_note("cut (pass already tainted: indirect call)", c->x[30] - 4, addr)) nnunwind_bail_trampoline();
+    }
+    if (!fr_note("indirect call", c->x[30] - 4, addr)) return 0;
     c->x[0] = 0;
     return 1;
 }
