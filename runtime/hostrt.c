@@ -596,8 +596,22 @@ void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }
  * They look like a thread blocked in a wait (so the ring parks them like any other) until the fight is over. No sound in rollback matches while it is on. */
 volatile LONG g_rb_audio_off;
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
+int os_mutexes_held_here(void);                    /* os_threads.c */
+/* Audio threads that are running guest code though AUDIO_OFF is on, because they hold a game mutex and parking them with it held would freeze a sim thread that needs it (seen: the game's
+ * thread waiting 20 s for a mutex owned by a parked audio thread). The ring waits for this count to reach 0 before it loads a state (rb_audio_wait_parked), so no audio thread is in guest
+ * code while the ring rewinds the memory under it (the reads of 0x5 / 0xffffffffffffffff after a load). An audio thread holding no mutex parks for good at the gate, in host code touching no
+ * guest memory, safe across any number of loads. g_audio_gen is bumped at fight over so a thread's "running" mark from a past fight does not leak into the next. */
+static volatile LONG g_audio_running, g_audio_gen;
+int rb_audio_running(void) { return g_audio_running; }
+void rb_audio_fight_over(void) { InterlockedExchange(&g_audio_running, 0); InterlockedIncrement(&g_audio_gen); }   /* ring_simulation.c, where g_rb_audio_off is cleared */
+int rb_audio_wait_parked(double max_ms) {           /* snapshot_ring.c, before a load: 1 = no audio thread is in guest code now, 0 = one still is after max_ms */
+    if (!g_rb_audio_off) return 1;
+    for (double t0 = now_ms(); g_audio_running > 0; ) { if (now_ms() - t0 > max_ms) return 0; YieldProcessor(); }
+    return 1;
+}
 void rb_audio_off_gate(Ctx *c) {
     static __declspec(thread) int is_audio = -1;
+    static __declspec(thread) int running, running_gen;
     static __declspec(thread) unsigned asked;           /* a thread with no name (the main thread) asks again only every 4096th import: the lookup takes a lock */
     if (is_audio < 0) {
         if ((asked++ & 4095) != 0) return;
@@ -605,10 +619,15 @@ void rb_audio_off_gate(Ctx *c) {
         is_audio = (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")) ? 1 : 0;
     }
     if (!is_audio) return;
-    { int os_mutexes_held_here(void); if (os_mutexes_held_here()) return; }      /* holds a mutex: stopping it here could leave the game waiting for that mutex for ever; the next import will do */
+    if (running && running_gen != g_audio_gen) running = 0;    /* a new fight: the count was reset, our old mark is void */
+    if (os_mutexes_held_here()) {                       /* holds a game mutex: do not park here (a sim thread may need it); go on, but keep the ring from loading while this runs */
+        if (!running) { running = 1; running_gen = g_audio_gen; InterlockedIncrement(&g_audio_running); }
+        return;
+    }
+    if (running) { running = 0; if (InterlockedDecrement(&g_audio_running) < 0) InterlockedExchange(&g_audio_running, 0); }
     const char *saved_name = c->in_import; uint64_t saved_from = c->import_from;
     c->in_import = "nn::os::WaitEvent (rollback: audio thread stopped)"; c->import_from = 0;
-    while (g_rb_audio_off) Sleep(20);                    /* the fight is over: the audio threads go on */
+    while (g_rb_audio_off) Sleep(20);                    /* holds no mutex: safe to stay here until the fight is over */
     c->in_import = saved_name; c->import_from = saved_from;
 }
 /* Session 8 (track V), SSBU_IMPORT_WATCH=<part of an import's name>: the calls of that one import are timed, and for every

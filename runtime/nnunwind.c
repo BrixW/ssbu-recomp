@@ -172,21 +172,26 @@ static int step(const Fde *f, Regs *r, uint64_t *cfa_out) {
     if (row.cfa_reg < 19 || row.cfa_reg > 31) return 0;
     uint64_t cfa = r->x[row.cfa_reg] + (uint64_t)row.cfa_off;
     g_fix_x29_valid = 0;
-    if (row.cfa_reg == 29 && row.have_sp) {              /* a frame-pointer CFA: x29 + off. sp is arithmetic and always right; x29 comes from a slot or a callee's return and has been seen wrong after rollbacks */
+    /* A frame-pointer CFA (x29 + off) only when x29 is sound. x29 has been seen wrong after rollbacks (0, a data pointer), which made the walk read the return address from the wrong place and
+     * stop. The discriminator: the return address the x29 CFA yields must be inside a known function. When it is not AND the sp-based CFA (sp is arithmetic, always right) yields one that IS, the
+     * frame is taken from sp instead. This never fires on a healthy throw (x29's return is real code there), so it does not count a sound frame as corrupt the way an eager swap did. */
+    if (row.cfa_reg == 29 && row.have_sp && row.cfa_reg != 31) {
         uint64_t spcfa = r->x[31] + (uint64_t)row.sp_off;
         if (spcfa != cfa) {
-            static volatile LONG nmis; int use = 0;
-            LONG k = InterlockedIncrement(&nmis);
+            unsigned ra = f->ra < 32 ? f->ra : 30;
+            EhFunction tmp;
+            uint64_t lr_x = (row.rule[ra] == R_OFFSET) ? (cxxrt_readable(cfa + (uint64_t)row.val[ra], 8) ? rd64(cfa + (uint64_t)row.val[ra]) : 0) : r->x[ra];
+            if (!(lr_x && eh_find_function(lr_x - 4, &tmp))) {      /* x29 gives a return address that is not code: suspect */
+                uint64_t lr_s = (row.rule[ra] == R_OFFSET) ? (cxxrt_readable(spcfa + (uint64_t)row.val[ra], 8) ? rd64(spcfa + (uint64_t)row.val[ra]) : 0) : r->x[ra];
+                if (lr_s && eh_find_function(lr_s - 4, &tmp)) {     /* sp gives one that is: use it */
+                    static volatile LONG nmis; LONG k = InterlockedIncrement(&nmis);
+                    if (k <= 12) printf("unwind: frame f_%llx: x29-based return %llx is not code, sp-based %llx is: using sp (x29 %llx, sp %llx)\n",
+                                        (unsigned long long)f->start, (unsigned long long)lr_x, (unsigned long long)lr_s, (unsigned long long)r->x[29], (unsigned long long)r->x[31]);
+                    g_fix_x29 = spcfa - (uint64_t)row.cfa_off; g_fix_x29_valid = 1; cfa = spcfa;
 #ifdef _WIN32
-            { extern int rb_fault_net_active(void); use = rb_fault_net_active(); }
+                    { extern void rb_fault_note_repair(uint64_t where_); rb_fault_note_repair(r->pc - 4); }      /* the state that left x29 wrong is suspect: the pass is reloaded at its end */
 #endif
-            if (k <= 12) printf("unwind: frame f_%llx: the CFA from x29 (%llx) is not the one from sp (%llx) (x29 %llx, sp %llx, pc %llx): %s\n", (unsigned long long)f->start, (unsigned long long)cfa, (unsigned long long)spcfa,
-                                (unsigned long long)r->x[29], (unsigned long long)r->x[31], (unsigned long long)r->pc, use ? "using sp" : "using x29");
-            if (use) {
-                g_fix_x29 = spcfa - (uint64_t)row.cfa_off; g_fix_x29_valid = 1; cfa = spcfa;
-#ifdef _WIN32
-                { extern void rb_fault_note_repair(uint64_t where_); rb_fault_note_repair(r->pc - 4); }      /* the state that left x29 wrong is suspect: the pass is reloaded at its end */
-#endif
+                }
             }
         }
     }

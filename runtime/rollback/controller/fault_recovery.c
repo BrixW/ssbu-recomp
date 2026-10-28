@@ -25,7 +25,8 @@ static volatile LONG g_fr_off;                          /* the net let go: fault
 static volatile LONG g_fr_lines;
 static int g_fr_enabled = -1;
 
-#define FR_MAX_PER_PASS 64                              /* more faults than this in one pass: it is running on garbage, do not go on */
+#define FR_MAX_PER_PASS 4096                            /* a bad object makes the code read through it and fault again and again (a null read gives 0, then 0+offset faults...): absorb the whole cascade so the thread still reaches
+                                                         * its safe point, where the pass is reloaded once from the last healthy state (the reload, not read-by-read patching, is what fixes the object). More than this in one pass is a true runaway: give up. */
 #define FR_MAX_RECOVERIES 400                           /* in one run: a fight that needs more than this is not being saved by it */
 
 static int fr_enabled(void) {
@@ -162,7 +163,13 @@ int rb_fault_recover(long long i, Ctx *c, long long *best_out) {
     if (best < 0) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: pass %lld faulted %ld times in a row and the ring has no older state: the net lets go\n", i, (long)depth); return 0; }
     g_rg_keep = 0;
     double t0 = now_ms();
-    if (r1_ring_load(best, c) <= 0) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: loading state %lld refused: the net lets go\n", best); return 0; }
+    int lr = 0;
+    for (int tries = 0; tries < 60; tries++) {          /* r1_ring_load returns -1 when a thread is still running or an audio thread holds a mutex: transient, clears within a frame. Only 0 (frame not in the ring) is final. */
+        lr = r1_ring_load(best, c);
+        if (lr != -1) break;
+        Sleep(1);
+    }
+    if (lr <= 0) { InterlockedExchange(&g_fr_off, 1); InterlockedIncrement64(&g_fr_giveups); LOG("r1: FAULT RECOVERY: loading state %lld %s: the net lets go\n", best, lr == 0 ? "not in the ring" : "still refused after 60 ms"); return 0; }
     InterlockedIncrement64(&g_fr_recoveries);
     LOG("r1: FAULT RECOVERY: pass %lld was tainted: state of pass %lld loaded (%ld back) in %.2f ms, passes %lld .. %lld run again (recovery #%lld, %lld faults absorbed in all)\n",
         i, best, (long)depth, now_ms() - t0, best + 1, i, (long long)g_fr_recoveries, (long long)g_fr_total);

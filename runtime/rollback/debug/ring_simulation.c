@@ -38,7 +38,7 @@ void rgs_step(Ctx *c) {
     }
     if (g_rgs_polls_cur > 1) g_rgs_multi++;
     g_rgs_polls_cur = 0;
-    if (g_ra_off || !ra_fight_on()) { ls_fight_over(); InterlockedExchange(&g_rb_audio_off, 0); if (g_ra_phase) g_ra_after_quiet = 1; g_ra_phase = 0; g_rgs_left = 0; g_rgs_pass_t0 = 0; if (rbg_on()) rbg_fight_off(); return; }   /* (R3: the report once at the end of each match; hs12: the session reset for the next match) */
+    if (g_ra_off || !ra_fight_on()) { void rb_audio_fight_over(void); ls_fight_over(); InterlockedExchange(&g_rb_audio_off, 0); rb_audio_fight_over(); if (g_ra_phase) g_ra_after_quiet = 1; g_ra_phase = 0; g_rgs_left = 0; g_rgs_pass_t0 = 0; if (rbg_on()) rbg_fight_off(); return; }   /* (R3: the report once at the end of each match; hs12: the session reset for the next match) */
     if (rbg_on()) { rbg_step(c); g_rgs_pass_t0 = now_ms(); g_rgs_cyc0 = rgs_cyc_now(); g_ra_t_mark = g_rgs_pass_t0; return; }      /* R3: online rollback */
     long long i = g_rgs_next;                             /* the pass that ended here */
     if (g_rg_keep_on < 0) { const char *e = getenv("SSBU_RB_KEEP"); g_rg_keep_on = !e || atoi(e) != 0; }
@@ -57,16 +57,7 @@ void rgs_step(Ctx *c) {
         }
     }
     int ok = 0, rebased = 0;
-    {   /* SSBU_RB_SIM_REBASE=<n>: the ring's base state is made again (a full save, a hitch of ~1.2 s) as soon as n pages have been committed in fights outside everything the ring saves
-         * (the third big reservation is extras only: pages committed after the base are never saved or restored). Only between real passes, with no re-run outstanding. */
-        extern volatile LONG64 g_xls_out_commit; static long long every = -1, at;
-        if (every < 0) { const char *e = getenv("SSBU_RB_SIM_REBASE"); every = e ? atoll(e) : 0; }
-        if (every > 0 && g_ra_phase == 0 && g_rg_ready && (long long)g_xls_out_commit - at >= every) {
-            at = (long long)g_xls_out_commit; g_rg_keep = 0;
-            ok = r1_ring_rebase(i, c); rebased = 1;
-            LOG("r1: RB SIM: ring rebased at pass %lld because %lld pages were committed outside it: %s\n", i, (long long)g_xls_out_commit, ok ? "done" : "refused (next pass)");
-        }
-    }
+    if (g_ra_phase == 0 && g_rg_ready) { int rb_maybe_rebase(long long, Ctx *); g_rg_keep = 0; if (rb_maybe_rebase(i, c)) { ok = 1; rebased = 1; } }   /* OPTION 1: pages committed outside the ring brought in by remaking the base (snapshot_ring.c) */
     if (!rebased || !ok) ok = r1_ring_capture(i, c);
     g_rg_keep = 0;
     if (g_rgv_target >= 0 && i == g_rgv_target) { if (ok) rgv_after(); else g_rgv_target = -1; }
@@ -481,6 +472,7 @@ void rgs_report(void) {
         }
         rgp_report();
         rb_fault_report();
+        { extern long long g_rg_audio_busy; extern int rb_audio_running(void); if (g_rg_audio_busy) LOG("r1: AUDIO: %lld loads waited for an audio thread to park (running now: %d)\n", g_rg_audio_busy, rb_audio_running()); }
         { extern volatile LONG64 g_xls_out_commit, g_xls_out_write; LOG("r1: PAGES OUTSIDE THE RING in fights so far: %lld committed, %lld written by the host (never saved or restored)\n", (long long)g_xls_out_commit, (long long)g_xls_out_write); }
         { extern volatile LONG64 g_hw_fight, g_hw_rerun; LOG("r1: HOST WRITES reported in fights so far: %lld, of them in re-run passes %lld (SSBU_RB_HOSTWRITES=1 lists them)\n", (long long)g_hw_fight, (long long)g_hw_rerun); }
         LOG("r1: RB SIM: %lld rollbacks (k: 1 %lld, 2 %lld, 3 %lld, 4 %lld, 5 %lld, 6 %lld, 7 %lld), captures failed %lld, re-run pads missing %lld, passes with more than one poll %lld\n",

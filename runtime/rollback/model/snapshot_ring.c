@@ -509,6 +509,26 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         frame, now_ms() - t0, t1 - t0, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
     return 1;
 }
+/* OPTION 1 (root cause): pages the game commits DURING a fight in the big reservations, outside what the ring saved at its base, are never captured nor restored; after a rollback they hold future
+ * content while the rest is rewound, and the game (the Lua interpreter's jemalloc memory) then reads an object that should not exist -> index2value crashes, a std::terminate, the fault cascade the
+ * safety net cannot fix because the reloaded state carries the same stale pages. Here the ring's base is simply made again (r1_ring_rebase: it re-scans every committed page and rebuilds the extras
+ * to include the new ones) once enough such pages have piled up, rate-limited so it cannot thrash. A rebase is a full save: a brief hitch. SSBU_RB_REBASE=<pages> sets the threshold (0 = off, default
+ * 96); SSBU_RB_REBASE_GAP=<frames> the least frames between rebases (default 120). Called at a real-pass safe point, no re-run outstanding, threads not held. The hitch-free version (adding the pages
+ * to the ring as they appear, no full save) is the follow-up once this confirms the pages are the cause. */
+int rb_maybe_rebase(long long i, Ctx *c) {
+    extern volatile LONG64 g_xls_out_commit;
+    static long long thr = -1, gap, seen_at, last_frame = -1000000;
+    if (thr < 0) { const char *e = getenv("SSBU_RB_REBASE"); thr = e ? atoll(e) : 96; e = getenv("SSBU_RB_REBASE_GAP"); gap = e ? atoll(e) : 120; }
+    if (thr <= 0 || !g_rg_ready) return 0;
+    long long out = (long long)g_xls_out_commit;
+    if (out - seen_at < thr || i - last_frame < gap) return 0;
+    seen_at = out; last_frame = i;
+    double t0 = now_ms();
+    int ok = r1_ring_rebase(i, c);
+    LOG("r1: REBASE at frame %lld: %lld pages committed outside the ring since the last base -> base remade (%s, %.0f ms); rollbacks before this frame can no longer be taken\n",
+        i, out, ok ? "done" : "refused, next time", now_ms() - t0);
+    return ok;
+}
 /* (R3 hs13: tl4 / nmr / le3a / lg2a / lh4, c00000ff in ntdll's unwinder at a lua2cpp L2CExceptionShutdown throw, about 1 loop
  * run in 5 at the same frame) nnunwind.c's catch table g_catch maps a guest frame (CFA) to a host jmp_buf ON A HOST STACK.
  * The table is state (an extra, rolled back with the rest), but only SOME host stacks go back with it: those of the fibers
@@ -565,10 +585,12 @@ static void rgc_after(void) {                           /* after the copies and 
 }
 long long g_rg_refused;                        /* (R3 pub1) loads refused: a thread still running after the hold */
 long long g_rg_ldpg;                           /* (R3 net3) pages to load, all loads (the written ones: g_cp_wrote) */
+long long g_rg_audio_busy;                     /* loads refused because an audio thread was still in guest code holding a mutex (hostrt.c) */
 int r1_ring_load(long long frame, Ctx *c) {
     int si = -1;
     for (int i = 0; i < g_rg_count; i++) if (rg_slot(i)->frame == frame) si = i;
     if (si < 0) return 0;
+    { int rb_audio_wait_parked(double); if (!rb_audio_wait_parked(8.0)) { g_rg_audio_busy++; return -1; } }   /* an audio thread still runs guest code (holds a mutex): load next pass, when it has parked (hostrt.c) */
     double t0 = now_ms(); g_rgp_seg = 5;
     RgSlot *g = rg_slot(si);
     int k = g_rg_count - 1 - si;

@@ -44,6 +44,7 @@ void rbn_set_lockstep(int on);
 int rbn_loop(void);
 void input_mark(const char *what);
 void rbn_put_mismatch(int m);
+int rb_maybe_rebase(long long i, Ctx *c);      /* snapshot_ring.c (OPTION 1) */
 #include "../rollback.h"
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
@@ -166,6 +167,7 @@ static long long g_rbg_short_waits;
  * until the rollback is made next tick; g_rbg_refused_tick: no second try in the same tick (each try may hold for 500 ms) */
 static int g_rbg_pend, g_rbg_refused_tick;
 void rbn_put_mismatch(int m);
+int rb_maybe_rebase(long long i, Ctx *c);      /* snapshot_ring.c (OPTION 1) */
 static int rbg_capture(long long i, Ctx *c) { g_rg_need = rbn_confirmed(); if (g_rbg_pend > 0 && g_rbg_pend - 1 < g_rg_need) g_rg_need = g_rbg_pend - 1; return r1_ring_capture(i, c); }
 void rbn_stats(int *delay, int *last, int *maxk) { *delay = rbn_delay(); *last = (int)g_rbg_last_k; *maxk = (int)g_rbg_max_k; }   /* net_relay.c net_stats_get (F2) */
 
@@ -328,7 +330,7 @@ static void rbg_step_body(Ctx *c) {
             if (rbg_rollback(c, i, m)) return;
             r1_ring_let_go();
             if (g_rbg_keep != 1 && !rbg_capture(i, c)) g_rbg_capfail++;
-        } else if (!rbg_capture(i, c)) g_rbg_capfail++;
+        } else if (!rb_maybe_rebase(i, c) && !rbg_capture(i, c)) g_rbg_capfail++;   /* OPTION 1: when enough pages have been committed outside the ring, the base is remade here instead of a normal capture (snapshot_ring.c) */
         if (g_rbg_test_f == -2) { const char *e = getenv("SSBU_RB_NET_TEST"); g_rbg_test_f = -1; if (e && *e) { long long tf = -1; int ms = 0, k = 0; sscanf(e, "%lld,%d,%d", &tf, &ms, &k); g_rbg_test_f = tf; g_rbg_test_ms = ms; g_rbg_test_k = k; } }
         if (g_rbg_test_f > 0 && i >= g_rbg_test_f && !g_rbg_noring) {    /* (the first real pass from that frame on without a rollback of its own) */
             g_rbg_test_f = -1;                        /* test: a long stall at this safe point, then a rollback (same pads: the timeline must not change) */
