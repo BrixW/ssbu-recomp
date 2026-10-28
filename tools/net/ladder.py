@@ -114,11 +114,14 @@ class Ladder:
     def __init__(self, path, open_signup=False, legal_stages=None, now=time.time):
         self.path, self.open_signup, self.legal_stages, self.now = path, open_signup, legal_stages, now
         self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")      # (the web thread reads while the lobby writes)
         self.db.executescript(SCHEMA)
+        self.db.execute("UPDATE sets SET state = 'void', closed = ? WHERE state = 'open'", (self.now(),))   # (a restarted lobby: those sets' games are lost)
         if self.db.execute("SELECT COUNT(*) FROM seasons WHERE ended IS NULL").fetchone()[0] == 0:
             self.db.execute("INSERT INTO seasons (name, started) VALUES (?, ?)", ("Season 1", self.now()))
         self.db.commit()
-        self.pending = {}         # match seed -> {"at": time, "reports": {player id: report}}
+        self.pending = {}         # match seed -> {"at": time, "reports": {player id: report}, "pair": the two ids}
+        self.settled = {}         # match seed -> outcome (a game sends its RESULT again until it is acknowledged)
 
     def season(self):
         return self.db.execute("SELECT id FROM seasons WHERE ended IS NULL ORDER BY id DESC").fetchone()[0]
@@ -160,6 +163,13 @@ class Ladder:
         self.db.commit()
         return pid, name
 
+    def rank(self, pid):
+        """pid's place in the table (1 = first), 0 = not ranked"""
+        row = self.db.execute("SELECT rating - 2 * rd FROM players WHERE id = ?", (pid,)).fetchone()
+        if row is None:
+            return 0
+        return 1 + self.db.execute("SELECT COUNT(*) FROM players WHERE rating - 2 * rd > ?", row).fetchone()[0]
+
     def player(self, pid):
         return self.db.execute("SELECT name, rating, rd, vol, wins, losses FROM players WHERE id = ?", (pid,)).fetchone()
 
@@ -191,6 +201,8 @@ class Ladder:
         """A RESULT from player pid (whose rollback opponent is opp). r: dict seed, slot (0 / 1: pid's own slot), stage,
         chara (2), stocks (2), dmg (2), frames, rule_kind, stock, desyncs, flags. Returns the outcome of the game once
         both reports are in ("ok" / "draw" / "disputed: why"), or None while one is waited for."""
+        if r["seed"] in self.settled:
+            return self.settled[r["seed"]]
         p = self.pending.setdefault(r["seed"], {"at": self.now(), "reports": {}, "pair": frozenset((pid, opp))})
         if pid not in p["pair"]:
             return None
@@ -247,7 +259,10 @@ class Ladder:
             if max(w1, w2) >= LADDER_TO:
                 self.close_set(set_id, 1 if w1 > w2 else 2)
         self.db.commit()
-        return state if state != "disputed" else "disputed: " + why
+        out = self.settled[seed] = state if state != "disputed" else "disputed: " + why
+        if len(self.settled) > 4096:
+            self.settled.pop(next(iter(self.settled)))
+        return out
 
     def close_set(self, set_id, winner):
         _, p1, p2 = self.db.execute("SELECT id, p1, p2 FROM sets WHERE id = ?", (set_id,)).fetchone()

@@ -36,7 +36,16 @@ match over RB messages (16) addressed to each other. The lobby counts the pair T
 between them. On the public lobby code an RB message to one player is relayed only to the player matched with the
 sender (or a player of its Local Wireless room). An older lobby ignores op 2 (the game then says "older lobby").
 
-Python 3.8+, standard library only. No authentication or encryption yet: run it for people you know."""
+Ranked ladder (lobby 1.5, --ladder-db, ladder.py): Glicko-2 over Bo3 sets of rollback matches between invited players.
+JOIN may end (after the 'M''S' block) with 'L''D' + version u8 (1) + ladder id[16] + HMAC-SHA256(key, JOIN nonce)[32] +
+flags u8 (1: key[32] + invitation length u8 + invitation follow: the sign-up, sent until the lobby says "ranked"). WELCOME
+then ends with 'L''D' + status u8 (1 ranked, 0 not, 2 unknown id: sign up again) + rating u16 + RD u16 + wins u16 +
+losses u16 + place u16 + text[32] (the ladder name, or why not ranked). After each rollback match both games send RESULT
+(22) until RESULT_ACK (23); a game counts only when both sent the same result for the same match seed (ladder.py).
+    python ssbu_lobby.py --ladder-db ladder.db [--ladder-open]        the lobby with the ladder (web: /ladder on --status-port)
+    python ssbu_lobby.py --ladder-db ladder.db --ladder-invite <name>  prints a one-use invitation code and exits
+
+Python 3.8+, standard library only. No encryption: run it for people you know."""
 import argparse
 import json
 import os
@@ -47,15 +56,28 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:                         # ladder.py from this file's own directory (python -I leaves that directory out of sys.path)
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("ladder", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ladder.py"))
+    ladder_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(ladder_mod)
+except (ImportError, OSError):   # (ladder.py not installed next to it: no ladder)
+    ladder_mod = None
+
 PROTO = 1
-LOBBY_VERSION = "1.4"
+LOBBY_VERSION = "1.5"
 (JOIN, WELCOME, REJECT, PING, PONG, DATA, LEAVE, LIST, LISTING, LIST_END,
  PEERS, PUNCH, DIRECT, BCAST) = range(1, 15)
 RB = 16          # online rollback messages between two games (recomp-study/net_relay.c T_RB, rb_net.c)
 ROOMS, ROOM_INFO, ROOMS_END = 17, 18, 19     # O1 room browser (net_relay.c): every room of this lobby code, any build
 MATCH, MATCH_STATE = 20, 21                  # O2 matchmaking (net_relay.c): find an opponent of the same build and code
+RESULT, RESULT_ACK = 22, 23                  # 1.5 ladder: a rollback match's result (net_relay.c, ladder_report.c)
+LD_UNRANKED, LD_RANKED, LD_UNKNOWN = 0, 1, 2
+OUT_WAIT, OUT_OK, OUT_DRAW, OUT_DISPUTED, OUT_UNRANKED = range(5)
+RESULT_LEN = 4 + 8 + 8 + 4 + 4 + 4 + 16 + 2 + 4 + 4 + 4
 (MS_IDLE, MS_SEARCHING, MS_MATCHED, MS_TIMEOUT, MS_PEER_LEFT, MS_TOGETHER, MS_EXPIRED) = range(7)
 ROLE_HOST, ROLE_JOIN = 1, 2
 KIND_ROOM, KIND_ROLLBACK = 1, 2              # MATCH op 1 / op 2: a Local Wireless search, a rollback-match search (1.4)
@@ -137,6 +159,8 @@ class Client:
         self.final = None         # (search id, state, role, peer ip, peer name): how its last search ended (sent again if asked)
         self.kind = KIND_ROOM     # 1.4: what it searches (KIND_ROOM / KIND_ROLLBACK)
         self.rb_peer = 0          # 1.4: the player of its last rollback match (RB to it is relayed on the public code)
+        self.ladder_id = None     # 1.5: its ladder id when it is ranked
+        self.ladder_why = ""      # (its ladder name, or why it is not ranked)
 
 
 class Match:
@@ -160,11 +184,12 @@ class Room:
 
 
 class Lobby:
-    def __init__(self, sock, verbose, search_for=SEARCH_FOR, match_for=MATCH_FOR):
-        self.sock, self.verbose = sock, verbose
+    def __init__(self, sock, verbose, search_for=SEARCH_FOR, match_for=MATCH_FOR, ladder=None):
+        self.sock, self.verbose, self.ladder = sock, verbose, ladder
         self.search_for, self.match_for = search_for, match_for
         self.by_at, self.by_ip, self.rooms = {}, {}, {}
         self.next_ip = SUBNET + 2
+        self.ladder_said = {}     # match seed -> outcome already logged
         self.stats = {"relayed game datagrams": 0, "ldn messages": 0, "dropped": 0}
 
     def say(self, *what):
@@ -222,6 +247,8 @@ class Lobby:
             c.match = None
             self.match_end(other, MS_PEER_LEFT, "%s left the lobby" % c.name)
         c.search_since = None
+        if self.ladder is not None and c.ladder_id is not None and self.ladder.void_sets(c.ladder_id):
+            self.say("ladder: the open set of %s is void (%s)" % (c.ladder_why, why))
         if c.room is not None:
             self.close_room(c.room, "host left")
         if c.claim:
@@ -302,8 +329,11 @@ class Lobby:
                 m.rb_seen.add(c.ip)
                 if len(m.rb_seen) == 2:
                     h, g = m.host, m.guest
+                    self.ladder_open_set(h, g)
                     self.match_end(h, MS_TOGETHER, "playing a rollback match with %s" % g.name)
                     self.match_end(g, MS_TOGETHER, "playing a rollback match with %s" % h.name)
+        elif kind == RESULT and len(p) >= RESULT_LEN and struct.unpack_from(">Q", p, 4)[0] == c.cookie:
+            self.on_result(c, p)
         elif kind == DATA and len(p) >= 16:
             self.on_data(c, p, 4, now, ())
         elif kind == BCAST and len(p) >= 5:
@@ -343,9 +373,91 @@ class Lobby:
                 name, code, build.decode("ascii", "replace"), vip_text(ip), at[0], at[1], socket.inet_ntoa(struct.pack(">I", lan[0])), lan[1],
                 "yes" if direct else "no"))
         c.seen, c.lan, c.direct = now, lan, direct
+        ld = None
         if len(p) > JOIN_LEN + 2 and p[JOIN_LEN:JOIN_LEN + 2] == b"MS":      # O1: the game's mods (an older game sends none)
             c.mods = mods_block(p[JOIN_LEN + 2:])
-        self.send(hdr(WELCOME) + nonce + struct.pack(">IQ", c.ip, c.cookie), at)
+            o = JOIN_LEN + 2 + len(c.mods) if c.mods is not None else len(p)
+            if p[o:o + 3] == b"LD\1":                                       # 1.5: the game's ladder id
+                ld = p[o + 3:]
+        tail = self.ladder_join(c, nonce, ld) if ld is not None else b""
+        self.send(hdr(WELCOME) + nonce + struct.pack(">IQ", c.ip, c.cookie) + tail, at)
+
+    # ---- 1.5 ladder
+    def ladder_join(self, c, nonce, ld):
+        """The 'L''D' block of a JOIN: who c is on the ladder. Returns WELCOME's 'L''D' tail."""
+        status, why = LD_UNRANKED, "no ladder on this lobby"
+        if self.ladder is not None and len(ld) >= 16 + 32 + 1:
+            pid, proof, flags = bytes(ld[:16]), bytes(ld[16:48]), ld[48]
+            key = invite = None
+            if flags & 1 and len(ld) >= 49 + 32 + 1:
+                key, n = bytes(ld[49:81]), ld[81]
+                invite = text(ld[82:82 + n]) or None
+            got, why = self.ladder.identify(pid, c.name, nonce, proof, key, invite)
+            if got is None and why == "unknown id":
+                status = LD_UNKNOWN
+            elif got is not None:
+                status = LD_RANKED
+                if c.ladder_id != got:
+                    self.say("ladder: %s is ranked as %s" % (c.name, why))
+            elif c.ladder_why != why:
+                self.say("ladder: %s is not ranked: %s" % (c.name, why))
+            c.ladder_id = got
+        c.ladder_why = why
+        return b"LD" + bytes((status,)) + self.ladder_numbers(c) + why.encode("utf-8", "replace")[:NAME_LEN].ljust(NAME_LEN, b"\0")
+
+    def ladder_numbers(self, c):
+        """rating u16, RD u16, wins u16, losses u16, place u16 of a ranked player (zeros otherwise)"""
+        row = self.ladder.player(c.ladder_id) if self.ladder is not None and c.ladder_id is not None else None
+        if row is None:
+            return bytes(10)
+        return struct.pack(">HHHHH", max(0, min(int(round(row[1])), 65535)), min(int(round(row[2])), 65535), min(row[4], 65535),
+                           min(row[5], 65535), min(self.ladder.rank(c.ladder_id), 65535))
+
+    def ladder_ack(self, c, seed, outcome, opp=None):
+        """RESULT_ACK: seed u64, outcome u8, rating u16, RD u16, wins u16, losses u16, place u16, set score (mine u8, the other's u8)"""
+        mine = theirs = 0
+        if self.ladder is not None and c.ladder_id is not None and opp is not None and opp.ladder_id is not None:
+            st = self.ladder.open_set_of(c.ladder_id, opp.ladder_id)
+            if st is not None:
+                mine, theirs = (st[3], st[4]) if st[1] == c.ladder_id else (st[4], st[3])
+        self.send(hdr(RESULT_ACK) + struct.pack(">QB", seed, outcome) + self.ladder_numbers(c) + bytes((mine, theirs)), c.at)
+
+    def ladder_open_set(self, a, b):
+        """a (player 1) and b play a rollback match: their set, if both are ranked"""
+        if self.ladder is not None and a.ladder_id is not None and b.ladder_id is not None and a.ladder_id != b.ladder_id:
+            if self.ladder.open_set_of(a.ladder_id, b.ladder_id) is None:
+                self.ladder.open_set(a.ladder_id, b.ladder_id)
+                self.say("ladder: set opened: %s vs %s" % (a.ladder_why, b.ladder_why))
+
+    def on_result(self, c, p):
+        """RESULT: cookie u64, match seed u64, the other player's address u32, slot u8 (0: player 1), rule kind u8, stocks of
+        the rule u8, flags u8 (1 abandoned, 2 disconnected), stage u32, chara u64 x 2, stocks left u8 x 2, damage (tenths of
+        a percent) u16 x 2, frames u32, desyncs u32"""
+        seed, peer, slot, rule_kind, stock, flags, stage = struct.unpack_from(">QIBBBBI", p, 12)
+        c0, c1, s0, s1, d0, d1, frames, desyncs = struct.unpack_from(">QQBBHHII", p, 32)
+        opp = self.by_ip.get(peer)
+        if (self.ladder is None or c.ladder_id is None or opp is None or opp is c or opp.ladder_id is None
+                or opp.ladder_id == c.ladder_id or opp.part[1] != c.part[1] or slot > 1):
+            self.log("ladder: the result of %s is not ranked" % c.name)
+            return self.ladder_ack(c, seed, OUT_UNRANKED)
+        a, b = (c, opp) if slot == 0 else (opp, c)
+        self.ladder_open_set(a, b)
+        r = {"seed": seed, "slot": slot, "stage": stage, "chara": (c0, c1), "stocks": (s0, s1), "dmg": (d0, d1), "frames": frames,
+             "rule_kind": rule_kind, "stock": stock, "desyncs": desyncs, "flags": flags}
+        out = self.ladder.report(c.ladder_id, opp.ladder_id, r)
+        if out is None:
+            return self.ladder_ack(c, seed, OUT_WAIT, opp)
+        code = OUT_OK if out == "ok" else OUT_DRAW if out == "draw" else OUT_DISPUTED
+        if seed not in self.ladder_said:
+            self.ladder_said[seed] = out
+            self.say("ladder: game %016x, %s vs %s: %s" % (seed, a.ladder_why, b.ladder_why, out))
+        for x, o in ((c, opp), (opp, c)):
+            self.ladder_ack(x, seed, code, o)
+
+    def ladder_sweep(self):
+        if self.ladder is not None:
+            for out in self.ladder.sweep():
+                self.say("ladder: a game without its second report: %s" % out)
 
     def on_list(self, c, seq, now, other=False):
         """The game's Rooms List. other (flag 1, a newer game): the rooms of every build of this code, each LISTING ending
@@ -566,6 +678,7 @@ class Lobby:
         for r in list(self.rooms.values()):
             if now - r.updated > ROOM_TIMEOUT:
                 self.close_room(r, "no advertisement for %d s" % ROOM_TIMEOUT)
+        self.ladder_sweep()
 
 
 def status_json(lobby, started, now):
@@ -575,8 +688,46 @@ def status_json(lobby, started, now):
                        "version": "%s (protocol SU %d)" % (LOBBY_VERSION, PROTO), "uptime_s": int(now - started)})
 
 
+LADDER_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSBU ladder</title>
+<style>
+:root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #ddddd6; --accent: #c2410c; --win: #15803d; --loss: #b91c1c; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ecece8; --muted: #9a9a93; --line: #2e2e2b; --accent: #fb923c; --win: #4ade80; --loss: #f87171; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 22px; margin: 0 0 4px; } p.sub { color: var(--muted); margin: 0 0 20px; }
+table { width: 100%; border-collapse: collapse; } th, td { padding: 8px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+th { color: var(--muted); font-weight: 600; font-size: 13px; } td.n { text-align: right; font-variant-numeric: tabular-nums; }
+tr.p { cursor: pointer; } tr.p:hover td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.rd { color: var(--muted); font-size: 12px; } .w { color: var(--win); } .l { color: var(--loss); }
+#hist { margin-top: 28px; } #hist h2 { font-size: 17px; margin: 0 0 8px; }
+</style></head><body><main>
+<h1>Ladder</h1><p class="sub">Glicko-2, Bo3 sets, 3 stocks. Ordered by rating minus twice the deviation.</p>
+<table><thead><tr><th>#</th><th>Player</th><th class="n">Rating</th><th class="n">Sets W-L</th></tr></thead><tbody id="t"></tbody></table>
+<section id="hist"></section>
+</main><script>
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function show(name) {
+  const r = await fetch("player/" + encodeURIComponent(name) + ".json"); if (!r.ok) return;
+  const h = await r.json(), el = document.getElementById("hist");
+  el.innerHTML = "<h2>" + esc(h.name) + "</h2><table><thead><tr><th>Opponent</th><th>Result</th><th class=n>Score</th><th class=n>Rating</th></tr></thead><tbody>" +
+    h.sets.map(s => "<tr><td>" + esc(s.opponent) + "</td><td class=" + (s.won === true ? "w" : s.won === false ? "l" : "") + ">" +
+      (s.state === "done" ? (s.won ? "won" : "lost") : s.state) + "</td><td class=n>" + s.score.join("-") + "</td><td class=n>" +
+      (s.rating ? s.rating[0] + " &rarr; " + s.rating[1] : "") + "</td></tr>").join("") + "</tbody></table>";
+}
+fetch("ladder.json").then(r => r.json()).then(rows => {
+  document.getElementById("t").innerHTML = rows.map((p, i) => "<tr class=p data-n=\"" + esc(p.name) + "\"><td>" + (i + 1) + "</td><td>" + esc(p.name) +
+    "</td><td class=n>" + p.rating + " <span class=rd>&plusmn;" + p.rd + "</span></td><td class=n>" + p.wins + "-" + p.losses + "</td></tr>").join("");
+  document.querySelectorAll("tr.p").forEach(tr => tr.onclick = () => show(tr.dataset.n));
+});
+</script></body></html>
+"""
+
+
 def start_status_server(lobby, bind, port, started):
-    """Serve GET /status on a daemon thread. Returns the server (its .server_address has the real port)."""
+    """Serve GET /status (and, with a ladder, /ladder, /ladder.json, /player/<name>.json) on a daemon thread. Returns the
+    server (its .server_address has the real port)."""
     class Handler(BaseHTTPRequestHandler):
         server_version = "ssbu-lobby-status"
         sys_version = ""
@@ -591,18 +742,30 @@ def start_status_server(lobby, bind, port, started):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
+        def route(self):
+            """(code, body, content type) of a GET. The ladder documents never hold ids, keys or addresses."""
+            path = self.path.split("?", 1)[0].rstrip("/")
+            ld = lobby.ladder
+            if path == "/status":
+                return 200, status_json(lobby, started, time.monotonic()).encode(), "application/json"
+            if ld is not None and path == "/ladder":
+                return 200, LADDER_PAGE.encode(), "text/html; charset=utf-8"
+            if ld is not None and path == "/ladder.json":
+                return 200, json.dumps(ld.table()).encode(), "application/json"
+            if ld is not None and path.startswith("/player/") and path.endswith(".json"):
+                h = ld.history(urllib.parse.unquote(path[len("/player/"):-len(".json")]))
+                if h is not None:
+                    return 200, json.dumps(h).encode(), "application/json"
+            return 404, b'{"error":"not found"}', "application/json"
+
         def do_GET(self):
-            if self.path.split("?", 1)[0].rstrip("/") == "/status":
-                body = status_json(lobby, started, time.monotonic()).encode()
-                self.head(200, body, "application/json")
-            else:
-                body = b'{"error":"not found"}'
-                self.head(404, body, "application/json")
+            code, body, ctype = self.route()
+            self.head(code, body, ctype)
             self.wfile.write(body)
 
         def do_HEAD(self):
-            ok = self.path.split("?", 1)[0].rstrip("/") == "/status"
-            self.head(200 if ok else 404, b"", "application/json")
+            code, _, ctype = self.route()
+            self.head(code, b"", ctype)
 
         def do_OPTIONS(self):
             self.head(204, b"", "text/plain")
@@ -626,7 +789,24 @@ def main():
     ap.add_argument("--status-bind", default="127.0.0.1", help="address of the status endpoint (default 127.0.0.1, behind a proxy)")
     ap.add_argument("--search-secs", type=float, default=SEARCH_FOR, help="matchmaking: a search without an opponent ends after this (default 120)")
     ap.add_argument("--match-secs", type=float, default=MATCH_FOR, help="matchmaking: matched players not in one room by then are told it expired (default 180)")
+    ap.add_argument("--ladder-db", default="", help="the ranked ladder's sqlite file (ladder.py; empty: no ladder)")
+    ap.add_argument("--ladder-open", action="store_true", help="ladder: any new player is ranked the first time it is seen (default: by invitation only)")
+    ap.add_argument("--ladder-invite", metavar="NAME", help="ladder: print a one-use invitation code for a player called NAME, and exit")
+    ap.add_argument("--ladder-stages", default="", help="ladder: the legal stages, comma-separated stage ids (match block + 0x420, hex or decimal; empty: any)")
     o = ap.parse_args()
+    ladder = None
+    if o.ladder_db:
+        if ladder_mod is None:
+            print("--ladder-db: ladder.py is not next to ssbu_lobby.py", file=sys.stderr)
+            return 2
+        stages = {int(x, 0) for x in o.ladder_stages.split(",") if x.strip()} or None
+        ladder = ladder_mod.Ladder(o.ladder_db, open_signup=o.ladder_open, legal_stages=stages)
+        if o.ladder_invite:
+            print(ladder.invite(o.ladder_invite))
+            return 0
+    elif o.ladder_invite:
+        print("--ladder-invite needs --ladder-db", file=sys.stderr)
+        return 2
     started = time.monotonic()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     if os.name == "nt":   # (no ICMP "port unreachable" errors on receive)
@@ -635,11 +815,13 @@ def main():
         except (AttributeError, OSError):
             pass
     sock.bind((o.bind, o.port))
-    lobby = Lobby(sock, o.verbose, o.search_secs, o.match_secs)
+    lobby = Lobby(sock, o.verbose, o.search_secs, o.match_secs, ladder)
     lobby.say("lobby on UDP %s:%d (protocol SU %d)" % (o.bind, o.port, PROTO))
+    if ladder is not None:
+        lobby.say("ladder: %s (%s)" % (o.ladder_db, "open sign-up" if o.ladder_open else "by invitation"))
     if o.status_port:
         srv = start_status_server(lobby, o.status_bind, o.status_port, started)
-        lobby.say("status endpoint on http://%s:%d/status" % srv.server_address[:2])
+        lobby.say("status endpoint on http://%s:%d/status%s" % (srv.server_address[:2] + (" (ladder: /ladder)" if ladder is not None else "",)))
     last_sweep = last_stats = time.monotonic()
     while True:
         r, _, _ = select.select([sock], [], [], 0.5)

@@ -2,15 +2,28 @@
 """Unit tests of ladder.py: Glicko-2 against Glickman's worked example, identity (invitation, open sign-up, key proof,
 names), a Bo3 with matching reports (both ratings change), disputed games (reports differ, a desync, one report only,
 not the ladder's rules), draws, a set left half-played, and the web documents (no ids or keys).
+LobbyLadderTest: the same through ssbu_lobby.py over UDP (JOIN 'L''D' sign-up by invitation, then the key proof only;
+a JOIN without 'L''D' still joins, unranked; a Bo3 of RESULTs with RESULT_ACKs; /ladder.json and /player/<name>.json).
     python -m unittest tools/net/test_ladder.py        (standard library only)"""
+import hashlib
+import hmac
 import json
 import os
+import socket
+import struct
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import ladder as LD  # noqa: E402
+import ssbu_lobby as L  # noqa: E402
+from test_ssbu_lobby import Fake, free_port, free_tcp_port  # noqa: E402
 
 
 class Clock:
@@ -113,6 +126,21 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(self.ld.open_set_of(self.a, self.b)[3:], (0, 0))
         self.assertEqual(self.ld.player(self.a)[1], 1500)
 
+    def test_resent_report_after_settle(self):
+        self.ld.open_set(self.a, self.b)
+        self.assertEqual(self.play(1, 0), "ok")
+        self.assertEqual(self.ld.report(self.a, self.b, report(1, 0)), "ok")
+        self.clock.t += LD.REPORT_WAIT + 1
+        self.assertEqual(self.ld.sweep(), [])
+        self.assertEqual(self.ld.open_set_of(self.a, self.b)[3:], (1, 0))
+        self.assertEqual((self.ld.rank(self.a), self.ld.rank(os.urandom(16))), (1, 0))
+
+    def test_restart_voids_open_sets(self):
+        self.ld.open_set(self.a, self.b)
+        self.ld.db.close()
+        self.ld = LD.Ladder(self.ld.path, now=self.clock)
+        self.assertIsNone(self.ld.open_set_of(self.a, self.b))
+
     def test_report_from_outsider_ignored(self):
         self.ld.open_set(self.a, self.b)
         self.ld.report(self.a, self.b, report(1, 0))
@@ -147,6 +175,118 @@ class LadderTest(unittest.TestCase):
         for secret in (self.a, self.b, self.ka, self.kb):
             self.assertNotIn(secret.hex(), doc)
         self.assertIsNone(self.ld.history("nobody"))
+
+
+class RankedFake(Fake):
+    def __init__(self, lobby, name, invite=None):
+        super().__init__(lobby, name, mods=b"\0")
+        self.pid, self.key, self.invite = os.urandom(16), os.urandom(32), invite
+
+    def join_ld(self, signup=True, ld=True):
+        """JOIN with the ladder block; returns WELCOME's 'L''D' tail as (status, rating, rd, wins, losses, place, text)"""
+        port = self.s.getsockname()[1]
+        block = b""
+        if ld:
+            block = b"LD\1" + self.pid + hmac.new(self.key, self.nonce, hashlib.sha256).digest()
+            if signup:
+                inv = (self.invite or "").encode()
+                block += b"\1" + self.key + bytes((len(inv),)) + inv
+            else:
+                block += b"\0"
+        self.tx(L.JOIN, self.nonce + self.code.ljust(32, b"\0") + self.name.encode().ljust(32, b"\0") + self.build.ljust(40, b"\0")
+                + struct.pack(">IHB", 0x7F000001, port, 1) + b"MS" + self.mods + block)
+        b = self.rx(L.WELCOME)
+        self.ip, self.cookie = struct.unpack_from(">IQ", b, 8)
+        if len(b) == 20:
+            return None
+        assert b[20:22] == b"LD", b[20:]
+        return (b[22],) + struct.unpack_from(">HHHHH", b, 23) + (b[33:65].rstrip(b"\0").decode(),)
+
+    def result(self, seed, peer, slot, stocks, dmg=(300, 900), desyncs=0):
+        self.tx(L.RESULT, struct.pack(">QQIBBBBI", self.cookie, seed, peer, slot, LD.RULE_STOCK, LD.LADDER_STOCKS, 0, 7)
+                + struct.pack(">QQBBHHII", 0x11, 0x22, stocks[0], stocks[1], dmg[0], dmg[1], 9000, desyncs))
+
+    def ack(self, seed):
+        """the next RESULT_ACK for seed: (outcome, rating, rd, wins, losses, place, my set score, the other's)"""
+        while True:
+            b = self.rx(L.RESULT_ACK)
+            if struct.unpack_from(">Q", b)[0] == seed:
+                return (b[8],) + struct.unpack_from(">HHHHH", b, 9) + (b[19], b[20])
+
+
+class LobbyLadderTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.dir.name, "ladder.db")
+        lobby = [sys.executable, "-I", os.path.join(HERE, "ssbu_lobby.py"), "--ladder-db", self.db]
+        self.inv = [subprocess.check_output(lobby + ["--ladder-invite", n], text=True).strip() for n in ("Roberto", "FreDy")]
+        self.port, self.sport = free_port(), free_tcp_port()
+        self.proc = subprocess.Popen(lobby + ["--bind", "127.0.0.1", "--port", str(self.port), "--stats", "0", "--status-port", str(self.sport)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.lines = []
+        self.reader = threading.Thread(target=lambda: self.lines.extend(iter(self.proc.stdout.readline, "")), daemon=True)
+        self.reader.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not any("status endpoint" in l for l in self.lines):
+            time.sleep(0.05)
+        self.lob = ("127.0.0.1", self.port)
+
+    def tearDown(self):
+        self.proc.terminate()
+        self.proc.wait(5)
+        self.reader.join(2)
+        self.proc.stdout.close()
+        if os.environ.get("LOBBY_LOG"):
+            print("".join(self.lines))
+        self.dir.cleanup()
+
+    def fake(self, name, invite=None):
+        f = RankedFake(self.lob, name, invite)
+        self.addCleanup(f.s.close)
+        return f
+
+    def get(self, path):
+        with urllib.request.urlopen("http://127.0.0.1:%d%s" % (self.sport, path), timeout=3) as r:
+            return r.read().decode()
+
+    def test_bo3_through_the_lobby(self):
+        a, b = self.fake("Rob", self.inv[0]), self.fake("Fre", self.inv[1])
+        self.assertEqual(a.join_ld()[0::6], (L.LD_RANKED, "Roberto"))
+        self.assertEqual(b.join_ld()[0::6], (L.LD_RANKED, "FreDy"))
+        a2 = self.fake("Rob")              # the same game again (new nonce): the key proof only
+        a2.pid, a2.key = a.pid, a.key
+        self.assertEqual(a2.join_ld(signup=False)[0::6], (L.LD_RANKED, "Roberto"))
+        a2.key = os.urandom(32)
+        a2.nonce = os.urandom(8)
+        self.assertEqual(a2.join_ld(signup=False)[0::6], (L.LD_UNRANKED, "wrong key"))
+        stranger = self.fake("Who")
+        self.assertEqual(stranger.join_ld(signup=False)[0], L.LD_UNKNOWN)
+        self.assertIsNone(self.fake("Old").join_ld(ld=False))       # an older game: no ladder, still joined
+        for seed, stocks in ((101, (2, 0)), (102, (0, 1)), (103, (1, 0))):
+            a.result(seed, b.ip, 0, stocks)
+            self.assertEqual(a.ack(seed)[0], L.OUT_WAIT)
+            b.result(seed, a.ip, 1, stocks)
+            self.assertEqual(b.ack(seed)[0], L.OUT_OK)
+            got = a.ack(seed)
+            self.assertEqual(got[0], L.OUT_OK)
+        self.assertGreater(got[1], 1500)
+        self.assertEqual((got[3], got[4], got[5]), (1, 0, 1))
+        a.result(103, b.ip, 0, (1, 0))               # resent after its ACK was lost: the same outcome, counted once
+        self.assertEqual(a.ack(103)[0], L.OUT_OK)
+        a.result(104, b.ip, 0, (2, 0))
+        a.ack(104)
+        b.result(104, a.ip, 1, (2, 0), desyncs=1)
+        self.assertEqual(b.ack(104)[0], L.OUT_DISPUTED)
+        stranger.result(105, a.ip, 0, (2, 0))
+        self.assertEqual(stranger.ack(105)[0], L.OUT_UNRANKED)
+        table = json.loads(self.get("/ladder.json"))
+        self.assertEqual([(p["name"], p["wins"], p["losses"]) for p in table], [("Roberto", 1, 0), ("FreDy", 0, 1)])
+        hist = json.loads(self.get("/player/FreDy.json"))
+        self.assertEqual(hist["sets"][-1]["score"], [1, 2])
+        self.assertIn("<title>SSBU ladder</title>", self.get("/ladder"))
+        doc = self.get("/ladder.json") + self.get("/player/Roberto.json")
+        for leak in ("127.0.0.1", "10.13.", a.pid.hex(), a.key.hex(), b.pid.hex(), self.inv[0]):
+            self.assertNotIn(leak, doc)
 
 
 if __name__ == "__main__":
