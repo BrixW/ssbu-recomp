@@ -257,6 +257,14 @@ int g_r1_ctr = -1;
 
 /* snapshot_ring.c load recorder, right after fibers_restore_all: fiber objects that exist now and not in the state just loaded (made after it) */
 /* snapshot_ring.c rg_gstk_load: is some context that runs now, and was not put back by the load, using guest stack [lo, hi)? (a born fiber running now, or a fiber not put back) */
+/* snapshot_ring.c rg_opg_load: the guest stack ranges of every fiber, in the state loaded and now (those pages are left to rg_gstk_load and its checks) */
+int os_fiber_stack(uint64_t key, uint64_t *lo, uint64_t *hi);
+int fibers_stack_ranges(uint64_t *lo, uint64_t *hi, int max) {
+    int n = 0;
+    for (int i = 0; i < g_guest_fibers.count && n < max; i++) { Fib *f = &g_guest_fibers.table[i]; if (f->obj[5]) { lo[n] = f->obj[4]; hi[n] = f->obj[4] + f->obj[5]; n++; } }
+    for (int j = 0; j < g_ncur && n < max; j++) { uint64_t a, b; if (os_fiber_stack(g_cur[j].key, &a, &b)) { lo[n] = a; hi[n] = b; n++; } }
+    return n;
+}
 int fibers_live_sp_in(uint64_t lo, uint64_t hi) {
     for (int j = 0; j < g_ncur; j++) {
         if (!g_cur[j].tid || !g_cur[j].c) continue;

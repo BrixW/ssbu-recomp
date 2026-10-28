@@ -122,6 +122,7 @@ extern int (*volatile cp_f_cmp)(uint8_t *, const uint8_t *);      /* compare one
 #define RG_ENT_RES (64ull << 20)               /* per slot: room for 8 M (id, old) pairs */
 #define RG_FP_RES (256ull << 20)               /* per slot: fibers' host stacks */
 #define RG_CB_RES (64ull << 20)                /* per slot: command-buffer recordings */
+#define RG_OP_RES (512ull << 20)               /* per slot: the pages committed outside the ring during the fight (snapshot_ring.c rg_opg_*) */
 #define RG_GS_RES (64ull << 20)                /* per slot: the live part of every fiber's GUEST stack (snapshot_ring.c rg_gstk_*) */
 #define RG_CBS_SIZE 144                        /* nvn_gl.c CbSave: CmdBuf *cb; CmdBuf copy (120: data, len, cap, ...); data; cap */
 #define RG_NST 65536
@@ -215,7 +216,8 @@ typedef struct {
     size_t pages, xpages;
     uint64_t tls[64];                                   /* nn::os thread-local storage slots (nnsdk.c: one host table), as at the capture */
     int quiet, qset;                                    /* every worker at a usual pause when it was taken (snapshot_ring.c rg_best_state) */
-    uint8_t *gstk; size_t gstk_used, gstk_com;          /* the fibers' guest stacks, [sp, top) each, as at the capture */
+    uint8_t *gstk; size_t gstk_used, gstk_com;
+    uint8_t *opg; size_t opg_used, opg_com;             /* the pages committed outside the ring, as at the capture */          /* the fibers' guest stacks, [sp, top) each, as at the capture */
 } RgSlot;
 
 typedef struct { uint64_t blk; long long n[3]; } RgPageCount;

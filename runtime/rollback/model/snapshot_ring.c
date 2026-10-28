@@ -294,6 +294,52 @@ void rg_quiet_report(void) {
     LOG("r1: QUIET: captures quiet %lld / not quiet %lld; loads from a quiet state %lld (%lld of them an older one than the newest, %lld frames run again more in all), loads with no quiet state %lld\n",
         g_qs_quiet, g_qs_noisy, g_qs_loads_quiet, g_qs_loads_older, g_qs_extra, g_qs_loads_fallback);
 }
+/* ---- PAGES COMMITTED OUTSIDE THE RING DURING THE FIGHT (the general case of the fiber guest stacks above). The third big reservation is saved as committed at the ring's base; what the game
+ * commits in it during the fight (new objects, coroutine stacks: 400-700 pages in a fight) was never saved nor restored. An object DESTROYED inside a rolled-back window stayed destroyed after the
+ * load while everything around it went back to when it was alive: Steve's blocks (2026-10-28) made the render dispatch threads call a virtual method of such an object and land in its base class's
+ * abstract entry, which calls std::terminate. Each capture now copies every such page (the list page_tracker_learned.c keeps: g_xls_out_pg), a load writes them back (committing a page the game
+ * decommitted since). The fibers' guest stacks are left to rg_gstk_load and its checks (a running fiber's stack is not written under it). 2-3 MB per capture. SSBU_R1_OUTPAGES=0: off. */
+extern uint64_t g_xls_out_pg[]; extern volatile LONG g_xls_out_npg;
+int fibers_stack_ranges(uint64_t *lo, uint64_t *hi, int max);   /* threads.c */
+#define OPH 16                                               /* entry: page address, (pad), then the 4 KB */
+static int g_opg_on = -1; static long long g_opg_caps, g_opg_pages, g_opg_gone, g_opg_full, g_opg_loads, g_opg_written, g_opg_skip, g_opg_recommit;
+static void opg_copy_page(uint8_t *d, const uint8_t *s) { memcpy(d, s, PG); }
+static void (*volatile g_opg_cp)(uint8_t *, const uint8_t *) = opg_copy_page;      /* (through a pointer the compiler cannot see through: __try then covers the copy, write_marks.c) */
+static int opg_try_copy(uint8_t *d, const uint8_t *s) { __try { g_opg_cp(d, s); return 1; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+static void rg_opg_capture(RgSlot *s) {
+    if (g_opg_on < 0) { const char *e = getenv("SSBU_R1_OUTPAGES"); g_opg_on = !(e && e[0] == '0'); }
+    s->opg_used = 0;
+    if (!g_opg_on || !s->opg) return;
+    int n = (int)g_xls_out_npg; if (n > 65536) n = 65536;
+    for (int i = 0; i < n; i++) {
+        uint64_t a = g_xls_out_pg[i]; if (!a) continue;
+        size_t need = s->opg_used + OPH + PG;
+        if (!rg_vcom(s->opg, &s->opg_com, need, 1u << 20)) { g_opg_full++; break; }
+        uint8_t *o = s->opg + s->opg_used;
+        if (!opg_try_copy(o + OPH, (const uint8_t *)(uintptr_t)a)) { g_opg_gone++; continue; }      /* not committed now: not part of this state */
+        ((uint64_t *)o)[0] = a; ((uint64_t *)o)[1] = 0;
+        s->opg_used = need;
+    }
+    g_opg_caps++; g_opg_pages += (long long)(s->opg_used / (OPH + PG));
+    if (g_opg_caps == 1 || g_opg_caps % 2000 == 0)
+        LOG("r1: OUTPAGES: %lld captures, %.0f pages each on average (%.1f MB), %lld not committed at a capture, %lld out of room; loads %lld: %lld pages written back, %lld left to the fiber stacks, %lld committed again\n",
+            g_opg_caps, (double)g_opg_pages / g_opg_caps, (double)g_opg_pages / g_opg_caps * PG / 1048576.0, g_opg_gone, g_opg_full, g_opg_loads, g_opg_written, g_opg_skip, g_opg_recommit);
+}
+static void rg_opg_load(const RgSlot *s) {
+    if (!g_opg_on || !s->opg || !s->opg_used) return;
+    static uint64_t lo[2048], hi[2048]; int nr = fibers_stack_ranges(lo, hi, 2048);
+    for (size_t off = 0; off + OPH + PG <= s->opg_used; off += OPH + PG) {
+        const uint8_t *o = s->opg + off; uint64_t a = ((const uint64_t *)o)[0];
+        int in_stack = 0; for (int r = 0; r < nr && !in_stack; r++) if (a + PG > lo[r] && a < hi[r]) in_stack = 1;
+        if (in_stack) { g_opg_skip++; continue; }
+        if (!opg_try_copy((uint8_t *)(uintptr_t)a, o + OPH)) {                                          /* decommitted since the capture: commit it again */
+            if (VirtualAlloc((void *)(uintptr_t)a, PG, MEM_COMMIT, PAGE_READWRITE) && opg_try_copy((uint8_t *)(uintptr_t)a, o + OPH)) g_opg_recommit++;
+            continue;
+        }
+        g_opg_written++;
+    }
+    g_opg_loads++;
+}
 /* ---- THE FIBERS' GUEST STACKS (the root cause of the post-rollback crashes, 2026-10-28). A coroutine made after the ring's base gets its guest stack in pages committed after it, which the ring
  * never saves (the third big reservation is "extras" as committed at the base): the failing throw's sp, x29 and return-address slot were all in such a stack, "NOT saved by the ring". A load put
  * the coroutine's registers and host stack back to the capture, while its guest stack still held what it wrote AFTER the capture: resumed, it read frames from the future (a wrong x29 / return
@@ -350,6 +396,7 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     else if (g_guest_fibers.pool_used) for (int i = 0; i < s->nfib; i++) s->fib[i].susp = 0;
     if (!rg_cb_capture(s)) s->ncbs = 0;
     rg_gstk_capture(s);
+    rg_opg_capture(s);
     qs_mark(s);
 }
 static void rg_free_all(void) {                         /* (hs13) a ring that could not be made: what it took is given back */
@@ -364,6 +411,7 @@ static void rg_free_all(void) {                         /* (hs13) a ring that co
         if (s->ent) VirtualFree(s->ent, 0, MEM_RELEASE);
         if (s->fpool) VirtualFree(s->fpool, 0, MEM_RELEASE);
         if (s->gstk) VirtualFree(s->gstk, 0, MEM_RELEASE);
+        if (s->opg) VirtualFree(s->opg, 0, MEM_RELEASE);
         if (s->cbd) VirtualFree(s->cbd, 0, MEM_RELEASE);
         free(s->fib); free(s->cbs);
     }
@@ -389,7 +437,7 @@ static int rg_init(void) {
     for (int i = 0; i < g_nx; i++) for (size_t o = 0; o < g_x[i].n; o += PG) { g_rg_xa[e] = g_x[i].a + o; g_rg_xb[e] = g_x[i].b + o; e++; }
     for (int i = 0; i < g_rg_cap; i++) {
         RgSlot *s = &g_rg[i]; s->frame = -1;
-        s->ent = (uint32_t *)rg_vres(RG_ENT_RES); s->fpool = rg_vres(RG_FP_RES); s->cbd = rg_vres(RG_CB_RES); s->gstk = rg_vres(RG_GS_RES); s->gstk_used = s->gstk_com = 0;
+        s->ent = (uint32_t *)rg_vres(RG_ENT_RES); s->fpool = rg_vres(RG_FP_RES); s->cbd = rg_vres(RG_CB_RES); s->gstk = rg_vres(RG_GS_RES); s->gstk_used = s->gstk_com = 0; s->opg = rg_vres(RG_OP_RES); s->opg_used = s->opg_com = 0;
         s->fib = malloc(1024 * sizeof *s->fib); s->cbs = malloc(512 * RG_CBS_SIZE);
         if (!s->ent || !s->fpool || !s->cbd || !s->fib || !s->cbs) { LOG("r1: RING: slot allocation FAILED\n"); rg_free_all(); return 0; }
     }
@@ -805,6 +853,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     restore_thread_regs(); double t2a = now_ms();
     long long lr_kept0 = g_rgc_kept, lr_dropped0 = g_rgc_dropped, lr_dead0 = g_rgc_dead;
     fibers_restore_all(); double t2b = now_ms();
+    rg_opg_load(g);                                       /* the pages committed outside the ring during the fight, as at that capture */
     rg_gstk_load(g);                                      /* the fibers' guest stacks as at that capture (pages the ring itself may not save) */
     rgc_after(); double t2c = now_ms();
     rg_load_note(frame, k, lr_kept0, lr_dropped0, lr_dead0);       /* (measurement) what this load did to the workers and the catch table */
