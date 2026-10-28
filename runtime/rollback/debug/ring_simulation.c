@@ -378,6 +378,7 @@ static double rg_pct(const double *v, int n, int p) {
 }
 static double rg_mean(const double *v, int n) { double s = 0; for (int i = 0; i < n; i++) s += v[i]; return n ? s / n : 0; }
 void rgs_report(void) {
+    sm_report(1);                                         /* (SSBU_STATE_MEASURE) */
     ls_report();                                          /* R4 */
     if (!g_rg_ready) { if (rbg_on()) rbg_report(); return; }      /* (hs14: a match without the ring has its report at the exit too) */
     rbg_report();

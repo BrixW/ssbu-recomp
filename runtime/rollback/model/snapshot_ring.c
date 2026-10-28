@@ -398,6 +398,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
     fibers_save(); double t3a = now_ms();
     nvn_r1_cb_save(); double t3b = now_ms();
     rg_meta_capture(s, c);
+    sm_capture(frame);                                      /* (debug, SSBU_STATE_MEASURE) fingerprints of the threads and objects at this capture */
     double t4 = now_ms();
     if (g_rg_keep) g_rg_kept = 1;                          /* a load follows at once (r1_ring_load / r1_ring_let_go lets them go) */
     else unpark();                                         /* every thread, the audio ones too (a real pass follows) */
@@ -610,6 +611,7 @@ int r1_ring_load(long long frame, Ctx *c) {
         }
     }
     double t1 = now_ms();
+    sm_load(frame);                                         /* (debug, SSBU_STATE_MEASURE) what differs from the capture, before anything is restored */
     R1_CTR("load (state of frame)", frame, 0);
     rgc_before();
     g_rg_ntl = 0;
