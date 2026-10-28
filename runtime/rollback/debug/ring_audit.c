@@ -41,6 +41,24 @@ static void audit_note(AuBlock *tab, int *n, int cap, uint8_t *a) {
     if (*n < cap) { tab[*n].block = blk; tab[*n].pages = 1; tab[*n].first = a; (*n)++; }
 }
 
+/* Who owns the memory block that contains `a`: the TLS block or the stack of a guest thread, or the stack of a fiber (same Windows
+ * allocation); empty when none of them. Written to the audit line so a differing block can be tied to a thread. */
+static void audit_owner(uint8_t *a, char *out, size_t cap) {
+    out[0] = 0;
+    MEMORY_BASIC_INFORMATION m; if (!VirtualQuery(a, &m, sizeof m)) return;
+    void *ab = m.AllocationBase;
+    Ctx *tc; const char *nm; HANDLE h; int o = 0;
+    for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && o < (int)cap - 120; i++) {
+        MEMORY_BASIC_INFORMATION q;
+        if (tc->tpidr && VirtualQuery((void *)(uintptr_t)tc->tpidr, &q, sizeof q) && q.AllocationBase == ab) o += snprintf(out + o, cap - o, " [TLS of %s]", nm ? nm : "?");
+        if (tc->x[31] && VirtualQuery((void *)(uintptr_t)tc->x[31], &q, sizeof q) && q.AllocationBase == ab) o += snprintf(out + o, cap - o, " [stack of %s]", nm ? nm : "?");
+    }
+    for (int i = 0; i < g_guest_fibers.count && o < (int)cap - 120; i++) {
+        MEMORY_BASIC_INFORMATION q; const Fib *f = &g_guest_fibers.table[i];
+        if (f->sp && VirtualQuery((void *)(uintptr_t)f->sp, &q, sizeof q) && q.AllocationBase == ab) o += snprintf(out + o, cap - o, " [stack of a fiber %llx]", (unsigned long long)f->key);
+    }
+}
+
 /* Called by r1_ring_capture right after the capture's copies, every guest thread still held. */
 void rg_audit(void) {
     if (g_au_every < 0) { const char *e = getenv("SSBU_RB_AUDIT"); g_au_every = e ? atoi(e) : 0; }
@@ -68,6 +86,9 @@ void rg_audit(void) {
         if (audit_page_differs(a, (uint32_t)(g_rg_n1 + g_rg_n2 + e))) { bad[2]++; audit_note(tab, &nb, CAP, a); }
     }
     g_au_runs++;
+    {   char nh[600]; int o = 0; nh[0] = 0;        /* threads that were NOT held during the capture (they ran while memory was copied) */
+        for (int i = 0; i < g_guest_threads.count && o < 560; i++) if (!g_guest_threads.table[i].held) o += snprintf(nh + o, sizeof nh - o, " [%s]", g_guest_threads.table[i].name);
+        if (g_au_runs <= 3 || nh[0]) LOG("r1: RING AUDIT threads not held during the capture:%s\n", nh[0] ? nh : " none"); }
     LOG("r1: RING AUDIT %lld (after capture %lld): pages checked window 1 %lld, window 2 %lld, extras %lld; DIFFER from the ring's newest value: window 1 %lld, window 2 %lld, extras %lld; %d blocks of 64 KB; took %.0f ms\n",
         g_au_runs, g_au_captures, checked[0], checked[1], checked[2], bad[0], bad[1], bad[2], nb, now_ms() - t0);
     for (int shown = 0; shown < 12 && nb > 0; shown++) {         /* the largest blocks first */
@@ -88,6 +109,7 @@ void rg_audit(void) {
                 __except (EXCEPTION_EXECUTE_HANDLER) { }
             }
         }
-        LOG("r1: RING AUDIT   block %p (%s): %lld pages differ; first page %p:%s\n", (void *)(uintptr_t)(b.block << 16), where((uint8_t *)(uintptr_t)(b.block << 16)), b.pages, (void *)b.first, words);
+        char own[400]; audit_owner(b.first, own, sizeof own);
+        LOG("r1: RING AUDIT   block %p (%s): %lld pages differ; first page %p; owner:%s;%s\n", (void *)(uintptr_t)(b.block << 16), where((uint8_t *)(uintptr_t)(b.block << 16)), b.pages, (void *)b.first, own[0] ? own : " none of the guest threads' TLS or stacks", words);
     }
 }
