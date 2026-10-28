@@ -240,9 +240,9 @@ static void rbg_step_body(Ctx *c) {
         rbg_fallback_reset();                           /* the failure counters of the fallback start at zero for this match */
         if (g_rbg_noring) {
             g_rbg_noring_matches++;
-            LOG("r1: RB NET: ROLLBACK OFF FOR THIS MATCH: not enough memory for the snapshot ring (%s); the match goes on delay-based: every frame waits for the other player's pad\n",
-                g_rg_nomem == 1 ? "the base state needs about one copy of the game's memory in free commit" : "the ring broke on the way: off for the rest of this session");
-            printf("[rbnet] rollback OFF for this match (not enough memory): delay-based, the game waits for the other player's input every frame\n"); fflush(stdout);
+            LOG("r1: RB NET: ROLLBACK OFF FOR THIS MATCH: %s; the match goes on delay-based: every frame waits for the other player's pad\n",
+                rb_norollback_asked() ? "asked for by SSBU_RB_NET_NOROLLBACK" : g_rg_nomem == 1 ? "not enough memory for the snapshot ring (the base state needs about one copy of the game's memory in free commit)" : "the ring broke on the way: off for the rest of this session");
+            printf("[rbnet] rollback OFF for this match (%s): delay-based, the game waits for the other player's input every frame\n", rb_norollback_asked() ? "SSBU_RB_NET_NOROLLBACK" : "not enough memory"); fflush(stdout);
         }
         if (g_rbg_wdfix) g_ra_wd_pause = 1;
         g_rbg_in_match = 1;

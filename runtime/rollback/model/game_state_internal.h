@@ -79,6 +79,7 @@ void ls_range_event(uint64_t a, uint64_t n, int what);      /* memory changed wi
 void ls_report(void);                        /* end-of-run report of the learned set and the pool */
 uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeeping region, so it is saved with the rest; *n is its size */
 extern volatile LONG g_rb_audio_off;         /* hostrt.c: 1 = the audio threads are stopped (SSBU_RB_AUDIO_OFF=1, for the length of a fight) */
+int rb_norollback_asked(void);              /* memory_map.c: SSBU_RB_NET_NOROLLBACK=1, play the match delay-based, without rollback */
 void ppool_init(void);
 void rg_audit(void);                         /* debug/ring_audit.c: after a capture, lists the pages that differ from the ring's newest value (SSBU_RB_AUDIT=<n>) */
 /* The extras' learned set (page_tracker_learned.c, "LS-X"): the ring asks which extras pages need comparing, and tells the set how each compare ended. */

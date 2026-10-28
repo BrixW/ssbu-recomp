@@ -83,7 +83,10 @@ void rs_free(void *p) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
 
 int g_rs_drop;                                   /* set by the first save's callers (the ring, run-ahead): r->s given back during mark_setup */
 static int g_rb_test_nomem = -1;                        /* SSBU_RB_NET_TEST_NOMEM (test only): 1 = the commit check says no, 2 = an allocation of the full save fails, 3 = the ring's own allocations fail, 4 = the shadow's commit fails */
-int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; } return g_rb_test_nomem; }
+/* SSBU_RB_NET_NOROLLBACK=1: the match is played WITHOUT rollback (delay-based: every frame waits for the other player's pad), the way the game's own online play works.
+ * It uses the same path as "no memory for the ring" (the ring's base is not made), so nothing is rolled back and no state is saved. */
+int rb_norollback_asked(void) { static int v = -1; if (v < 0) { const char *e = getenv("SSBU_RB_NET_NOROLLBACK"); v = e && e[0] && e[0] != '0'; } return v; }
+int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; if (rb_norollback_asked()) g_rb_test_nomem = 1; } return g_rb_test_nomem; }
 double g_save_need_mb, g_save_avail_mb;          /* the last commit check (MB) */
 void collect(Ctx *c) {
     for (int i = 0; i < g_memory_map.range_count; i++) { rs_free(g_memory_map.ranges[i].s); g_memory_map.ranges[i].s = NULL; free(g_memory_map.ranges[i].dirty); free(g_memory_map.ranges[i].async); }
