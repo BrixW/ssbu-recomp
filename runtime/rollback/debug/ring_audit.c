@@ -59,10 +59,25 @@ static void audit_owner(uint8_t *a, char *out, size_t cap) {
     }
 }
 
+static void audit_run(const char *what, long long which);
 /* Called by r1_ring_capture right after the capture's copies, every guest thread still held. */
 void rg_audit(void) {
     if (g_au_every < 0) { const char *e = getenv("SSBU_RB_AUDIT"); g_au_every = e ? atoi(e) : 0; }
     if (g_au_every <= 0 || ++g_au_captures % g_au_every) return;
+    audit_run("capture", g_au_captures);
+}
+/* ROUND TRIP (SSBU_RB_ROUNDTRIP=<n>: every n-th load; unset or 0 = off): the same comparison right after a LOAD, with every guest thread
+ * still held and everything restored. A load of frame F must leave every page exactly as the ring recorded it at F, and the ring's
+ * "newest value" of a page IS the value at F after a load. A page that differs now was not restored (or was changed by a host thread in
+ * the meantime): the load did not give back the state that was saved. This is the check "save -> run -> load -> compare with the save".
+ * Called by r1_ring_load before it lets the threads go. */
+void rg_roundtrip_after_load(void) {
+    static int every = -1; static long long loads;
+    if (every < 0) { const char *e = getenv("SSBU_RB_ROUNDTRIP"); every = e ? atoi(e) : 0; }
+    if (every <= 0 || ++loads % every) return;
+    audit_run("load", loads);
+}
+static void audit_run(const char *what, long long which) {
     double t0 = now_ms();
     enum { CAP = 512 };
     static AuBlock tab[CAP]; int nb = 0;
@@ -89,8 +104,8 @@ void rg_audit(void) {
     {   char nh[600]; int o = 0; nh[0] = 0;        /* threads that were NOT held during the capture (they ran while memory was copied) */
         for (int i = 0; i < g_guest_threads.count && o < 560; i++) if (!g_guest_threads.table[i].held) o += snprintf(nh + o, sizeof nh - o, " [%s]", g_guest_threads.table[i].name);
         if (g_au_runs <= 3 || nh[0]) LOG("r1: RING AUDIT threads not held during the capture:%s\n", nh[0] ? nh : " none"); }
-    LOG("r1: RING AUDIT %lld (after capture %lld): pages checked window 1 %lld, window 2 %lld, extras %lld; DIFFER from the ring's newest value: window 1 %lld, window 2 %lld, extras %lld; %d blocks of 64 KB; took %.0f ms\n",
-        g_au_runs, g_au_captures, checked[0], checked[1], checked[2], bad[0], bad[1], bad[2], nb, now_ms() - t0);
+    LOG("r1: RING AUDIT %lld (after %s %lld): pages checked window 1 %lld, window 2 %lld, extras %lld; DIFFER from the ring's newest value: window 1 %lld, window 2 %lld, extras %lld; %d blocks of 64 KB; took %.0f ms\n",
+        g_au_runs, what, which, checked[0], checked[1], checked[2], bad[0], bad[1], bad[2], nb, now_ms() - t0);
     for (int shown = 0; shown < 12 && nb > 0; shown++) {         /* the largest blocks first */
         int best = 0; for (int i = 1; i < nb; i++) if (tab[i].pages > tab[best].pages) best = i;
         AuBlock b = tab[best]; tab[best] = tab[--nb];

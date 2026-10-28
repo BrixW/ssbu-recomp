@@ -649,6 +649,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     fibers_restore_all(); double t2b = now_ms();
     rgc_after(); double t2c = now_ms();
     rg_cb_load(g);
+    rg_roundtrip_after_load();                              /* (debug, SSBU_RB_ROUNDTRIP) every page must now be what the ring recorded at this frame */
     double t3 = now_ms();
     unpark();
     g_mp[4] += t2a - t2; g_mp[5] += t2b - t2a; g_mp[6] += t2c - t2b; g_mp[7] += t3 - t2c; g_mp[8] += now_ms() - t3; g_mp_n[1]++;

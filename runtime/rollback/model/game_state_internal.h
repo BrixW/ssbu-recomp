@@ -80,6 +80,7 @@ void ls_report(void);                        /* end-of-run report of the learned
 uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeeping region, so it is saved with the rest; *n is its size */
 extern volatile LONG g_rb_audio_off;         /* hostrt.c: 1 = the audio threads are stopped (SSBU_RB_AUDIO_OFF=1, for the length of a fight) */
 int rb_norollback_asked(void);              /* memory_map.c: SSBU_RB_NET_NOROLLBACK=1, play the match delay-based, without rollback */
+void rg_roundtrip_after_load(void);          /* debug/ring_audit.c (SSBU_RB_ROUNDTRIP=<n>): after a load, every page must be as recorded at that frame */
 void sm_capture(long long frame);            /* debug/state_measure.c (SSBU_STATE_MEASURE=1): fingerprints of threads and objects at a capture */
 void sm_load(long long frame);               /* ... and the comparison at a load, before anything is restored */
 void sm_report(int final);                   /* ... the tables, every 100 loads and at the end */
