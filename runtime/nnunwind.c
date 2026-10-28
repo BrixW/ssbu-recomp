@@ -630,6 +630,38 @@ static int reload_via_host_catch(Ctx *c, uint64_t exc) {
     longjmp(best->jb, 1);                                  /* nro_catch_call's setjmp != 0 branch: restores in_import and returns to the guest caller */
     return 1;                                              /* not reached */
 }
+/* ---- cutting a fault cascade (fault_recovery.c). Absorbing a bad read with 0 can leave a thread in an endless loop (walk a list until `end`: next is 0, never `end`, fault, 0, ...). After enough faults
+ * in one pass the exception filter sends the faulting thread here instead of absorbing again: the host stack is unwound to the innermost nro_catch_call frame on this thread's stack (as reload_via_host_catch
+ * does for a throw), which returns to its guest caller; the pass is already tainted and the ring reloads the last healthy state at its safe point. */
+static CatchFrame *innermost_catch_above(uint64_t rsp) {
+    CatchFrame *best = NULL;
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++) {
+        if (g_catch[i].cfa <= 1 || !g_catch[i].jb) continue;
+        uint64_t a = (uint64_t)(uintptr_t)g_catch[i].jb;
+        if (a <= rsp || !catch_here(g_catch[i].jb) || !cxxrt_readable(a, sizeof(CatchFrame))) continue;
+        CatchFrame *cf = (CatchFrame *)(uintptr_t)a;
+        if (cf->cfa != g_catch[i].cfa) continue;
+        if (!best || a < (uint64_t)(uintptr_t)best) best = cf;
+    }
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    return best;
+}
+int nnunwind_has_bail_target(uint64_t rsp) { return innermost_catch_above(rsp) != NULL; }
+static volatile LONG g_bails;
+__declspec(noreturn) void nnunwind_bail_trampoline(void) {
+    volatile char here = 0;
+    CatchFrame *best = innermost_catch_above((uint64_t)(uintptr_t)&here);
+    if (!best) { printf("fault recovery: cascade cut, but no catch frame on this stack any more: ending\n"); fflush(stdout); TerminateProcess(GetCurrentProcess(), 4); }
+    AcquireSRWLockExclusive(&g_catch_lock);
+    for (unsigned i = 0; i < CATCH_SLOTS; i++)
+        if (g_catch[i].cfa > 1 && g_catch[i].jb && catch_here(g_catch[i].jb) && (uintptr_t)g_catch[i].jb <= (uintptr_t)best) catch_free_slot(i);
+    ReleaseSRWLockExclusive(&g_catch_lock);
+    os_release_held_down_to(best->held);
+    LONG n = InterlockedIncrement(&g_bails);
+    if (n <= 20) printf("fault recovery: a fault cascade was cut: host stack unwound to f_%llx, the pass will be reloaded (%ld so far)\n", (unsigned long long)guest_function_of((uint64_t)(uintptr_t)best->body), (long)n);
+    longjmp(best->jb, 1);
+}
 #else
 static int absorb_by_host_stack(Ctx *c, uint64_t exc) { (void)c; (void)exc; return 0; }
 static int reload_via_host_catch(Ctx *c, uint64_t exc) { (void)c; (void)exc; return 0; }

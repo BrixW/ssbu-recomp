@@ -25,6 +25,7 @@ static volatile LONG g_fr_off;                          /* the net let go: fault
 static volatile LONG g_fr_lines;
 static int g_fr_enabled = -1;
 
+#define FR_BAIL 256                                     /* past this many faults in one pass a fault cuts the cascade (see rb_fault_try_absorb) instead of being absorbed */
 #define FR_MAX_PER_PASS 4096                            /* a bad object makes the code read through it and fault again and again (a null read gives 0, then 0+offset faults...): absorb the whole cascade so the thread still reaches
                                                          * its safe point, where the pass is reloaded once from the last healthy state (the reload, not read-by-read patching, is what fixes the object). More than this in one pass is a true runaway: give up. */
 #define FR_MAX_RECOVERIES 400                           /* in one run: a fight that needs more than this is not being saved by it */
@@ -113,6 +114,15 @@ int rb_fault_try_absorb(EXCEPTION_POINTERS *ep) {
     const uint8_t *ip = (const uint8_t *)(uintptr_t)cx->Rip;
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery(ip, &mi, sizeof mi) || !(mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) || (uintptr_t)ip + 8 > (uintptr_t)mi.BaseAddress + mi.RegionSize) return 0;
+    {   /* a cascade: past FR_BAIL faults in this pass the thread is likely looping on garbage; send it to nnunwind_bail_trampoline (unwinds to a catch frame on its own stack) instead of
+         * absorbing again. Only for faults in the game's code (guest_function_of), never in the runtime's own code, which may hold host locks. */
+        extern int nnunwind_has_bail_target(uint64_t rsp); extern void nnunwind_bail_trampoline(void); extern uint64_t guest_function_of(uint64_t rip);
+        if (g_fr_in_pass >= FR_BAIL && guest_function_of(cx->Rip) && nnunwind_has_bail_target(cx->Rsp) && fr_note("cascade cut", cx->Rip, er->ExceptionInformation[1])) {
+            cx->Rsp = ((cx->Rsp - 256) & ~(DWORD64)15) - 8;      /* as at a function's entry; the trampoline never returns, the dispatcher's frames below are given up */
+            cx->Rip = (DWORD64)(uintptr_t)nnunwind_bail_trampoline;
+            return 1;
+        }
+    }
     if (!fr_leaf_len(ip)) {                              /* not a leaf helper: a plain memory move inside a bigger function can still be stepped over */
         if ((uintptr_t)ip + 16 <= (uintptr_t)mi.BaseAddress + mi.RegionSize) {
             CONTEXT *tmp = (CONTEXT *)malloc(sizeof *tmp);
