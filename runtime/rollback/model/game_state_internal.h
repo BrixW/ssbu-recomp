@@ -79,6 +79,7 @@ void ls_range_event(uint64_t a, uint64_t n, int what);      /* memory changed wi
 void ls_report(void);                        /* end-of-run report of the learned set and the pool */
 uint8_t *ppool_bookkeeping(size_t *n);       /* the presentation pool's bookkeeping region, so it is saved with the rest; *n is its size */
 void ppool_init(void);
+void rg_audit(void);                         /* debug/ring_audit.c: after a capture, lists the pages that differ from the ring's newest value (SSBU_RB_AUDIT=<n>) */
 /* The extras' learned set (page_tracker_learned.c, "LS-X"): the ring asks which extras pages need comparing, and tells the set how each compare ended. */
 extern long long g_xls_caps, g_xls_jobs, g_xls_loads, g_xls_loadpages;      /* statistics: captures, pages compared, loads, pages loaded */
 int xls_skip(size_t e);                      /* 1 when extras page e was not written since the base, so it is neither compared nor loaded */

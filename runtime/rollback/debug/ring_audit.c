@@ -1,0 +1,93 @@
+/* RING AUDIT (SSBU_RB_AUDIT=<n>: every n captures; unset or 0 = off). Debugging aid for "a rollback restored the wrong state".
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * The ring keeps, for every page of the saved memory, its value at the newest capture (rg_src). Right after a capture, with every
+ * guest thread still held, that value must equal what is in memory, for every page the game can write. A page that differs now
+ * was changed since the previous capture and the capture did NOT take it: the page tracker (the learned set, the write watch, the
+ * marks) missed a write, so a later rollback would put an old value back, or leave a newer one in place, for that page.
+ * The forced-rollback simulation (SSBU_RB_SIM) cannot find this: it replays the same pads, so a stale page is overwritten with the
+ * same values again. A rollback in a real match replays DIFFERENT pads, and the game can then read a page that was never restored.
+ *
+ * What it does: compares every committed page of window 1, window 2 and the extras with the ring's newest value, one 4 KB page at
+ * a time, skipping pages marked "not simulation" (host stacks, audio output) and, with SSBU_R1_AUDIO_FREE, the asynchronous ones.
+ * A page that cannot be read (decommitted meanwhile) is skipped. It prints, per audit, how many pages differ in each memory kind and
+ * the largest 64 KB blocks that hold differing pages (where() names the block), with the first differing words of one page.
+ * Other threads of this exe (the renderer's copy-back of GPU results, loaders) can write guest memory while the audit runs: a block
+ * that shows up once may be that; a block that shows up in audit after audit is a missed write. Cost: reads all committed memory
+ * twice, about 0.3 to 0.6 s per audit on the machine of the study, so use n of 60 or more. */
+#include "../model/game_state_internal.h"
+
+static int g_au_every = -1;
+static long long g_au_captures, g_au_runs;
+
+typedef struct { uint64_t block; long long pages; uint8_t *first; } AuBlock;
+
+/* Compares page `a` (page id `id`) with the ring's newest value. 1 = differs, 0 = same or not comparable. */
+static int audit_page_differs(uint8_t *a, uint32_t id) {
+    static uint8_t zero[PG];
+    const uint8_t *src = rg_src(id);
+    if (src == (const uint8_t *)1) return 0;                 /* decommitted at the newest capture */
+    if (!src) src = zero;                                    /* a page that was all zero */
+    if (is_nosim(a)) return 0;
+    if (g_audio_free && is_async(a)) return 0;
+    int d = 0;
+    __try { d = cp_f_cmp(a, src); } __except (EXCEPTION_EXECUTE_HANDLER) { d = 0; }
+    return d;
+}
+
+static void audit_note(AuBlock *tab, int *n, int cap, uint8_t *a) {
+    uint64_t blk = (uint64_t)(uintptr_t)a >> 16;
+    for (int i = 0; i < *n; i++) if (tab[i].block == blk) { tab[i].pages++; return; }
+    if (*n < cap) { tab[*n].block = blk; tab[*n].pages = 1; tab[*n].first = a; (*n)++; }
+}
+
+/* Called by r1_ring_capture right after the capture's copies, every guest thread still held. */
+void rg_audit(void) {
+    if (g_au_every < 0) { const char *e = getenv("SSBU_RB_AUDIT"); g_au_every = e ? atoi(e) : 0; }
+    if (g_au_every <= 0 || ++g_au_captures % g_au_every) return;
+    double t0 = now_ms();
+    enum { CAP = 512 };
+    static AuBlock tab[CAP]; int nb = 0;
+    long long checked[3] = {0, 0, 0}, bad[3] = {0, 0, 0};      /* window 1, window 2, extras */
+    uint8_t *w1 = g_win1; uint64_t w1n = g_wn1;
+    for (int i = 0; i < g_memory_map.range_count; i++) {
+        Rng *r = &g_memory_map.ranges[i];
+        int kind; uint32_t base;
+        if (r->a >= w1 && r->a < w1 + w1n) { kind = 0; base = (uint32_t)((r->a - w1) >> 12); }
+        else if ((uint64_t)(uintptr_t)r->a >= WIN2 && (uint64_t)(uintptr_t)r->a < WIN2 + WN2) { kind = 1; base = (uint32_t)(g_rg_n1 + (((uint64_t)(uintptr_t)r->a - WIN2) >> 12)); }
+        else continue;                                           /* not in a window: the extras below cover it */
+        for (size_t p = 0; p < r->n / PG; p++) {
+            uint8_t *a = r->a + p * PG;
+            checked[kind]++;
+            if (audit_page_differs(a, base + (uint32_t)p)) { bad[kind]++; audit_note(tab, &nb, CAP, a); }
+        }
+    }
+    for (size_t e = 0; e < g_rg_nx; e++) {
+        uint8_t *a = g_rg_xa[e];
+        checked[2]++;
+        if (audit_page_differs(a, (uint32_t)(g_rg_n1 + g_rg_n2 + e))) { bad[2]++; audit_note(tab, &nb, CAP, a); }
+    }
+    g_au_runs++;
+    LOG("r1: RING AUDIT %lld (after capture %lld): pages checked window 1 %lld, window 2 %lld, extras %lld; DIFFER from the ring's newest value: window 1 %lld, window 2 %lld, extras %lld; %d blocks of 64 KB; took %.0f ms\n",
+        g_au_runs, g_au_captures, checked[0], checked[1], checked[2], bad[0], bad[1], bad[2], nb, now_ms() - t0);
+    for (int shown = 0; shown < 12 && nb > 0; shown++) {         /* the largest blocks first */
+        int best = 0; for (int i = 1; i < nb; i++) if (tab[i].pages > tab[best].pages) best = i;
+        AuBlock b = tab[best]; tab[best] = tab[--nb];
+        char words[300]; int o = 0; words[0] = 0;
+        {   /* the first differing words of the first page: where it is (offset in the page), memory now, ring's value */
+            uint32_t id = 0; int have = 0;
+            uint8_t *a = b.first;
+            if (a >= w1 && a < w1 + w1n) { id = (uint32_t)((a - w1) >> 12); have = 1; }
+            else if ((uint64_t)(uintptr_t)a >= WIN2 && (uint64_t)(uintptr_t)a < WIN2 + WN2) { id = (uint32_t)(g_rg_n1 + (((uint64_t)(uintptr_t)a - WIN2) >> 12)); have = 1; }
+            else for (size_t e = 0; e < g_rg_nx; e++) if (g_rg_xa[e] == a) { id = (uint32_t)(g_rg_n1 + g_rg_n2 + e); have = 1; break; }
+            const uint8_t *s = have ? rg_src(id) : NULL; static uint8_t zero[PG];
+            if (have && s != (const uint8_t *)1) {
+                if (!s) s = zero;
+                const uint64_t *x = (const uint64_t *)a, *y = (const uint64_t *)s; int nd = 0;
+                __try { for (int k = 0; k < PG / 8 && nd < 3; k++) if (x[k] != y[k]) { nd++; o += snprintf(words + o, sizeof words - o, " +%03x: ring %llx now %llx", k * 8, (unsigned long long)y[k], (unsigned long long)x[k]); } }
+                __except (EXCEPTION_EXECUTE_HANDLER) { }
+            }
+        }
+        LOG("r1: RING AUDIT   block %p (%s): %lld pages differ; first page %p:%s\n", (void *)(uintptr_t)(b.block << 16), where((uint8_t *)(uintptr_t)(b.block << 16)), b.pages, (void *)b.first, words);
+    }
+}

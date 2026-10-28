@@ -390,6 +390,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
         return 0;
     }
     g_rg_short = 0;
+    rg_audit();                                             /* (debug, SSBU_RB_AUDIT) pages the capture should have taken and did not */
     double t3 = now_ms();
     ls_after_capture();                                     /* R4 (SSBU_LS_DECAY) */
     fibers_save(); double t3a = now_ms();
