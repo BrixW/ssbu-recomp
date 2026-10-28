@@ -754,6 +754,13 @@ static void eh_raise(Ctx *c, int reason) {
             eh_terminate(c, "the handler cannot be entered");
         }
         if (!found) {
+#ifdef _WIN32
+            {   /* which fiber this throw is on, and whether it was born inside a rolled-back window (rollback/model/threads.c) */
+                extern uint64_t os_fiber_cur_key(void); extern const char *rb_born_info(uint64_t key, char *buf, size_t n); extern long long g_rgs_next;
+                static volatile LONG nfib; char bi[160]; uint64_t fk = os_fiber_cur_key();
+                if (InterlockedIncrement(&nfib) <= 20) printf("unwind: the throw that cannot be walked is on fiber %llx (%s), pass %lld\n", (unsigned long long)fk, fk ? rb_born_info(fk, bi, sizeof bi) : "the thread's own context", g_rgs_next);
+            }
+#endif
             if (reload_via_host_catch(c, exc)) return;   /* net active: unwind the host stack to a catch frame and reload, instead of ending the game */
             if (absorb_by_host_stack(c, exc)) return;      /* (does not come back when it takes the exception) */
             printf("\nunwind: %s thrown at 0x%llx: no handler in %d frames (%s)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, depth, stop);

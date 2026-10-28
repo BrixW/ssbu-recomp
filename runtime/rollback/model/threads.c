@@ -266,6 +266,12 @@ int fibers_born_count(char *buf, size_t n) {
     }
     return born;
 }
+/* The fibers a load found born after the state it loaded (the last 64), for crash reports: was the fiber of a failing throw one of them? */
+static uint64_t g_born_keys[64]; static long long g_born_pass[64]; static int g_nborn_keys;
+const char *rb_born_info(uint64_t key, char *buf, size_t n) {
+    for (int k = 0; k < 64 && k < g_nborn_keys; k++) if (g_born_keys[k] == key) { snprintf(buf, n, "BORN INSIDE A ROLLED-BACK WINDOW, reset at the load before pass %lld", g_born_pass[k]); return buf; }
+    snprintf(buf, n, "not one of the %d fibers born inside a rolled-back window", g_nborn_keys < 64 ? g_nborn_keys : 64); return buf;
+}
 void fibers_restore_all(void) {
     g_nrest = 0;
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);
@@ -326,6 +332,7 @@ void fibers_restore_all(void) {
             int i; for (i = 0; i < g_guest_fibers.count; i++) if (g_guest_fibers.table[i].key == g_cur[j].key) break;
             if (i < g_guest_fibers.count || g_cur[j].tid) continue;
             os_r1_fiber_set(g_cur[j].key, NULL, NULL, 0);
+            { int b = g_nborn_keys++ % 64; g_born_keys[b] = g_cur[j].key; g_born_pass[b] = g_rgs_next; }
             if (++nreset <= 20) LOG("r1: fiber %llx was born after the state loaded: its host side is reset to never set up (%lld so far)\n", (unsigned long long)g_cur[j].key, nreset);
         }
     }
