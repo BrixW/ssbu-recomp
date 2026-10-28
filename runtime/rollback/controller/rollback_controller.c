@@ -59,6 +59,40 @@ void rbn_set_lockstep(int on); int rbn_loop(void);      /* (hs13) */
  * guess and the two games stay identical; the other game may still roll back. SSBU_RB_NET_TEST_NOMEM forces it (test). */
 static int g_rbg_noring; static long long g_rbg_noring_matches;
 int rbg_noring_now(void) { return g_rbg_noring; }
+
+/* ---------------------------------------------------------------- falling back to delay-only play in the middle of a match
+ * A rollback that cannot be done safely used to leave the match stuck or dead (loads refused again and again, captures skipped for ever, the
+ * ring broken). Now the controller counts those failures and, when they pile up, ends rollback FOR THE REST OF THE MATCH: the match goes on as
+ * a match without the ring (g_rbg_noring, see above): every pass waits for the other player's pad of its frame, so no frame runs on a guess and
+ * the two games stay identical; the other game may still roll back. The switch is made only at a moment with no guess outstanding (every pad
+ * up to the current frame has arrived and no wrong guess is pending), because after it a wrong guess could not be undone any more.
+ * This catches what the controller can SEE: refused loads, skipped captures, a ring that broke. It does not catch a fault inside the game's code.
+ * SSBU_RB_NET_FALLBACK=0 turns it off (test). */
+static const char *g_rbg_fb_why;                         /* why the fallback was asked for (NULL = not asked) */
+static long long g_rbg_fb_refused0, g_rbg_fb_caps, g_rbg_fb_fail; static int g_rbg_fb_run, g_rbg_fb_on = -1;
+enum { RBG_FB_REFUSED = 8, RBG_FB_CAPTURE_RUN = 20 };     /* refused loads in one match; skipped captures in a row */
+/* Called every tick of a ring match: looks at the failure counters and records the reason when one has reached its limit. */
+static void rbg_fallback_watch(void) {
+    if (g_rbg_fb_on < 0) { const char *e = getenv("SSBU_RB_NET_FALLBACK"); g_rbg_fb_on = !(e && e[0] == '0'); }
+    if (!g_rbg_fb_on || g_rbg_noring || g_rbg_fb_why) return;
+    if (g_rg_nomem == 2) { g_rbg_fb_why = "the snapshot ring broke during the match"; return; }
+    if (g_rg_refused - g_rbg_fb_refused0 >= RBG_FB_REFUSED) { g_rbg_fb_why = "loads were refused again and again (a thread kept running guest code)"; return; }
+    if (g_rg_caps != g_rbg_fb_caps) { g_rbg_fb_caps = g_rg_caps; g_rbg_fb_fail = g_rg_cap_fail; g_rbg_fb_run = 0; }       /* a capture worked: the run starts again */
+    else if (g_rg_cap_fail != g_rbg_fb_fail) { g_rbg_fb_run += (int)(g_rg_cap_fail - g_rbg_fb_fail); g_rbg_fb_fail = g_rg_cap_fail; }
+    if (g_rbg_fb_run >= RBG_FB_CAPTURE_RUN) g_rbg_fb_why = "captures were skipped one after another (a thread never reached a wait)";
+}
+/* Starts a match with the failure counters at zero. */
+static void rbg_fallback_reset(void) { g_rbg_fb_why = NULL; g_rbg_fb_refused0 = g_rg_refused; g_rbg_fb_caps = g_rg_caps; g_rbg_fb_fail = g_rg_cap_fail; g_rbg_fb_run = 0; }
+/* Ends rollback for the rest of this match (call it only when no guess is outstanding): the ring is let go, page tracking stops, and the
+ * passes wait for the other player's pad from here on. */
+static void rbg_fallback_go(long long frame) {
+    g_rbg_noring = 1; g_rbg_noring_matches++;
+    rbn_set_lockstep(1);
+    r1_ring_let_go();
+    ls_fight_over();                                      /* no more captures: the page protection and the write watch are not needed */
+    LOG("r1: RB NET: ROLLBACK OFF FOR THE REST OF THIS MATCH at frame %lld: %s; every pass now waits for the other player's pad\n", frame, g_rbg_fb_why);
+    printf("[rbnet] rollback OFF for the rest of this match at frame %lld (%s): delay-based from here\n", frame, g_rbg_fb_why); fflush(stdout);
+}
             /* r1_ring.c (hs12) */
 void input_mark(const char *what);                      /* nnhid.c: the input sequence can wait for it (@match1on, @match1over, ...) */
 /* (hs12) matches in one session: 0 = between matches, 1 = an online match runs (its base state made), 2 = a match that was
@@ -180,6 +214,7 @@ static void rbg_step_body(Ctx *c) {
         else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
         g_rbg_noring = g_rg_nomem != 0;
         rbn_set_lockstep(g_rbg_noring);
+        rbg_fallback_reset();                           /* the failure counters of the fallback start at zero for this match */
         if (g_rbg_noring) {
             g_rbg_noring_matches++;
             LOG("r1: RB NET: ROLLBACK OFF FOR THIS MATCH: not enough memory for the snapshot ring (%s); the match goes on delay-based: every frame waits for the other player's pad\n",
@@ -295,6 +330,8 @@ static void rbg_step_body(Ctx *c) {
         int m = rbn_take_mismatch();
         if (m > 0 && m <= i) { if (g_rbg_noring) { g_rbg_miss++; if (g_rbg_miss <= 10) LOG("r1: RB NET: wrong guess at frame %d WITHOUT the ring: cannot be rolled back (desync)\n", m); }
                                else { if (stalled) { g_rbg_stall_ms += now_ms() - ts; } if (rbg_rollback(c, i, m)) return; } }
+        rbg_fallback_watch();                       /* failures piling up: no rollback for the rest of the match, once no guess is outstanding */
+        if (g_rbg_fb_why && !g_rbg_noring && m == 0 && rbn_confirmed() >= i) rbg_fallback_go(i);
         /* (hs14) the ring short of pool memory (its last capture given up): no frame on a guess until a capture succeeds */
         if (g_rgs_next - rbn_confirmed() <= (g_rbg_noring || g_rg_short ? 0 : rbn_ahead())) break;
         if (!g_rbg_noring && g_rg_short && g_rgs_next - rbn_confirmed() <= rbn_ahead() && !stalled) g_rbg_short_waits++;
