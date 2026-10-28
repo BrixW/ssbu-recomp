@@ -758,7 +758,16 @@ static void eh_raise(Ctx *c, int reason) {
             {   /* which fiber this throw is on, and whether it was born inside a rolled-back window (rollback/model/threads.c) */
                 extern uint64_t os_fiber_cur_key(void); extern const char *rb_born_info(uint64_t key, char *buf, size_t n); extern long long g_rgs_next;
                 static volatile LONG nfib; char bi[160]; uint64_t fk = os_fiber_cur_key();
-                if (InterlockedIncrement(&nfib) <= 20) printf("unwind: the throw that cannot be walked is on fiber %llx (%s), pass %lld\n", (unsigned long long)fk, fk ? rb_born_info(fk, bi, sizeof bi) : "the thread's own context", g_rgs_next);
+                if (InterlockedIncrement(&nfib) <= 20) {
+                    extern int os_fiber_stack(uint64_t key, uint64_t *lo, uint64_t *hi);
+                    uint64_t slo = 0, shi = 0; int has = os_fiber_stack(fk, &slo, &shi);
+                    printf("unwind: the throw that cannot be walked is on fiber %llx (%s), pass %lld\n", (unsigned long long)fk, fk ? rb_born_info(fk, bi, sizeof bi) : "the thread's own context", g_rgs_next);
+                    if (has) printf("unwind:   its guest stack %llx..%llx: low end %s, high end %s\n", (unsigned long long)slo, (unsigned long long)shi, r1_addr_class(slo), r1_addr_class(shi - 8));
+                    printf("unwind:   sp %llx (%s%s), x29 %llx (%s%s), the return-address slot read last %llx (%s) holds %llx\n",
+                           (unsigned long long)c->x[31], r1_addr_class(c->x[31]), has && c->x[31] >= slo && c->x[31] < shi ? ", inside that stack" : "",
+                           (unsigned long long)c->x[29], r1_addr_class(c->x[29]), has && c->x[29] >= slo && c->x[29] < shi ? ", inside that stack" : "",
+                           (unsigned long long)g_unw_lr_slot, g_unw_lr_slot ? r1_addr_class(g_unw_lr_slot) : "none", g_unw_lr_slot && cxxrt_readable(g_unw_lr_slot, 8) ? (unsigned long long)rd64(g_unw_lr_slot) : 0ull);
+                }
             }
 #endif
             if (reload_via_host_catch(c, exc)) return;   /* net active: unwind the host stack to a catch frame and reload, instead of ending the game */

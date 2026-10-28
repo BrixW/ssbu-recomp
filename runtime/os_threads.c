@@ -749,6 +749,7 @@ void (*g_r1_fiber_born)(void *fiber);                 /* r1_state.c (R3 hs13): a
 static int fib_bad_target(uint64_t next, uint64_t from);
 /* rollback/debug/call_trace.c (job trace): the guest fiber this host thread runs now, and how many times a fiber has switched away so far */
 uint64_t os_fiber_cur_key(void) { return fiber_cur(); }
+int os_fiber_stack(uint64_t key, uint64_t *lo, uint64_t *hi) { if (!key) return 0; Obj *o = obj(key); if (!o->stack_size) return 0; *lo = o->stack; *hi = o->stack + o->stack_size; return 1; }   /* the fiber's guest stack */
 long os_fiber_switch_outs(uint64_t key) { return key ? obj(key)->switch_outs : 0; }
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
