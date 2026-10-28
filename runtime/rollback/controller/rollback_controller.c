@@ -81,17 +81,40 @@ static void rbg_fallback_watch(void) {
     else if (g_rg_cap_fail != g_rbg_fb_fail) { g_rbg_fb_run += (int)(g_rg_cap_fail - g_rbg_fb_fail); g_rbg_fb_fail = g_rg_cap_fail; }
     if (g_rbg_fb_run >= RBG_FB_CAPTURE_RUN) g_rbg_fb_why = "captures were skipped one after another (a thread never reached a wait)";
 }
-/* Starts a match with the failure counters at zero. */
-static void rbg_fallback_reset(void) { g_rbg_fb_why = NULL; g_rbg_fb_refused0 = g_rg_refused; g_rbg_fb_caps = g_rg_caps; g_rbg_fb_fail = g_rg_cap_fail; g_rbg_fb_run = 0; }
+static long long g_rbg_fb_at = -1;                       /* the frame where the fallback was made (-1 = rollback is on, or it was off from the start of the match) */
+static int g_rbg_fb_n;                                    /* fallbacks in this match */
+enum { RBG_FB_RETRY_FRAMES = 900, RBG_FB_MAX = 3 };       /* frames to wait before trying rollback again (x the number of fallbacks: 15 s, 30 s, 45 s at 60 fps); fallbacks after which it stays off */
+/* Zeroes the failure counters (a match starts, or rollback has just come back). */
+static void rbg_fallback_counters(void) { g_rbg_fb_why = NULL; g_rbg_fb_refused0 = g_rg_refused; g_rbg_fb_caps = g_rg_caps; g_rbg_fb_fail = g_rg_cap_fail; g_rbg_fb_run = 0; }
+/* Starts a match with the failure counters at zero and no fallback made yet. */
+static void rbg_fallback_reset(void) { rbg_fallback_counters(); g_rbg_fb_at = -1; g_rbg_fb_n = 0; }
 /* Ends rollback for the rest of this match (call it only when no guess is outstanding): the ring is let go, page tracking stops, and the
  * passes wait for the other player's pad from here on. */
 static void rbg_fallback_go(long long frame) {
     g_rbg_noring = 1; g_rbg_noring_matches++;
+    g_rbg_fb_at = frame; g_rbg_fb_n++;
     rbn_set_lockstep(1);
     r1_ring_let_go();
     ls_fight_over();                                      /* no more captures: the page protection and the write watch are not needed */
     LOG("r1: RB NET: ROLLBACK OFF FOR THE REST OF THIS MATCH at frame %lld: %s; every pass now waits for the other player's pad\n", frame, g_rbg_fb_why);
     printf("[rbnet] rollback OFF for the rest of this match at frame %lld (%s): delay-based from here\n", frame, g_rbg_fb_why); fflush(stdout);
+}
+/* Called after every real pass of a match that fell back: after a quiet stretch (RBG_FB_RETRY_FRAMES frames per earlier fallback) the ring's
+ * base is made again right here (r1_ring_rebase: every page copied, tracking started from nothing, slot 0 = this frame) and rollback goes on.
+ * A fresh base also drops whatever stale state the tracking had built up. Done only when every pad up to this frame is known (no guess is
+ * outstanding, as in the other direction); a rebase that finds no quiet moment is tried again on the next pass. After RBG_FB_MAX fallbacks
+ * the match stays delay-only: if the cause is still there, going back and forth would only make hitches (each rebase costs about a second). */
+static void rbg_fallback_try_recover(long long i, Ctx *c) {
+    if (g_rbg_fb_at < 0 || g_rbg_fb_n >= RBG_FB_MAX || g_rg_nomem) return;
+    if (i - g_rbg_fb_at < (long long)RBG_FB_RETRY_FRAMES * g_rbg_fb_n) return;
+    if (rbn_confirmed() < i) return;
+    double t0 = now_ms();
+    if (!r1_ring_rebase(i, c)) return;
+    g_rbg_noring = 0; g_rbg_fb_at = -1;
+    rbn_set_lockstep(0);
+    rbg_fallback_counters();
+    LOG("r1: RB NET: ROLLBACK IS BACK at frame %lld (a new base state, %.0f ms), after %d fallback(s) in this match\n", i, now_ms() - t0, g_rbg_fb_n);
+    printf("[rbnet] rollback is back at frame %lld (new base state)\n", i); fflush(stdout);
 }
             /* r1_ring.c (hs12) */
 void input_mark(const char *what);                      /* nnhid.c: the input sequence can wait for it (@match1on, @match1over, ...) */
@@ -279,6 +302,7 @@ static void rbg_step_body(Ctx *c) {
         rbn_drain(i);
         int m = rbn_take_mismatch();
         if (m > 0 && m <= i) { g_rbg_miss++; if (g_rbg_miss <= 10) LOG("r1: RB NET: wrong guess at frame %d WITHOUT the ring (frame %lld): cannot be rolled back (desync)\n", m, i); }
+        else rbg_fallback_try_recover(i, c);              /* after a fallback: rollback comes back once things have been quiet for a while */
     } else {                                            /* a real pass ended */
         g_rgs_next = i + 1; g_rbg_real++;
         rbn_drain(i);
