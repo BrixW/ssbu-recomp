@@ -132,6 +132,12 @@ def rmc_proto_bytes(proto, request):
     return bytes([0x7f | flag]) + struct.pack("<H", proto) if proto >= 0x7f else bytes([proto | flag])
 
 
+def rmc_request(protocol, call, method, body):
+    """A call from the server to the game (notifications)."""
+    b = rmc_proto_bytes(protocol, True) + struct.pack("<II", call, method) + body
+    return struct.pack("<I", len(b)) + b
+
+
 def rmc_ok(req, body):
     b = rmc_proto_bytes(req.protocol, False) + b"\x01" + struct.pack("<II", req.call, req.method | 0x8000) + body
     return struct.pack("<I", len(b)) + b
@@ -270,6 +276,8 @@ def validate_and_request_ticket(client, req):
 
 
 RESULT_SUCCESS = 0x00010001
+NOTIFY_PARTICIPATION = 3001  # type 3 (participation) * 1000 + 1 (a new participant): param1 gid, param2 pid
+CALLS_DIR = "nex_calls"     # the bodies of calls without a handler (in the current directory)
 
 
 def request_ticket(client, req):
@@ -326,15 +334,70 @@ def matchmake_ext_58(client, req):
     return Writer().u("I", 0).bytes()
 
 
+ARENAS = {}                 # gathering id -> {"owner": pid, "session": MatchmakeSession bytes, "client": Client}
+ARENAS_LOCK = threading.Lock()
+_next_gid = [1000]
+
+
+def matchmake_session_span(b, o):
+    """The bytes of a MatchmakeSession at b[o:]: the Gathering part (header + body) then the MatchmakeSession part."""
+    g = struct.unpack_from("<I", b, o + 1)[0]
+    m = struct.unpack_from("<I", b, o + 5 + g + 1)[0]
+    return o + 5 + g + 5 + m
+
+
+def create_matchmake_session_with_param(client, req):
+    """MatchmakeExtension method 38, creating a Battle Arena: CreateMatchmakeSessionParam {MatchmakeSession (Gathering
+    {gid u32, owner u64, host u64, min u16, max u16, policy u32, policy argument u32, flags u32, state u32,
+    description}, game mode u32 (7: an arena), attributes List<u32>, open participation, matchmake system type u32,
+    application buffer (413 bytes: the arena's settings and the host's name), ...), then 17 more bytes}. Answers the
+    session as it was sent with the gathering id, owner and host filled in."""
+    b = req.body
+    end = matchmake_session_span(b, 5)
+    session = bytearray(b[5:end])
+    with ARENAS_LOCK:
+        gid = _next_gid[0]
+        _next_gid[0] += 1
+        struct.pack_into("<IQQ", session, 5, gid, client.pid or 0, client.pid or 0)
+        ARENAS[gid] = {"owner": client.pid, "session": bytes(session), "client": client}
+    r = Reader(bytes(session))
+    r.raw(5 + 4 + 16)
+    mn, mx = r.u("H"), r.u("H")
+    client.log("%s     arena %d created by pid %d (%d..%d players, session %d bytes, %d more bytes in the param: %s)" % (
+        client.who, gid, client.pid or 0, mn, mx, len(session), len(b) - end, b[end:].hex(" ")))
+    # NexMatchCreateSessionJob::WaitNotification: the game waits ~10 s for a notification after creating, then gives
+    # up ("a communication error"). Sent after the answer: participation (3001) of the owner in his own gathering.
+    client.after_reply = lambda: client.notify(NOTIFY_PARTICIPATION, gid, client.pid or 0)
+    return bytes(session)
+
+
+def unregister_gathering(client, req):
+    """MatchMaking method 2 UnregisterGathering(gid u32) -> bool."""
+    gid = Reader(req.body).u("I")
+    with ARENAS_LOCK:
+        ok = ARENAS.get(gid, {}).get("owner") == client.pid
+        if ok:
+            del ARENAS[gid]
+    client.log("%s     unregister gathering %d: %s" % (client.who, gid, "removed" if ok else "not ours / unknown"))
+    return Writer().u("B", 1 if ok else 0).bytes()
+
+
 def matchmake_ext_52(client, req):
     """MatchmakeExtension method 52, the Battle Arenas search: a MatchmakeSessionSearchCriteria-like structure
     (attribute strings "0", "1", "7"..., flags) and at the end a ResultRange {offset 0, size 50}. Answered with an empty
     list of sessions (u32 0) (UNCONFIRMED: the answer type)."""
-    client.log("%s     MatchmakeExtension 52 (arena search): no arenas" % client.who)
-    return Writer().u("I", 0).bytes()
+    with ARENAS_LOCK:
+        found = [a["session"] for a in ARENAS.values()]
+    client.log("%s     MatchmakeExtension 52 (arena search): %d arena(s)" % (client.who, len(found)))
+    w = Writer().u("I", len(found))
+    for session in found:
+        w.raw(session)
+    return w.bytes()
 
 
 HANDLERS = {
+    (21, 2): unregister_gathering,
+    (109, 38): create_matchmake_session_with_param,
     (109, 52): matchmake_ext_52,
     (109, 58): matchmake_ext_58,
     (110, 7): get_integer_settings,
@@ -378,6 +441,7 @@ class Client:
         self.peer = addr                 # the game's address as seen from here
         self.cid, self.urls = 0, []
         self.pid = None
+        self.after_reply = None          # something to send right after the current call's answer (a notification)
         self.user_key = None             # the login's source key
         self.last_ports = (1, 0x1f)
 
@@ -485,6 +549,15 @@ class Client:
         self.log("%s     secure CONNECT: pid %d (check data pid %d), connection id %d, check %08x" % (self.who, pid, cpid, cid, value))
         return Writer().buffer(struct.pack("<I", (value + 1) & 0xffffffff)).bytes()
 
+    def notify(self, type_, param1, param2, text="", param3=0):
+        """NotificationEvents (protocol 14) method 1 ProcessNotificationEvent(NotificationEvent {source pid u64, type u32,
+        param1 u64, param2 u64, string, param3 u64}) (UNCONFIRMED: the NEX 4.6 field list, structure version 0)."""
+        event = Writer().u("Q", self.pid or 0).u("I", type_).u("Q", param1).u("Q", param2).string(text).u("Q", param3).bytes()
+        self.notify_call = getattr(self, "notify_call", 0x10000) + 1
+        self.log("%s     notification %d to pid %d: param1 %d param2 %d" % (self.who, type_, self.pid or 0, param1, param2))
+        self.send_data(rmc_request(14, self.notify_call, 1, Writer().structure(event).bytes()), self.last_ports[0],
+                       self.last_ports[1])
+
     def send_data(self, payload, src_port=1, dst_port=0x1f):
         p = Packet(TYPE_DATA, FLAG_RELIABLE | FLAG_NEED_ACK | FLAG_HAS_SIZE, self.seq_out, 10, 10, src_port, dst_port,
                    0, None, payload)
@@ -493,12 +566,19 @@ class Client:
 
     # RMC
     def on_rmc(self, data):
+        if len(data) > 4 and not data[4] & 0x80:
+            self.log("%s     the game's answer to our call: %s" % (self.who, hexdump(data, 32)))
+            return
         try:
             req = Rmc.decode(data)
         except (ValueError, struct.error) as e:
             self.log("%s     not an RMC request (%s): %s" % (self.who, e, hexdump(data)))
             return
         fn = self.handlers.get((req.protocol, req.method))
+        if not fn:                                            # the whole body, for reading it later (the log cuts it)
+            os.makedirs(CALLS_DIR, exist_ok=True)
+            with open(os.path.join(CALLS_DIR, "%d_%d_%d.bin" % (req.protocol, req.method, req.call)), "wb") as f:
+                f.write(req.body)
         self.log("%s     RMC call %d %s, %d bytes%s" % (self.who, req.call, rmc_name(req), len(req.body),
                                                          "" if fn else ": NOT IMPLEMENTED (%s), body %s" % (
             "answered DataStore::NotFound" if req.protocol == 115 else "answered Core::NotImplemented", hexdump(req.body, 512))))
@@ -509,6 +589,9 @@ class Client:
             out = NOT_IMPLEMENTED
         self.send_data(rmc_error(req, out) if isinstance(out, int) else rmc_ok(req, out), self.last_ports[0],
                        self.last_ports[1])
+        after, self.after_reply = self.after_reply, None
+        if after:
+            after()
 
     def run(self):
         self.log("%s connected" % self.who)
@@ -534,8 +617,28 @@ class Client:
         except (ConnectionError, OSError) as e:
             self.log("%s %s" % (self.who, e))
         finally:
+            with ARENAS_LOCK:
+                for gid in [g for g, a in ARENAS.items() if a["client"] is self]:
+                    del ARENAS[gid]
+                    self.log("%s arena %d closed (its host left)" % (self.who, gid))
             self.s.close()
             self.log("%s gone" % self.who)
+
+
+NAT_PORTS = (10025, 10125)  # UNCONFIRMED: Pia's NAT check servers (nncs1 / nncs2); the game's SendTo log shows the real ones
+
+
+def nat_listener(bind, port, log):
+    """Logs what Pia's NAT check sends to nncs1 (127.0.0.1) / nncs2 (127.0.0.2); answers nothing yet."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u.bind((bind, port))
+    except OSError as e:
+        log("NAT check listener %s:%d: %s" % (bind, port, e))
+        return
+    while True:
+        data, addr = u.recvfrom(2048)
+        log("NAT check %s:%d <- %s:%d %d bytes: %s" % (bind, port, addr[0], addr[1], len(data), hexdump(data)))
 
 
 def main():
@@ -550,6 +653,9 @@ def main():
     srv.bind((a.bind, a.port))
     srv.listen(8)
     log("nex server on TCP %s:%d (WebSocket, PRUDP lite)" % (a.bind, a.port))
+    for host in ("127.0.0.1", "127.0.0.2"):
+        for port in NAT_PORTS:
+            threading.Thread(target=nat_listener, args=(host, port, log), daemon=True).start()
     while True:
         s, addr = srv.accept()
         threading.Thread(target=Client(s, addr, log).run, daemon=True).start()

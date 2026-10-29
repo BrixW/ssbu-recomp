@@ -11,8 +11,12 @@
  * server on this PC (tools/net/nex_probe.py). See docs/ONLINE_MENU_RE.md. */
 #define OM_TOKEN_MAGIC 0x6f6d746bu                         /* "omtk": stands for the IAsyncContext of EnsureIdTokenCacheAsync */
 static char g_om_server[64] = "127.0.0.1";
-static volatile LONG g_om_packets;                         /* packets whose first bytes were logged */
+static volatile LONG g_om_packets, g_om_udp;               /* nn::ssl / UDP packets whose first bytes were logged */
 #define OM_PACKETS_LOGGED 64
+#define OM_UDP_LOGGED 256
+/* Pia's NAT check asks nncs1 and nncs2 and compares the answers: they must be two addresses. nncs2 -> the second one
+ * (SSBU_ONLINE_MENU_SERVER2, default 127.0.0.2: loopback too on Windows). */
+static char g_om_server2[64] = "127.0.0.2";
 static ImportFn g_om_prev_gai2, g_om_prev_gainn, g_om_prev_ghbn, g_om_prev_resolve, g_om_prev_connect, g_om_prev_sendto,
                 g_om_prev_send, g_om_prev_socket, g_om_prev_ssl_host, g_om_prev_primary_ip;
 
@@ -25,13 +29,17 @@ static void om_log(const char *fmt, ...) {
     va_end(ap);
     fflush(stdout);
 }
-static void om_hex(const char *what, uint64_t buf, uint64_t len) {
-    if (InterlockedIncrement(&g_om_packets) > OM_PACKETS_LOGGED || !buf) return;
+static void om_hex_n(volatile LONG *count, LONG most, const char *what, uint64_t buf, uint64_t len) {
+    if (InterlockedIncrement(count) > most || !buf) return;
     char t[3 * 48 + 1];
     int n = len < 48 ? (int)len : 48, k = 0;
     for (int i = 0; i < n; i++) k += sprintf(t + k, "%02x ", ((const uint8_t *)(uintptr_t)buf)[i]);
     t[k] = 0;
     om_log("%s %llu bytes: %s%s", what, (unsigned long long)len, t, len > 48 ? "..." : "");
+}
+static void om_hex(const char *what, uint64_t buf, uint64_t len) { om_hex_n(&g_om_packets, OM_PACKETS_LOGGED, what, buf, len); }
+static const char *om_server_for(const char *name) {      /* our address for a nintendo.net name */
+    return !_strnicmp(name, "nncs2", 5) ? g_om_server2 : g_om_server;
 }
 static void om_addr_text(uint64_t sa, char *out, size_t n) {
     struct sockaddr_in a;
@@ -114,8 +122,8 @@ static void om_gai(Ctx *c, ImportFn prev) {               /* (node, service, hin
     static __declspec(thread) char t_node[64];
     const char *node = (const char *)(uintptr_t)A0, *service = (const char *)(uintptr_t)A1;
     if (node && om_ours(node)) {
-        om_log("GetAddrInfo \"%s\" port %s -> %s (our server)", node, service ? service : "-", g_om_server);
-        snprintf(t_node, sizeof t_node, "%s", g_om_server);
+        om_log("GetAddrInfo \"%s\" port %s -> %s (our server)", node, service ? service : "-", om_server_for(node));
+        snprintf(t_node, sizeof t_node, "%s", om_server_for(node));
         c->x[0] = P(t_node);
     } else om_log("GetAddrInfo \"%s\" port %s: not ours, left to the offline resolver", node ? node : "-", service ? service : "-");
     prev(c);
@@ -126,8 +134,8 @@ static void om_GetHostByNameWithOptions(Ctx *c) {
     static __declspec(thread) char t_node[64];
     const char *name = (const char *)(uintptr_t)A0;
     if (name && om_ours(name)) {
-        om_log("GetHostByName \"%s\" -> %s (our server)", name, g_om_server);
-        snprintf(t_node, sizeof t_node, "%s", g_om_server);
+        om_log("GetHostByName \"%s\" -> %s (our server)", name, om_server_for(name));
+        snprintf(t_node, sizeof t_node, "%s", om_server_for(name));
         c->x[0] = P(t_node);
     } else om_log("GetHostByName \"%s\": not ours, left to the offline resolver", name ? name : "-");
     g_om_prev_ghbn(c);
@@ -160,7 +168,7 @@ static void om_SendTo(Ctx *c) {
     char to[48], what[96];
     om_addr_text(c->x[4], to, sizeof to);
     snprintf(what, sizeof what, "SendTo(fd %d, %s)", fd, to);
-    om_hex(what, buf, len);
+    om_hex_n(&g_om_udp, OM_UDP_LOGGED, what, buf, len);
     g_om_prev_sendto(c);
 }
 static void om_Send(Ctx *c) {
@@ -261,6 +269,7 @@ static void online_menu_register(void) {
         if (InetPtonA(AF_INET, e, &a) != 1) { printf("[online-menu] SSBU_ONLINE_MENU_SERVER=%s is not an IPv4 address: the Online menu stays off\n", e); return; }
         snprintf(g_om_server, sizeof g_om_server, "%s", e);
     }
+    if ((e = getenv("SSBU_ONLINE_MENU_SERVER2")) && *e) snprintf(g_om_server2, sizeof g_om_server2, "%s", e);
     g_om_prev_gai2 = om_prev(OM_SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"));
     g_om_prev_gainn = om_prev(OM_SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"));
     g_om_prev_ghbn = om_prev("nnsocketGetHostByNameWithOptions");

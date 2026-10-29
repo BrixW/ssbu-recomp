@@ -50,11 +50,43 @@ then Online in the game's main menu. `runtime/online_menu.inc` (only with `SSBU_
 ## Decision
 
 **B1 (our own NEX server)**: the transport is plain enough. TLS is removed in our nn::ssl, WebSocket is standard, and
-the NEX payload starts with a PRUDP lite SYN. Next (phase 1): `tools/net/nex_server.py` answers SYN / CONNECT, then the
-authentication server's RMC calls, logging every protocol and method it does not know.
+the NEX payload starts with a PRUDP lite SYN. Later the answers move into the runtime (each game answers itself on
+loopback; the arena list goes over our existing lobby / host-as-server): the player runs nothing extra.
+
+## Phase 1 so far (tools/net/nex_server.py, 2026-10-29)
+
+Works, against `nex_server.py` on 127.0.0.1:443 (the game also logs in by itself at boot):
+1. Authentication server: SYN / CONNECT (no payload), then TicketGranting 6 (ValidateAndRequestTicketWithParam:
+   platform 3, username = the NSA id in decimal, AuthenticationInfo with our token, NEX 40603, client 40). Answer:
+   structure v0 {pid u64, ticket, secure StationURL, DateTime, server name, source key hex}. The ticket is kerberos
+   (RC4 + HMAC-MD5, key = the source key) of {session key 32, target pid u64 = 2 (the secure server), internal Buffer}.
+   Target pid = the player made the game ask RequestTicket and crash (null session key at 0x71001cf570).
+2. Secure server: a second WebSocket to the StationURL address; CONNECT payload = Buffer internal ticket + Buffer
+   kerberos(session key){pid, cid, check}. Answer in the CONNECT-ACK: **Buffer(u32 check + 1) in the clear** (encrypted
+   answers made the game disconnect).
+3. SecureConnection 1 Register (two prudp:/ URLs, ports 11/12.., Tpt=2, sid=30): Result, cid, public URL.
+4. PRUDP type 8 every 3 s on the secure connection: a keep-alive; it must be ACKed (else 2306-0332 after ~50 s).
+5. Online menu: DataStore 61, 83, 94, 84, 60, 95, 97, 8 (Smash methods, answered DataStore::NotFound or an empty list),
+   Utility 7 GetIntegerSettings (empty map), Utility 11 (en-US; NotImplemented is tolerated). Also an HTTP
+   `POST /v1/NX/getToken` to api-%.znc.srv.nintendo.net (404 is tolerated).
+6. Battle Arenas search: MatchmakeExtension 58 (u32 7) -> empty list, then 52 (search criteria + ResultRange 0..50) ->
+   List<MatchmakeSession>: an empty list shows "no arenas".
+7. Create arena: MatchmakeExtension 38 (CreateMatchmakeSessionWithParam: MatchmakeSession with game mode 7, attributes
+   [0,2,3,2,1,1], 2..6 players, a 413-byte application buffer with the host's name) -> the session with gid / owner /
+   host filled in. Then the game waits for a notification (NexMatchCreateSessionJob::WaitNotification, ~10 s, else
+   "a communication error" and MatchMaking 2 UnregisterGathering). A NotificationEvents 1 call with type 3001
+   (participation, param1 gid, param2 pid) moves it on to Pia's NAT check.
+
+## Where it stops (next step)
+
+Pia's NAT check: nncs1 / nncs2 (mapped to 127.0.0.1 / 127.0.0.2), UDP port **10025**. 16-byte packets, the 4th byte
+a request type: 0x65 (x5) and 0x66 (x5) to nncs1, 0x67 to nncs2; also 16 zero bytes to 127.0.0.1:33334. The server
+only logs them (no answer): the game shows "loading", then an error (2618-0006 before the second address existed).
+Next: answer the NAT check (the client's address as seen, per request type), then Pia's own session / mesh between
+two games; then route the arena's fight into our rollback match (plan phase 3).
 
 ## Open
 
-- The `%` in the host name (`lp1` on a console): harmless while we answer every name.
-- What follows the SYN-ACK: the authentication (ticket) step, then the secure server address the game connects to next.
-- Pia's NAT check (`nncs1/2-%.n.n.srv.nintendo.net`): not asked yet.
+- The `%` in the host names (`lp1` on a console): harmless while we answer every name.
+- The Smash DataStore methods (what 61, 83, 94... are) and Utility 11.
+- The notification's exact NEX 4.6 layout (accepted as {pid, type, param1 u64, param2 u64, string, param3 u64} v0).
