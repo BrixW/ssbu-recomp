@@ -75,7 +75,8 @@ def personal_patterns():
     for w in words:                                   # each word of a name, and the whole name
         for part in [w] + w.split():
             if len(part) >= 4 and part.lower() not in ('users', 'user', 'admin', 'administrator', 'workgroup'):
-                pats.append(b'(?i)' + re.escape(part.encode('utf-8', 'replace')))
+                # (a whole word only: a user "Rober" is not the "Robert" of a vendor list in glslang's SPIR-V tables)
+                pats.append(b'(?i)(?<![a-z0-9])' + re.escape(part.encode('utf-8', 'replace')) + b'(?![a-z0-9])')
     for whole in (REPO, os.path.dirname(REPO), os.environ.get('USERPROFILE', '')):
         if whole:
             pats.append(b'(?i)' + re.escape(whole.encode('utf-8', 'replace')).replace(b'\\\\\\\\', b'[\\\\/]'))
