@@ -160,6 +160,7 @@ static void friends_NQ_GetSystemEvent(Ctx *c) {
 }
 static void c5a_register(void);                           /* nnsvc_c5a.inc: account, friends, bcat directory / file, ngc, pdm, pl VR */
 static void c4a_register(void);                           /* nnnet_c4a.inc: nifm, sockets, ssl, nsd, ldn, ec accessor */
+static void online_menu_register(void);                   /* online_menu.inc: the game's Online menu against our servers (SSBU_ONLINE_MENU=1) */
 void nnnet_register_final(void) {                          /* after every other table (nnsdk2.c): replaces the do-nothing versions */
     static const ImportDef defs[] = {
         {"_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", friends_UserPresence_Initialize},
@@ -171,6 +172,7 @@ void nnnet_register_final(void) {                          /* after every other 
     c4a_register();
     c5a_register();
     { void nnldn_register(void); nnldn_register(); }      /* online play (nnldn.c): does nothing unless SSBU_ONLINE / online_server is set */
+    online_menu_register();                               /* last: wraps the handlers above; does nothing unless SSBU_ONLINE_MENU=1 */
 }
 
 /* ---------------------------------------------------------------- self-test */
@@ -181,6 +183,8 @@ static ImportFn h(const char *name) {
 }
 #include "nnnet_c4a.inc"
 #include "nnsvc_c5a.inc"
+#include <stdarg.h>
+#include "online_menu.inc"
 int nnnet_selftest(Ctx *c) {
     int bad = 0, ok;
     bad += c4a_selftest(c);

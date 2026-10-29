@@ -1,0 +1,278 @@
+/* Included by nnnet.c: the game's own Online menu (Battle Arenas) against our servers, phase 0 (discovery spike).
+ * Only with SSBU_ONLINE_MENU=1; registered by online_menu_register() from nnnet_register_final(), after every other table,
+ * so these REPLACE (and mostly wrap) the handlers of nnfs.c, nnnet_c4a.inc and nnsvc_c5a.inc.
+ *
+ * What it models: the console is connected (nn::nifm accepts the request; the address is loopback) and the user has a
+ * network service account (nn::account: available, an ID token, a finished EnsureIdTokenCacheAsync). Every name the game
+ * resolves is logged; a name under nintendo.net is answered with OUR server (SSBU_ONLINE_MENU_SERVER, default
+ * 127.0.0.1): the game must never reach a server of Nintendo. Sockets, sends and nn::ssl host names are logged, with the
+ * first bytes of the first packets, to learn what the Online menu speaks (PRUDP over UDP? TLS?).
+ * Run it with online play OFF (SSBU_ONLINE=off): the offline sockets (real Winsock, loopback only) carry the traffic to a
+ * server on this PC (tools/net/nex_probe.py). See docs/ONLINE_MENU_RE.md. */
+#define OM_TOKEN_MAGIC 0x6f6d746bu                         /* "omtk": stands for the IAsyncContext of EnsureIdTokenCacheAsync */
+static char g_om_server[64] = "127.0.0.1";
+static volatile LONG g_om_packets;                         /* packets whose first bytes were logged */
+#define OM_PACKETS_LOGGED 64
+static ImportFn g_om_prev_gai2, g_om_prev_gainn, g_om_prev_ghbn, g_om_prev_resolve, g_om_prev_connect, g_om_prev_sendto,
+                g_om_prev_send, g_om_prev_socket, g_om_prev_ssl_host, g_om_prev_primary_ip;
+
+static void om_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    printf("[online-menu] ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+    fflush(stdout);
+}
+static void om_hex(const char *what, uint64_t buf, uint64_t len) {
+    if (InterlockedIncrement(&g_om_packets) > OM_PACKETS_LOGGED || !buf) return;
+    char t[3 * 48 + 1];
+    int n = len < 48 ? (int)len : 48, k = 0;
+    for (int i = 0; i < n; i++) k += sprintf(t + k, "%02x ", ((const uint8_t *)(uintptr_t)buf)[i]);
+    t[k] = 0;
+    om_log("%s %llu bytes: %s%s", what, (unsigned long long)len, t, len > 48 ? "..." : "");
+}
+static void om_addr_text(uint64_t sa, char *out, size_t n) {
+    struct sockaddr_in a;
+    if (!sa || !so_addr_in(sa, &a)) { snprintf(out, n, "(none)"); return; }
+    char ip[32] = "";
+    InetNtopA(AF_INET, &a.sin_addr, ip, sizeof ip);
+    snprintf(out, n, "%s:%u", ip, ntohs(a.sin_port));
+}
+static int om_ours(const char *name) {                     /* a name answered with our server */
+    size_t l = name ? strlen(name) : 0;
+    return l >= 12 && !_stricmp(name + l - 12, "nintendo.net");
+}
+
+/* ---------------------------------------------------------------- nn::nifm: connected */
+static void om_nifm_true(Ctx *c) { RET(1); }
+static void om_nifm_false(Ctx *c) { RET(0); }
+static void om_nifm_keep(Ctx *c) { (void)c; }
+static void om_nifm_GetCurrentPrimaryIpAddress(Ctx *c) {
+    uint64_t out = A0;
+    g_om_prev_primary_ip(c);
+    if ((uint32_t)c->x[0] == 0) M32(out) = htonl(INADDR_LOOPBACK);
+}
+
+/* ---------------------------------------------------------------- nn::account: a network service account */
+static uint64_t om_nsa_id(void) {                          /* a stable id per player: FNV-1a of the nickname (phase 1: the ladder id) */
+    const char *e = getenv("SSBU_NICKNAME");
+    char name[64];
+    DWORD n = sizeof name;
+    if (!(e && *e)) { if (!GetUserNameA(name, &n)) strcpy(name, "Player"); e = name; }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (; *e; e++) { h ^= (uint8_t)*e; h *= 0x100000001b3ull; }
+    return h | 1;
+}
+static void om_acc_IsNsaAvailable(Ctx *c) { wr8(A0, 1); RET(0); }
+static void om_acc_ok(Ctx *c) { RET(0); }
+static void om_acc_GetNsaId(Ctx *c) { wr64(A0, om_nsa_id()); RET(0); }
+static void om_acc_LoadCachedNintendoAccountInfo(Ctx *c) {
+    om_log("nn::account::LoadCachedNintendoAccountInfo (info 0x%llx, buffer 0x%llx, %llu bytes): answered 0, nothing written",
+           (unsigned long long)A0, (unsigned long long)A2, (unsigned long long)c->x[3]);
+    RET(0);
+}
+/* (size_t *outLen, char *buf, size_t bufLen, const UserHandle &): a JWT-shaped token (header.payload.signature, base64url);
+ * the signature is not valid: only our server reads it. */
+static void om_acc_LoadIdTokenCache(Ctx *c) {
+    uint64_t out_len = A0, buf = A1, cap = A2;
+    char tok[256];
+    int n = snprintf(tok, sizeof tok, "eyJhbGciOiJub25lIn0.%016llx.c3NidS1yZWNvbXA", (unsigned long long)om_nsa_id());
+    if (!buf || cap < (uint64_t)n + 1) { om_log("nn::account::LoadNetworkServiceAccountIdTokenCache: buffer of %llu bytes too small", (unsigned long long)cap); RET(0x1907cu); return; }
+    memcpy((void *)(uintptr_t)buf, tok, (size_t)n + 1);
+    if (out_len) wr64(out_len, (uint64_t)n);
+    om_log("nn::account: ID token handed to the game (%d bytes)", n);
+    RET(0);
+}
+/* AsyncContext {vtable, 8 + 8 bytes, IAsyncContext * @0x18} (nnsvc_c5a.inc): EnsureIdTokenCacheAsync stores a finished
+ * request; HasDone true, GetResult 0, the event signalled. */
+static uint32_t g_om_token_request = OM_TOKEN_MAGIC;
+static int om_ctx_ours(uint64_t ctx) { return rd64(ctx + 0x18) == P(&g_om_token_request); }
+static void om_acc_EnsureIdTokenCacheAsync(Ctx *c) {
+    uint64_t ctx = A0;
+    if (rd64(ctx + 0x18) && !om_ctx_ours(ctx)) guest_trap("nn::account::AsyncContext: a request pointer this model did not make", ctx);
+    wr64(ctx + 0x18, P(&g_om_token_request));
+    om_log("nn::account::EnsureNetworkServiceAccountIdTokenCacheAsync: finished at once");
+    RET(0);
+}
+static void om_acc_Async_HasDone(Ctx *c) { wr8(A1, om_ctx_ours(A0) ? 1 : 0); RET(0); }
+static void om_acc_Async_GetResult(Ctx *c) { RET(0); }
+static void om_acc_Async_Cancel(Ctx *c) { RET(0); }
+static void om_acc_Async_GetSystemEvent(Ctx *c) { os_init_event(A1, 0); os_signal_event(A1); RET(0); }
+static void om_acc_Async_move_assign(Ctx *c) {
+    uint64_t s = A0, o = A1;
+    uint64_t a = rd64(o + 8), b = rd64(o + 0x10), p = rd64(o + 0x18);
+    wr64(o + 8, 0); wr64(o + 0x10, 0); wr64(o + 0x18, 0);
+    wr64(s + 8, a); wr64(s + 0x10, b); wr64(s + 0x18, p);
+    RET(s);
+}
+static void om_acc_Async_dtor(Ctx *c) { uint64_t s = A0; wr64(s, c5a_acc_vtable()); wr64(s + 0x18, 0); RET(s); }
+
+/* ---------------------------------------------------------------- names: logged; nintendo.net -> our server */
+static void om_gai(Ctx *c, ImportFn prev) {               /* (node, service, hints, out) */
+    static __declspec(thread) char t_node[64];
+    const char *node = (const char *)(uintptr_t)A0, *service = (const char *)(uintptr_t)A1;
+    if (node && om_ours(node)) {
+        om_log("GetAddrInfo \"%s\" port %s -> %s (our server)", node, service ? service : "-", g_om_server);
+        snprintf(t_node, sizeof t_node, "%s", g_om_server);
+        c->x[0] = P(t_node);
+    } else om_log("GetAddrInfo \"%s\" port %s: not ours, left to the offline resolver", node ? node : "-", service ? service : "-");
+    prev(c);
+}
+static void om_GetAddrInfo2(Ctx *c) { om_gai(c, g_om_prev_gai2); }
+static void om_GetAddrInfoNn(Ctx *c) { om_gai(c, g_om_prev_gainn); }
+static void om_GetHostByNameWithOptions(Ctx *c) {
+    static __declspec(thread) char t_node[64];
+    const char *name = (const char *)(uintptr_t)A0;
+    if (name && om_ours(name)) {
+        om_log("GetHostByName \"%s\" -> %s (our server)", name, g_om_server);
+        snprintf(t_node, sizeof t_node, "%s", g_om_server);
+        c->x[0] = P(t_node);
+    } else om_log("GetHostByName \"%s\": not ours, left to the offline resolver", name ? name : "-");
+    g_om_prev_ghbn(c);
+}
+static void om_nsd_ResolveEx(Ctx *c) {
+    uint64_t out = A0;
+    char in[0x100];
+    memcpy(in, (const void *)(uintptr_t)A1, sizeof in);
+    in[sizeof in - 1] = 0;
+    g_om_prev_resolve(c);
+    om_log("nsd::ResolveEx \"%s\" -> \"%s\"", in, (const char *)(uintptr_t)out);
+}
+
+/* ---------------------------------------------------------------- sockets and nn::ssl: logged */
+static void om_Socket(Ctx *c) {
+    int family = (int)A0, type = (int)A1, proto = (int)A2;
+    g_om_prev_socket(c);
+    om_log("Socket(family %d, type %d = %s, protocol %d) -> %d", family, type, type == 1 ? "TCP" : type == 2 ? "UDP" : "?", proto, (int)c->x[0]);
+}
+static void om_Connect(Ctx *c) {
+    int fd = (int)A0;
+    char to[48];
+    om_addr_text(A1, to, sizeof to);
+    g_om_prev_connect(c);
+    om_log("Connect(fd %d, %s) -> %d", fd, to, (int)c->x[0]);
+}
+static void om_SendTo(Ctx *c) {
+    int fd = (int)A0;
+    uint64_t buf = A1, len = A2;
+    char to[48], what[96];
+    om_addr_text(c->x[4], to, sizeof to);
+    snprintf(what, sizeof what, "SendTo(fd %d, %s)", fd, to);
+    om_hex(what, buf, len);
+    g_om_prev_sendto(c);
+}
+static void om_Send(Ctx *c) {
+    char what[48];
+    snprintf(what, sizeof what, "Send(fd %d)", (int)A0);
+    om_hex(what, A1, A2);
+    g_om_prev_send(c);
+}
+static void om_ssl_SetHostName(Ctx *c) {                   /* (connection, const char *, uint32_t) */
+    char name[256] = "";
+    uint32_t n = (uint32_t)A2;
+    if (A1) { if (n >= sizeof name) n = sizeof name - 1; memcpy(name, (const void *)(uintptr_t)A1, n); name[n] = 0; }
+    om_log("nn::ssl connection host name \"%s\" (no TLS: in the clear)", name);
+    g_om_prev_ssl_host(c);
+}
+
+/* nn::ssl without TLS: both ends are ours (the game and tools/net/nex_probe.py / nex_server.py), so the "TLS" connection
+ * carries the bytes in the clear over its socket. DoHandshake succeeds with no certificate; Read / Write are recv / send. */
+#define OM_SSL_WOULD_BLOCK 0x1987bu                        /* [suyu] ssl ResultWouldBlock {123, 204} */
+#define OM_SSL_IO_ERROR 0xd27bu
+static void om_ssl_DoHandshake(Ctx *c) {                   /* (connection, uint32_t *outCertSize, uint32_t *outCertCount) */
+    uint64_t osize = A1, ocount = A2;
+    SslConn *n = ssl_conn_enter(c, A0);
+    if (!n) return;
+    if (osize) M32(osize) = 0;
+    if (ocount) M32(ocount) = 0;
+    om_log("nn::ssl DoHandshake: no TLS (bytes in the clear to our server)");
+    RET(0);
+}
+static void om_ssl_io(Ctx *c, int write) {                 /* (connection, buffer, int *outSize, uint32_t size) */
+    uint64_t self = A0, buf = A1, out = A2;
+    int size = (int)(uint32_t)A3, k, r = 0;
+    SslConn *n = ssl_conn_enter(c, self);
+    if (!n) return;
+    SoObj *o = n->fd >= 0 ? so_get(n->fd, NULL) : NULL;
+    if (!o) { M32(self + 0x24) = 0xce7bu; RET(0xce7bu); return; }
+    k = write ? send(o->s, (const char *)(uintptr_t)buf, size, 0) : recv(o->s, (char *)(uintptr_t)buf, size, 0);
+    if (k < 0) {
+        int w = WSAGetLastError();
+        r = w == WSAEWOULDBLOCK ? OM_SSL_WOULD_BLOCK : OM_SSL_IO_ERROR;
+        if (r != OM_SSL_WOULD_BLOCK) om_log("nn::ssl %s: socket error %d", write ? "Write" : "Read", w);
+        k = 0;
+    } else om_hex(write ? "ssl Write" : "ssl Read", buf, (uint64_t)k);
+    so_put(o);
+    if (out) M32(out) = (uint32_t)k;
+    M32(self + 0x24) = (uint32_t)r;
+    RET(r);
+}
+static void om_ssl_Read(Ctx *c) { om_ssl_io(c, 0); }
+static void om_ssl_Write(Ctx *c) { om_ssl_io(c, 1); }
+static void om_ssl_Pending(Ctx *c) {                       /* (connection, int *out) */
+    uint64_t self = A0, out = A1;
+    SslConn *n = ssl_conn_enter(c, self);
+    if (!n) return;
+    u_long avail = 0;
+    SoObj *o = n->fd >= 0 ? so_get(n->fd, NULL) : NULL;
+    if (o) { ioctlsocket(o->s, FIONREAD, &avail); so_put(o); }
+    if (out) M32(out) = (uint32_t)avail;
+    M32(self + 0x24) = 0;
+    RET(0);
+}
+static void om_ssl_GetVerifyCertError(Ctx *c) { if (!ssl_conn_enter(c, A0)) return; if (A1) M32(A1) = 0; RET(0); }
+
+static ImportFn om_prev(const char *name) {
+    ImportFn f = import_lookup(name);
+    if (!f) { printf("online menu: no handler for %s\n", name); guest_trap("online menu: missing handler", 0); }
+    return f;
+}
+#define OM_SOK(n) "_ZN2nn6socket" n
+static void online_menu_register(void) {
+    const char *e = getenv("SSBU_ONLINE_MENU");
+    if (!e || e[0] != '1') return;
+    if ((e = getenv("SSBU_ONLINE_MENU_SERVER")) && *e) {
+        struct in_addr a;
+        if (InetPtonA(AF_INET, e, &a) != 1) { printf("[online-menu] SSBU_ONLINE_MENU_SERVER=%s is not an IPv4 address: the Online menu stays off\n", e); return; }
+        snprintf(g_om_server, sizeof g_om_server, "%s", e);
+    }
+    g_om_prev_gai2 = om_prev(OM_SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"));
+    g_om_prev_gainn = om_prev(OM_SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"));
+    g_om_prev_ghbn = om_prev("nnsocketGetHostByNameWithOptions");
+    g_om_prev_resolve = om_prev("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_");
+    g_om_prev_socket = om_prev(OM_SOK("6SocketEiii"));
+    g_om_prev_connect = om_prev(OM_SOK("7ConnectEiPK8sockaddrj"));
+    g_om_prev_sendto = om_prev(OM_SOK("6SendToEiPKvmiPK8sockaddrj"));
+    g_om_prev_send = om_prev(OM_SOK("4SendEiPKvmi"));
+    g_om_prev_ssl_host = om_prev("nnsslConnectionSetHostName");
+    g_om_prev_primary_ip = om_prev("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr");
+    static const ImportDef defs[] = {
+        {"_ZN2nn4nifm18IsNetworkAvailableEv", om_nifm_true}, {"_ZN2nn4nifm22IsNetworkRequestOnHoldEv", om_nifm_false},
+        {"_ZN2nn4nifm20SubmitNetworkRequestEv", om_nifm_keep}, {"_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", om_nifm_keep},
+        {"_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", om_nifm_GetCurrentPrimaryIpAddress},
+        {"_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", om_acc_IsNsaAvailable},
+        {"_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", om_acc_ok},
+        {"_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", om_acc_EnsureIdTokenCacheAsync},
+        {"_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", om_acc_GetNsaId},
+        {"_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", om_acc_LoadCachedNintendoAccountInfo},
+        {"_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", om_acc_LoadIdTokenCache},
+        {"_ZN2nn7account12AsyncContext7HasDoneEPb", om_acc_Async_HasDone}, {"_ZN2nn7account12AsyncContext9GetResultEv", om_acc_Async_GetResult},
+        {"_ZN2nn7account12AsyncContext6CancelEv", om_acc_Async_Cancel},
+        {"_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", om_acc_Async_GetSystemEvent},
+        {"_ZN2nn7account12AsyncContextaSEOS1_", om_acc_Async_move_assign}, {"_ZN2nn7account12AsyncContextD1Ev", om_acc_Async_dtor},
+        {OM_SOK("11GetAddrInfoEPKcS2_PK8addrinfoPPS3_"), om_GetAddrInfo2}, {OM_SOK("11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_"), om_GetAddrInfoNn},
+        {"nnsocketGetHostByNameWithOptions", om_GetHostByNameWithOptions}, {"_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", om_nsd_ResolveEx},
+        {OM_SOK("6SocketEiii"), om_Socket}, {OM_SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), om_Socket}, {"nnsocketSocket", om_Socket},
+        {OM_SOK("7ConnectEiPK8sockaddrj"), om_Connect}, {"nnsocketConnect", om_Connect},
+        {OM_SOK("6SendToEiPKvmiPK8sockaddrj"), om_SendTo}, {OM_SOK("6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj"), om_SendTo},
+        {OM_SOK("4SendEiPKvmi"), om_Send}, {"nnsocketSend", om_Send},
+        {"nnsslConnectionSetHostName", om_ssl_SetHostName},
+        {"nnsslConnectionDoHandshakeWithCertBuffer", om_ssl_DoHandshake}, {"nnsslConnectionRead", om_ssl_Read},
+        {"nnsslConnectionWrite", om_ssl_Write}, {"nnsslConnectionPending", om_ssl_Pending},
+        {"nnsslConnectionGetVerifyCertError", om_ssl_GetVerifyCertError},
+    };
+    register_imports(defs, (int)(sizeof defs / sizeof defs[0]));
+    om_log("ON (phase 0, discovery): network and network service account modelled as available; nintendo.net names -> %s", g_om_server);
+}
