@@ -33,7 +33,7 @@ WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # PRUDP
 LITE_MAGIC = 0x80
 TYPE_SYN, TYPE_CONNECT, TYPE_DATA, TYPE_DISCONNECT, TYPE_PING = 0, 1, 2, 3, 4
-TYPE_NAMES = {0: "SYN", 1: "CONNECT", 2: "DATA", 3: "DISCONNECT", 4: "PING"}
+TYPE_NAMES = {0: "SYN", 1: "CONNECT", 2: "DATA", 3: "DISCONNECT", 4: "PING", 8: "KEEPALIVE?"}
 FLAG_ACK, FLAG_RELIABLE, FLAG_NEED_ACK, FLAG_HAS_SIZE, FLAG_MULTI_ACK = 1, 2, 4, 8, 0x200
 OPT_SUPPORT, OPT_SIGNATURE, OPT_FRAGMENT, OPT_INITIAL_SEQ, OPT_MAX_SUBSTREAM = 0, 1, 2, 3, 4
 
@@ -319,7 +319,24 @@ def datastore_61(client, req):
     return Writer().u("I", 0).bytes()
 
 
+def matchmake_ext_58(client, req):
+    """MatchmakeExtension method 58 (u32: 7 when the player searches Battle Arenas): UNKNOWN. Answered with an empty
+    list (u32 0) to learn what the game does with it."""
+    client.log("%s     MatchmakeExtension 58(%s): an empty list" % (client.who, req.body.hex(" ")))
+    return Writer().u("I", 0).bytes()
+
+
+def matchmake_ext_52(client, req):
+    """MatchmakeExtension method 52, the Battle Arenas search: a MatchmakeSessionSearchCriteria-like structure
+    (attribute strings "0", "1", "7"..., flags) and at the end a ResultRange {offset 0, size 50}. Answered with an empty
+    list of sessions (u32 0) (UNCONFIRMED: the answer type)."""
+    client.log("%s     MatchmakeExtension 52 (arena search): no arenas" % client.who)
+    return Writer().u("I", 0).bytes()
+
+
 HANDLERS = {
+    (109, 52): matchmake_ext_52,
+    (109, 58): matchmake_ext_58,
     (110, 7): get_integer_settings,
     (115, 61): datastore_61,
     (11, 1): register,
@@ -446,6 +463,10 @@ class Client:
         elif p.type == TYPE_DISCONNECT:
             self.send_packet(self.reply_to(p, TYPE_DISCONNECT, FLAG_ACK))
             raise ConnectionError("DISCONNECT")
+        elif p.flags & FLAG_NEED_ACK:
+            # type 8: the game's keep-alive on the secure connection, every 3 s with its own sequence; without an ACK
+            # the game drops the connection after about 50 s (2306-0332)
+            self.send_packet(self.reply_to(p, p.type, FLAG_ACK))
 
     def secure_connect(self, payload):
         """The secure server's CONNECT: Buffer internal ticket (ours: pid u64, session key) + Buffer check data
