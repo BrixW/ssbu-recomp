@@ -27,6 +27,93 @@ static uint64_t fighter_info_record(int id) {
     return info ? sr64(info + 8) : 0;
 }
 
+/* (rollback, 2026-10-28: the black screen after a match) the sound engine's command queue: a ring of 32-byte commands
+ * ("release", "fence", ...) that the game's threads fill and the "nus3::audio update" thread empties (0x7103963010, called
+ * from its loop at 0x7103987bd8) while fences are pending. After rollback matches the main thread waited for ever for room
+ * in it (0x7103737a10 -> 0x710395fd10: "busy" while the ring is full). Its header: 0x7106dd4408 -> {+8 buffer, +0x10 size,
+ * +0x14 write offset, +0x18 read offset, +0x1c wrapped}; pending fences 0x7106dd4520; flags 0x7106dd40c8 / c9. */
+void dm_audio_queue_report(const char *when) {
+    const char *r1_addr_class(uint64_t a);
+    uint64_t hp = 0;
+    if (!safe_read(GA(0x7106dd4408ULL), &hp, 8) || !hp) { printf("r1: AUDIO QUEUE (%s): not made yet\n", when); fflush(stdout); return; }
+    uint8_t h[0x20];
+    if (!safe_read(hp, h, sizeof h)) { printf("r1: AUDIO QUEUE (%s): header %llx not readable\n", when, (unsigned long long)hp); fflush(stdout); return; }
+    uint64_t buf; uint32_t size, wr, rd, wrapped, fences = 0, tag = 0, tag_w = 0; uint8_t c8 = 0, c9 = 0;
+    memcpy(&buf, h + 8, 8); memcpy(&size, h + 0x10, 4); memcpy(&wr, h + 0x14, 4); memcpy(&rd, h + 0x18, 4); memcpy(&wrapped, h + 0x1c, 4);
+    safe_read(GA(0x7106dd4520ULL), &fences, 4); safe_read(GA(0x7106dd40c8ULL), &c8, 1); safe_read(GA(0x7106dd40c9ULL), &c9, 1);
+    uint32_t used = wr >= rd ? wr - rd : size - rd + wr;
+    int rd_ok = buf && rd < size && safe_read(buf + rd, &tag, 4);
+    if (buf && wr >= 0x20 && wr <= size) safe_read(buf + wr - 0x20, &tag_w, 4);
+    char t1[5] = "????", t2[5] = "????";
+    if (rd_ok) memcpy(t1, &tag, 4);
+    memcpy(t2, &tag_w, 4);
+    for (int k = 0; k < 4; k++) { if (t1[k] < 0x20 || t1[k] > 0x7e) t1[k] = '.'; if (t2[k] < 0x20 || t2[k] > 0x7e) t2[k] = '.'; }
+    printf("r1: AUDIO QUEUE (%s): header %llx (%s), buffer %llx (%s), size %u, write %u, read %u: %u bytes used (%.0f%%), wrapped %u; fences pending %u; flags c8 %u c9 %u; at the read offset \"%s\", last written \"%s\"\n",
+           when, (unsigned long long)hp, r1_addr_class(hp), (unsigned long long)buf, buf ? r1_addr_class(buf) : "-", size, wr, rd, used, size ? 100.0 * used / size : 0.0, wrapped, fences, c8, c9, t1, t2);
+    fflush(stdout);
+}
+
+/* (rollback, 2026-10-28) with SSBU_RB_AUDIO_OFF the audio threads are held for the whole fight, so the queue above is full a
+ * few seconds into it (test45: 131064 of 131072 bytes, 539 fences pending) and stays full: at the end of the fight the backlog
+ * either kept the main thread waiting for room for ever (the black screen) or, once the audio thread took it, ended the game
+ * (std::terminate). Called at the end of the fight, while the audio threads are still held and the main thread is at the
+ * ring's safe point (nothing else uses the queue): the backlog is dropped (read offset = write offset, no fence pending). The
+ * objects that the dropped "release" commands would have let go are not freed (counted in the log line). SSBU_RB_AUDIO_DROPQ=0: off. */
+/* (test48 / test49: dropping the backlog is not enough: an object a dropped command was for stays "busy" (+ 0x6d, set by the
+ * audio thread when it has run the object's commands) and the main thread waits for it for ever. So the queue is no longer
+ * left to fill: dm_audio_pump below empties it at every pass. The drop stays as a test switch: SSBU_RB_AUDIO_DROPQ=1.) */
+void dm_audio_queue_drop(void) {
+    { const char *e = getenv("SSBU_RB_AUDIO_DROPQ"); if (!(e && e[0] == '1')) return; }
+    uint64_t hp = 0; uint8_t h[0x20]; uint32_t fences = 0;
+    if (!safe_read(GA(0x7106dd4408ULL), &hp, 8) || !hp || !safe_read(hp, h, sizeof h)) return;
+    uint64_t buf; uint32_t size, wr, rd;
+    memcpy(&buf, h + 8, 8); memcpy(&size, h + 0x10, 4); memcpy(&wr, h + 0x14, 4); memcpy(&rd, h + 0x18, 4);
+    safe_read(GA(0x7106dd4520ULL), &fences, 4);
+    if (!buf || !size || wr >= size || rd >= size || (wr == rd && !fences)) return;
+    /* (test47: dropping the commands alone left the main thread waiting for an object to be idle: a command holds its object,
+     * + 0x10 of the command, by one count at + 0x3c that the audio thread gives back after running it, 0x71039636cc. So every
+     * dropped command gives its count back here, as the audio thread would.) */
+    int releases = 0, cmds = 0, held = 0;               /* (counted: commands of the backlog, "release" ones, object counts given back) */
+    for (uint32_t o = rd, n = 0; o != wr && n < size / 0x20 + 2; n++) {
+        uint32_t w[2] = {0, 0};
+        if (!safe_read(buf + o, w, 8)) break;
+        if (w[0] == 0x64716e62u) { o = 0; continue; }   /* (the wrap marker: the next command is at the start) */
+        if (w[0] != 0x70716e62u) break;
+        uint32_t id = 0; uint64_t ob = 0; int32_t cnt = 0;
+        safe_read(buf + o + 8, &id, 4);
+        cmds++; if (id == 0x656c6572u) releases++;     /* "rele" */
+        if (safe_read(buf + o + 0x10, &ob, 8) && ob && safe_read(ob + 0x3c, &cnt, 4) && cnt > 0) {
+            InterlockedDecrement((volatile LONG *)(uintptr_t)(ob + 0x3c)); held++;
+        }
+        o = (o + ((w[1] + 3) & ~3u) + 8) % size;
+    }
+    *(volatile uint32_t *)(uintptr_t)(hp + 0x18) = wr;
+    *(volatile uint32_t *)(uintptr_t)(hp + 0x1c) = 0;
+    wr32(GA(0x7106dd4520ULL), 0);
+    printf("r1: AUDIO QUEUE: the fight's backlog dropped at its end: %u bytes, %d commands (%d of them \"release\": not freed), %d object counts given back, %u fences (SSBU_RB_AUDIO_DROPQ=0: off)\n",
+           wr >= rd ? wr - rd : size - rd + wr, cmds, releases, held, fences);
+    fflush(stdout);
+}
+
+/* (rollback, 2026-10-28) the audio threads are held for the whole fight (SSBU_RB_AUDIO_OFF: running beside the ring's loads
+ * crashed them), so nobody emptied the sound engine's command queue (above). Now the main thread runs the audio thread's own
+ * step that empties it (0x7103963010, as the audio thread's loop calls it at 0x7103987bd8: only when + 0x838 is set) at every
+ * pass of the fight, at the ring's safe point: the queue never fills, and the engine's state it changes is guest memory the
+ * ring saves and restores with the rest of the frame (nothing runs beside a load any more). The registers of the main thread
+ * are put back after it. SSBU_RB_AUDIO_PUMP=0: off. */
+void dm_audio_pump(Ctx *c) {
+    static int on = -1; static long long runs, skipped;
+    if (on < 0) { const char *e = getenv("SSBU_RB_AUDIO_PUMP"); on = !(e && e[0] == '0'); printf("r1: AUDIO PUMP %s: the main thread empties the sound engine's command queue at every pass of a fight while the audio threads are held (SSBU_RB_AUDIO_PUMP)\n", on ? "on" : "OFF"); fflush(stdout); }
+    if (!on) return;
+    uint8_t ready = 0; uint64_t eng = 0; uint32_t fences = 0;
+    if (!safe_read(GA(0x7106dd43a8ULL), &ready, 1) || ready != 1 || !safe_read(GA(0x7106dd4838ULL), &eng, 8) || !eng || !safe_read(GA(0x7106dd4520ULL), &fences, 4) || !fences) { skipped++; return; }
+    Ctx keep = *c;
+    c->x[31] = (c->x[31] - 0x400) & ~15ull;              /* (below the live frames of the pass) */
+    call_guest(c, GA(0x7103963010ULL));
+    *c = keep;
+    if (++runs == 1 || runs % 3000 == 0) { printf("r1: AUDIO PUMP: %lld runs (%lld passes with nothing to do); after the last, fences pending %u\n", runs, skipped, rd32(GA(0x7106dd4520ULL))); fflush(stdout); }
+}
+
 /* SSBU_DEBUG_SCAN=1: once, when entry 1's record exists, every other copy of the pattern in it (HP 999.0 followed by
  * ff bytes, record + 0x40) in committed memory is printed with 0x60 bytes in front of it: finds the structure the record was built from. */
 static void scan_copies(uint64_t rec) {

@@ -26,6 +26,7 @@ int rgs_wanted(void) {
  * processes on the PC disturb much less than wall time (A/B of builds on a busy PC) */
 static ULONG64 g_rgs_cyc0; static double g_rgs_cyc[2];
 ULONG64 rgs_cyc_now(void) { ULONG64 v = 0; QueryThreadCycleTime(GetCurrentThread(), &v); return v; }
+static int g_rgs_newfight;                               /* (2026-10-28) a fight ended: the next one makes the ring's base again (it kept fight 1's base: fight 2 froze) */
 /* at the safe point (H2) of every pass while the fight runs */
 void rgs_step(Ctx *c) {
     double t = now_ms(); ULONG64 cy = rgs_cyc_now();
@@ -38,6 +39,18 @@ void rgs_step(Ctx *c) {
     }
     if (g_rgs_polls_cur > 1) g_rgs_multi++;
     g_rgs_polls_cur = 0;
+    {   static int was_on; void dm_audio_queue_report(const char *when);      /* (2026-10-28) the sound engine's command queue at the start and end of each fight */
+        int on = !g_ra_off && ra_fight_on();
+        if (on != was_on) {
+            dm_audio_queue_report(on ? "fight start" : "fight over, before the audio threads are let go");
+            if (!on && !rbg_on()) g_rgs_newfight = 1;     /* (the simulation: the next fight makes the ring's base again) */
+            if (!on && g_rb_audio_off) {                  /* (the audio threads were held for the fight: its backlog is dropped while they still are) */
+                int rb_audio_wait_parked(double max_ms); void dm_audio_queue_drop(void);
+                if (rb_audio_wait_parked(50)) dm_audio_queue_drop(); else LOG("r1: AUDIO QUEUE: an audio thread still runs at the end of the fight: the backlog is left as it is\n");
+            }
+            was_on = on;
+        }
+        if (on && g_rb_audio_off) { void dm_audio_pump(Ctx *c); dm_audio_pump(c); } }   /* (the audio threads are held: the main thread empties the sound engine's queue at every pass) */
     if (g_ra_off || !ra_fight_on()) { void rb_audio_fight_over(void); ls_fight_over(); InterlockedExchange(&g_rb_audio_off, 0); rb_audio_fight_over(); if (g_ra_phase) g_ra_after_quiet = 1; g_ra_phase = 0; g_rgs_left = 0; g_rgs_pass_t0 = 0; if (rbg_on()) rbg_fight_off(); return; }   /* (R3: the report once at the end of each match; hs12: the session reset for the next match) */
     if (rbg_on()) { rbg_step(c); g_rgs_pass_t0 = now_ms(); g_rgs_cyc0 = rgs_cyc_now(); g_ra_t_mark = g_rgs_pass_t0; return; }      /* R3: online rollback */
     long long i = g_rgs_next;                             /* the pass that ended here */
@@ -55,6 +68,13 @@ void rgs_step(Ctx *c) {
             g_rgs_pass_t0 = now_ms(); g_ra_t_mark = g_rgs_pass_t0;
             return;
         }
+    }
+    if (g_rgs_newfight && g_rg_ready) {                   /* (2026-10-28) a new fight in this session: the ring's base made again, as online play does at each match (rollback_controller.c) */
+        if (!r1_ring_rebase(i, c)) { g_rgs_pass_t0 = now_ms(); return; }      /* (no quiet moment: the next pass) */
+        g_rgs_newfight = 0; g_ra_phase = 0; g_rgs_left = 0; g_rgs_real_since = 0; g_rgs_next = i + 1;
+        LOG("r1: RB SIM: a new fight: the ring's base made again at pass %lld (fight frame %lld)\n", i, g_session.fight_frame);
+        g_rgs_pass_t0 = now_ms(); g_ra_t_mark = g_rgs_pass_t0;
+        return;
     }
     int ok = 0, rebased = 0;
     if (g_ra_phase == 0 && g_rg_ready) { int rb_maybe_rebase(long long, Ctx *); g_rg_keep = 0; if (rb_maybe_rebase(i, c)) { ok = 1; rebased = 1; } }   /* OPTION 1: pages committed outside the ring brought in by remaking the base (snapshot_ring.c) */
@@ -506,6 +526,7 @@ void rgs_report(void) {
         { extern long long g_rg_audio_busy; extern int rb_audio_running(void); if (g_rg_audio_busy) LOG("r1: AUDIO: %lld loads waited for an audio thread to park (running now: %d)\n", g_rg_audio_busy, rb_audio_running()); }
         { extern volatile LONG64 g_xls_out_commit, g_xls_out_write; LOG("r1: PAGES OUTSIDE THE RING in fights so far: %lld committed, %lld written by the host (never saved or restored)\n", (long long)g_xls_out_commit, (long long)g_xls_out_write); }
         { extern volatile LONG64 g_hw_fight, g_hw_rerun; LOG("r1: HOST WRITES reported in fights so far: %lld, of them in re-run passes %lld (SSBU_RB_HOSTWRITES=1 lists them)\n", (long long)g_hw_fight, (long long)g_hw_rerun); }
+        { void dm_audio_queue_report(const char *when); dm_audio_queue_report("in the fight"); }
         LOG("r1: RB SIM: %lld rollbacks (k: 1 %lld, 2 %lld, 3 %lld, 4 %lld, 5 %lld, 6 %lld, 7 %lld), captures failed %lld, re-run pads missing %lld, passes with more than one poll %lld\n",
             g_rgs_done, g_rgs_ksum[1], g_rgs_ksum[2], g_rgs_ksum[3], g_rgs_ksum[4], g_rgs_ksum[5], g_rgs_ksum[6], g_rgs_ksum[7], g_rgs_nocap, g_rgs_padmiss, g_rgs_multi);
         LOG("r1: RB SIM passes (safe point to safe point, without the capture / load): real %lld mean %.3f median %.3f ms; re-run %lld mean %.3f median %.3f ms (kick skip mask in re-run passes but the last: %d)\n",

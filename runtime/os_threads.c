@@ -424,8 +424,38 @@ static void movie_preroll_diag(Ctx *c) {
         (long long)((rd64(ar + 0x78) - rd64(ar + 0x70)) / 0x40), (long long)((rd64(ar + 0x60) - rd64(ar + 0x58)) / 0x18), (int)rd32(ar + 0x40));
     printf("%c", 10);
 }
+/* (rollback, 2026-10-28: the black screen after a match) the main thread waited for ever in 0x7103737a10, sleeping 1 ms a
+ * time: either for room in the sound engine's command queue (sleep returns to 0x7103737b40) or for the object it releases
+ * (+ 0x10 of the handle in x19) to be idle (its vtable + 0x20 returns 1; sleep returns to 0x7103737bac). After 2 s of it,
+ * once: the handle, the object and its vtable entry, to see what it still waits for. */
+static int sl_peek(uint64_t a, void *out, size_t n) { SIZE_T got = 0; return a >= 0x10000 && ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)a, out, n, &got) && got == n; }
+static void sleep_wait_diag(Ctx *c) {
+    static __declspec(thread) int n;                    /* (per thread: the other threads' sleeps must not reset it) */
+    static __declspec(thread) uint64_t last;
+    static volatile LONG told, told_other;
+    uint64_t lr = c->x[30];
+    if (lr != last) { last = lr; n = 0; }
+    if (++n != 2000) return;
+    if (lr < 0x7103737a10ull || lr >= 0x7103737cd0ull) {  /* (any other place a thread sleeps 2000 times in a row from: said, in case the return address is not where expected) */
+        if (InterlockedIncrement(&told_other) <= 10) { printf("r1: SOUND WAIT: (another place) thread %lu slept 2000 times in a row returning to %llx (fn %llx), x19 %llx\n", (unsigned long)GetCurrentThreadId(), (unsigned long long)lr, (unsigned long long)c->fn, (unsigned long long)c->x[19]); fflush(stdout); }
+        return;
+    }
+    if (told >= 3) return;
+    InterlockedIncrement(&told);
+    uint64_t h = c->x[19], ob = 0, vt = 0, fn = 0; uint32_t hw[24] = {0}, ow[24] = {0};
+    sl_peek(h, hw, sizeof hw); sl_peek(h + 0x10, &ob, 8);
+    if (ob) { sl_peek(ob, &vt, 8); sl_peek(ob, ow, sizeof ow); }
+    if (vt) sl_peek(vt + 0x20, &fn, 8);
+    printf("r1: SOUND WAIT: the main thread has slept 2 s in 0x7103737a10 (return address %llx: %s); handle x19 %llx, object %llx, vtable %llx, its + 0x20 %llx\n",
+           (unsigned long long)lr, lr == 0x7103737b40ull ? "waiting for room in the command queue" : lr == 0x7103737bacull ? "waiting for the object to be idle" : "?",
+           (unsigned long long)h, (unsigned long long)ob, (unsigned long long)vt, (unsigned long long)fn);
+    for (int k = 0; k < 24; k += 8) printf("r1: SOUND WAIT:   handle + %02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", k * 4, hw[k], hw[k + 1], hw[k + 2], hw[k + 3], hw[k + 4], hw[k + 5], hw[k + 6], hw[k + 7]);
+    for (int k = 0; k < 24; k += 8) printf("r1: SOUND WAIT:   object + %02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", k * 4, ow[k], ow[k + 1], ow[k + 2], ow[k + 3], ow[k + 4], ow[k + 5], ow[k + 6], ow[k + 7]);
+    fflush(stdout);
+}
 static void os_SleepThread(Ctx *c) {
     movie_preroll_diag(c);
+    sleep_wait_diag(c);
     if ((int64_t)A0 > 1000000000ll) {                    /* a sleep over one second is rare: say who asked and for how long (a deadline computed from a clock the game keeps in its memory can come out huge after a rollback) */
         static LONG lines; if (InterlockedIncrement(&lines) <= 20) printf("nn::os::SleepThread: asked to sleep %lld ms (%llx ns) by f_%llx (return address %llx)\n", (long long)((int64_t)A0 / 1000000ll), (unsigned long long)A0, (unsigned long long)c->fn, (unsigned long long)c->x[30]);
     }

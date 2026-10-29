@@ -174,6 +174,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
     {   static char mw[4096]; if (os_mutex_waits_text(mw, sizeof mw)) wdp("%s", mw); else wdp("  mutex waits (guest mutexes a thread found taken): none\n"); }
+    {   void dm_audio_queue_report(const char *when); dm_audio_queue_report("no frame presented (watchdog)"); }     /* (2026-10-28) the black screen after a match */
 #ifdef _WIN32
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
