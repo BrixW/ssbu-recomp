@@ -44,6 +44,35 @@ def ini_on(path, key):
     return False
 
 
+def ini_get(path, key):
+    """The value of `key` in a graphics.ini (lower case, comments cut), or None when the file or the key is missing."""
+    try:
+        with open(path, encoding='utf-8-sig', errors='replace') as f:
+            for line in f:
+                k, sep, v = line.partition('=')
+                if sep and k.strip().lower() == key:
+                    return v.split('#')[0].split(';')[0].strip().lower()
+    except OSError:
+        pass
+    return None
+
+
+# (fork Rsoto95/ssbu-recomp, 2026-10-28) "Play SSBU.bat" plays as the group plays, with nothing to set up: online play
+# through Roberto's lobby over the Radmin network (F1 > Arena: the queue of 1-on-1 rollback matches) with rollback on and
+# the settings the tests of 2026-10-28 used. In config\graphics.ini, rollback = off turns all of it off and group_lobby = off
+# keeps the rest but connects as F1 > Online says; an --env given to run.py wins over all of them.
+PLAY_LOBBY = '26.190.211.56:39500'
+PLAY_DEFAULTS = {
+    'SSBU_RB_NET_DELAY': '3',        # input delay in frames, the same on every PC
+    'SSBU_LATENCY': 'low',
+    'SSBU_LS_X_WW': '1',             # the ring tracks the writes to the big extras ranges with GetWriteWatch
+    'SSBU_RB_AUDIO_OFF': '1',        # the audio threads held in a fight (the main thread empties their queue: SSBU_RB_AUDIO_PUMP)
+    'SSBU_RB_SIM_SKIP': '0',         # re-run passes do the whole presentation work (the blue / black fighters)
+    'SSBU_RB_SIM_LITE': '0',
+    'SSBU_RB_NET_LASTLITE': '0',
+}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--userdata', help='the save folder (required, except with --play)')
@@ -125,7 +154,8 @@ def main():
         state = json.load(f)
     work = os.path.join(a.build, 'work')
     rollback = False
-    if a.play and a.exe == main_exe and not (a.linux or a.mac) and ini_on(os.path.join(a.build, 'config', 'graphics.ini'), 'rollback'):
+    gini = os.path.join(a.build, 'config', 'graphics.ini')
+    if a.play and a.exe == main_exe and not (a.linux or a.mac) and ini_get(gini, 'rollback') not in ('off', '0', 'no', 'false'):   # (fork: on unless graphics.ini says off)
         # F1 > Experimental > Rollback netcode: the normal exe and game DLL with SSBU_RB_NET (since R4 the ring saves the fight on
         # the normal build: runtime/rb_learned.c); the old pair ssbu_native_rb.exe + ssbu_game_r1.dll of an older install is not used
         rollback = True
@@ -179,6 +209,12 @@ def main():
         env['SSBU_FIXED_SEED'] = a.seed
     if rollback and 'SSBU_RB_NET' not in env:
         env['SSBU_RB_NET'] = 'net'                    # rollback over the online connection (net_relay); needs online play on
+    if a.play and rollback:                           # (fork) the group's settings and lobby, see PLAY_DEFAULTS
+        for k, v in PLAY_DEFAULTS.items():
+            env.setdefault(k, v)
+        if ini_get(gini, 'group_lobby') not in ('off', '0', 'no', 'false'):   # (graphics.ini group_lobby = off: F1 > Online's mode instead)
+            env.setdefault('SSBU_ONLINE', PLAY_LOBBY)
+        print('Online: lobby %s (F1 > Arena to play), rollback on, input delay %s' % (env.get('SSBU_ONLINE', 'from graphics.ini'), env['SSBU_RB_NET_DELAY']))
     if a.mac and not (env.get('VK_DRIVER_FILES') or env.get('VK_ICD_FILENAMES')):
         # MoltenVK (the Vulkan driver on Metal) named for Homebrew's Vulkan loader, as play_mac.sh does: run.py started by hand
         icd = next((p for p in ('/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json', '/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json',
