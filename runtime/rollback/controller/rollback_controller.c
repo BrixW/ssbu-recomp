@@ -438,29 +438,33 @@ void rbg_step(Ctx *c) {
  * The owner chose to close it automatically: from the end of the match, every A this PC's player presses is pressed for
  * port 2 too (its card closes with ours), at most RBG_AFTER_PRESSES times, for RBG_AFTER_MS, and never once the next match
  * is on. Only A: port 2's stick and other buttons stay idle (on the character select they would act for player 2).
- * SSBU_RB_NET_AFTER=0: off. */
-#define RBG_AFTER_MS 45000.0
-#define RBG_AFTER_PRESSES 3
-static double g_rbg_after_t0; static int g_rbg_after_n, g_rbg_after_hold, g_rbg_after_down;
+ * SSBU_RB_NET_AFTER=0: off. (v13, owner 2026-10-28: with 3 presses the A's pressed through "GAME!" and the winner's
+ * animation used them all up before the cards came: 10 presses and 60 s; each press given is logged with its time.) */
+#define RBG_AFTER_MS 60000.0
+#define RBG_AFTER_PRESSES 10
+static double g_rbg_after_t0; static int g_rbg_after_n, g_rbg_after_hold, g_rbg_after_down, g_rbg_after_polls;
 static void rbg_after_begin(void) {
     const char *e = getenv("SSBU_RB_NET_AFTER");
     if (e && e[0] == '0') return;
-    g_rbg_after_t0 = now_ms(); g_rbg_after_n = g_rbg_after_hold = 0; g_rbg_after_down = 1;      /* (an A held at the end of the fight is not a press) */
+    g_rbg_after_t0 = now_ms(); g_rbg_after_n = g_rbg_after_hold = g_rbg_after_polls = 0; g_rbg_after_down = 1;      /* (an A held at the end of the fight is not a press) */
     LOG("r1: RB NET: results screen: player 2's card is closed with player 1's A (at most %d presses, %.0f s)\n", RBG_AFTER_PRESSES, RBG_AFTER_MS / 1000.0);
 }
 static int rbg_after(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {   /* 1 = port id's pad was given */
     if (now_ms() - g_rbg_after_t0 > RBG_AFTER_MS || rbn_started() || (g_rbg_after_n >= RBG_AFTER_PRESSES && !g_rbg_after_hold)) {
-        LOG("r1: RB NET: results screen: player 2's A given %d times, done\n", g_rbg_after_n);
+        LOG("r1: RB NET: results screen: player 2's A given %d times (port 2 read %d times with A down), done\n", g_rbg_after_n, g_rbg_after_polls);
         g_rbg_after_t0 = 0; return 0;
     }
     if (id == 0) {
         int down = (*b & 1) != 0;                       /* A (nnhid.c BTN_A) */
-        if (down && !g_rbg_after_down && g_rbg_after_n < RBG_AFTER_PRESSES) { g_rbg_after_n++; g_rbg_after_hold = 6; }
+        if (down && !g_rbg_after_down && g_rbg_after_n < RBG_AFTER_PRESSES) {
+            g_rbg_after_n++; g_rbg_after_hold = 6;
+            LOG("r1: RB NET: results screen: A %d of player 1 at %.1f s after the match: given to player 2 too\n", g_rbg_after_n, (now_ms() - g_rbg_after_t0) / 1000.0);
+        }
         g_rbg_after_down = down;
         return 0;                                       /* player 1's own pad is untouched */
     }
     *b = 0; *lx = *ly = *rx = *ry = 0;
-    if (g_rbg_after_hold > 0) { *b = 1; g_rbg_after_hold--; }
+    if (g_rbg_after_hold > 0) { *b = 1; g_rbg_after_hold--; g_rbg_after_polls++; }
     return 1;
 }
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
