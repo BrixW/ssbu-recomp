@@ -433,8 +433,39 @@ void rbg_step(Ctx *c) {
                      : "rbx", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
     tib->StackBase = ob; tib->StackLimit = ol;
 }
+/* (v12, owner 2026-10-28: "no me deja cerrar el de mi amigo") THE RESULTS SCREEN after an agreed match: the session is reset
+ * at the end of the fight, so port 2 (the other player) gets no input any more and its card waits for an A that never comes.
+ * The owner chose to close it automatically: from the end of the match, every A this PC's player presses is pressed for
+ * port 2 too (its card closes with ours), at most RBG_AFTER_PRESSES times, for RBG_AFTER_MS, and never once the next match
+ * is on. Only A: port 2's stick and other buttons stay idle (on the character select they would act for player 2).
+ * SSBU_RB_NET_AFTER=0: off. */
+#define RBG_AFTER_MS 45000.0
+#define RBG_AFTER_PRESSES 3
+static double g_rbg_after_t0; static int g_rbg_after_n, g_rbg_after_hold, g_rbg_after_down;
+static void rbg_after_begin(void) {
+    const char *e = getenv("SSBU_RB_NET_AFTER");
+    if (e && e[0] == '0') return;
+    g_rbg_after_t0 = now_ms(); g_rbg_after_n = g_rbg_after_hold = 0; g_rbg_after_down = 1;      /* (an A held at the end of the fight is not a press) */
+    LOG("r1: RB NET: results screen: player 2's card is closed with player 1's A (at most %d presses, %.0f s)\n", RBG_AFTER_PRESSES, RBG_AFTER_MS / 1000.0);
+}
+static int rbg_after(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {   /* 1 = port id's pad was given */
+    if (now_ms() - g_rbg_after_t0 > RBG_AFTER_MS || rbn_started() || (g_rbg_after_n >= RBG_AFTER_PRESSES && !g_rbg_after_hold)) {
+        LOG("r1: RB NET: results screen: player 2's A given %d times, done\n", g_rbg_after_n);
+        g_rbg_after_t0 = 0; return 0;
+    }
+    if (id == 0) {
+        int down = (*b & 1) != 0;                       /* A (nnhid.c BTN_A) */
+        if (down && !g_rbg_after_down && g_rbg_after_n < RBG_AFTER_PRESSES) { g_rbg_after_n++; g_rbg_after_hold = 6; }
+        g_rbg_after_down = down;
+        return 0;                                       /* player 1's own pad is untouched */
+    }
+    *b = 0; *lx = *ly = *rx = *ry = 0;
+    if (g_rbg_after_hold > 0) { *b = 1; g_rbg_after_hold--; }
+    return 1;
+}
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
 void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
+    if (!g_rbg_in_match && g_rbg_after_t0 > 0 && (id == 0 || id == 1) && rbg_after(id, b, lx, ly, rx, ry)) return;
     if (g_rbg_in_match == 2 && (id == 0 || id == 1)) {  /* (hs12) a match that was not agreed: this PC's player 1 pauses, then holds L + R + A (the game's own way out of a match), again every 4 s */
         /* (debug_mode.c makes it Final Destination with one stock) player 1 walks off the left edge for 20 s, which ends the
          * match the game's own way (results, then the stage select and the character select: run hw2 showed that pause +
@@ -477,7 +508,7 @@ void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
 void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     rb_fault_report();                                  /* once per match: the safety net and the quiet states (fault_recovery.c, snapshot_ring.c) */
-    if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
+    if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; rbg_after_begin(); }
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
