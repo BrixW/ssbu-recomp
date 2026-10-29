@@ -1508,7 +1508,7 @@ static int start_host(void) {                   /* HOST mode: the lobby in this 
 #define BEACON_GROUP "239.255.13.13"
 static volatile LONG64 g_lan_lobby_id;          /* our own in-game lobby (0: none) */
 static uint16_t g_lan_lobby_port;
-static struct { SRWLOCK lock; struct sockaddr_in at; uint64_t id; int pending; } g_switch = {SRWLOCK_INIT};
+static struct { SRWLOCK lock; struct sockaddr_in at; uint64_t id, cur; int pending; } g_switch = {SRWLOCK_INIT};   /* cur: the id of the lobby this game (not a lobby itself) is in or going to */
 static SOCKET g_beacon = INVALID_SOCKET;
 static SOCKET beacon_socket(void) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1565,6 +1565,11 @@ static DWORD WINAPI beacon_thread(LPVOID unused) {    /* sends our lobby's beaco
         int players = 0, rooms = 0;
         if (mine) minilobby_counts(&players, &rooms);
         if (mine && (id > mine || players > 1 || nnldn_players())) continue;
+        /* (2026-10-29: three players, two lobbies on the network) a game that is not a lobby took every beacon it heard as the
+         * lobby to join: with two lobbies it went from one to the other at each beacon and was disconnected each time. Now it
+         * stays in the lobby it is in while it is joined; not joined, it goes to a lobby of a smaller id (the one that stays,
+         * as above) or, when its lobby has not let it in for GONE_AFTER_MS (a firewall in front of that lobby), to another. */
+        if (!mine && g_switch.cur && id != g_switch.cur && (g_joined || (id > g_switch.cur && ms_now() - g_unjoined_since < GONE_AFTER_MS))) continue;
         AcquireSRWLockExclusive(&g_switch.lock);
         if (g_switch.id != id) { g_switch.at = from; g_switch.at.sin_port = htons(port); g_switch.id = id; g_switch.pending = 1; }
         ReleaseSRWLockExclusive(&g_switch.lock);
@@ -1588,7 +1593,7 @@ static int start_lan(void) {                    /* LAN mode: find the network's 
     Sleep(1500 + (DWORD)(rnd64() % 500));
     AcquireSRWLockExclusive(&g_switch.lock);
     int found = g_switch.pending;
-    if (found) { g_lobby = g_switch.at; g_switch.pending = 0; }
+    if (found) { g_lobby = g_switch.at; g_switch.cur = g_switch.id; g_switch.pending = 0; }
     ReleaseSRWLockExclusive(&g_switch.lock);
     if (found) { bind_client(0); say("lan: found the lobby of this network at %s:%u", ip_text(ntohl(g_lobby.sin_addr.s_addr), a), ntohs(g_lobby.sin_port)); return 1; }
     bind_client(0);
@@ -1600,6 +1605,7 @@ static void lan_switch_if_asked(void) {         /* (client thread) another netwo
     int go = g_switch.pending;
     struct sockaddr_in at = g_switch.at;
     g_switch.pending = 0;
+    if (go) g_switch.cur = g_switch.id;
     ReleaseSRWLockExclusive(&g_switch.lock);
     if (!go || same_at(&at, &g_lobby)) return;
     char a[16];
