@@ -58,7 +58,7 @@ def ini_get(path, key):
 
 
 # (fork Rsoto95/ssbu-recomp, 2026-10-28) "Play SSBU.bat" plays as the group plays, with nothing to set up: online play
-# through Roberto's lobby over the Radmin network (F1 > Arena: the queue of 1-on-1 rollback matches) with rollback on and
+# through Roberto's lobby over the Radmin network (the game's Local Wireless rooms: 1-on-1 rooms play with rollback) with rollback on and
 # the settings the tests of 2026-10-28 used. In config\graphics.ini, rollback = off turns all of it off and group_lobby = off
 # keeps the rest but connects as F1 > Online says; an --env given to run.py wins over all of them.
 PLAY_LOBBY = '26.190.211.56:39500'
@@ -214,7 +214,7 @@ def main():
             env.setdefault(k, v)
         if ini_get(gini, 'group_lobby') not in ('off', '0', 'no', 'false'):   # (graphics.ini group_lobby = off: F1 > Online's mode instead)
             env.setdefault('SSBU_ONLINE', PLAY_LOBBY)
-        print('Online: lobby %s (F1 > Arena to play), rollback on, input delay %s' % (env.get('SSBU_ONLINE', 'from graphics.ini'), env['SSBU_RB_NET_DELAY']))
+        print('Online: lobby %s (play in Local Wireless rooms: 1-on-1 rooms use rollback), rollback on, input delay %s' % (env.get('SSBU_ONLINE', 'from graphics.ini'), env['SSBU_RB_NET_DELAY']))
     if a.mac and not (env.get('VK_DRIVER_FILES') or env.get('VK_ICD_FILENAMES')):
         # MoltenVK (the Vulkan driver on Metal) named for Homebrew's Vulkan loader, as play_mac.sh does: run.py started by hand
         icd = next((p for p in ('/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json', '/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json',
