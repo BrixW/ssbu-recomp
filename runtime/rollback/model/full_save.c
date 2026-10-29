@@ -20,6 +20,23 @@ void save(Ctx *c) {
         MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
         double need = (g_rs_drop ? 1.0 : 2.0) * tot / 1048576.0 + 512.0, avail = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPageFile / 1048576.0 : 1e12;
         g_save_need_mb = need; g_save_avail_mb = avail;
+        /* (2026-10-29: a PC with 64 GB of RAM ran a match without rollback: 3374 MB of free commit, 160 MB short, and a page
+         * file "managed by Windows" of 4 GB at that moment) the free commit is only the room under the CURRENT limit: a page
+         * file Windows manages, or one with a larger maximum, grows when a commit asks for it. So when it looks short, the
+         * whole amount is asked for once (committed, never touched, released at once): if Windows grew the page file for it,
+         * the free commit is read again and the save goes on. */
+        if (rb_test_nomem() != 1 && avail < need + 1024.0) {
+            size_t ask = (size_t)((need + 1024.0) * 1048576.0);
+            void *probe = VirtualAlloc(NULL, ask, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (probe) {
+                VirtualFree(probe, 0, MEM_RELEASE);
+                double was = avail;
+                avail = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPageFile / 1048576.0 : 1e12;
+                g_save_avail_mb = avail;
+                LOG("r1: FULL SAVE: free commit %.0f MB looked short (needs %.0f + 1024 MB): Windows granted it (page file grown): %.0f MB free now\n", was, need, avail);
+                if (avail < need + 1024.0) avail = need + 1024.0;    /* (granted once: Windows can grant it again) */
+            }
+        }
         if (rb_test_nomem() == 1 || avail < need + 1024.0) {
             LOG("r1: FULL SAVE NOT MADE: not enough free commit memory: it needs %.0f MB (+ 1024 MB left for the game), %.0f MB free%s\n", need, avail, rb_test_nomem() == 1 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=1)" : "");
             g_save_failed = 2; return;
