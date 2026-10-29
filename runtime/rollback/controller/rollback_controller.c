@@ -439,9 +439,10 @@ void rbg_step(Ctx *c) {
  * port 2 too (its card closes with ours), at most RBG_AFTER_PRESSES times, for RBG_AFTER_MS, and never once the next match
  * is on. Only A: port 2's stick and other buttons stay idle (on the character select they would act for player 2).
  * SSBU_RB_NET_AFTER=0: off. (v13, owner 2026-10-28: with 3 presses the A's pressed through "GAME!" and the winner's
- * animation used them all up before the cards came: 10 presses and 60 s; each press given is logged with its time.) */
-#define RBG_AFTER_MS 60000.0
-#define RBG_AFTER_PRESSES 10
+ * animation used them all up before the cards came: 10 presses and 60 s; each press given is logged with its time.)
+ * (owner 2026-10-29: 10 were still used up before the cards closed: 100 presses and 3 minutes.) */
+#define RBG_AFTER_MS 180000.0
+#define RBG_AFTER_PRESSES 100
 static double g_rbg_after_t0; static int g_rbg_after_n, g_rbg_after_hold, g_rbg_after_down, g_rbg_after_polls;
 static void rbg_after_begin(void) {
     const char *e = getenv("SSBU_RB_NET_AFTER");
