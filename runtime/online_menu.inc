@@ -224,6 +224,29 @@ static void om_ssl_Pending(Ctx *c) {                       /* (connection, int *
 }
 static void om_ssl_GetVerifyCertError(Ctx *c) { if (!ssl_conn_enter(c, A0)) return; if (A1) M32(A1) = 0; RET(0); }
 
+/* abort() and CRT invalid parameters end the process with 0xC0000409 and no message: with the Online menu on, both print
+ * the host stack first (exe-relative addresses: resolve them with build\work\ssbu_native.map). */
+#include <signal.h>
+static void om_host_stack(const char *why) {
+    void *frames[48];
+    USHORT n = CaptureStackBackTrace(1, 48, frames, NULL);
+    printf("\n[online-menu] %s; host stack:\n", why);
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE m = NULL;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m))
+            GetModuleFileNameA(m, name, sizeof name);
+        const char *base = strrchr(name, '\\');
+        printf("  %2u  %s+0x%llx\n", i, base ? base + 1 : name, (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)m));
+    }
+    fflush(stdout);
+}
+static void om_on_abort(int sig) { (void)sig; om_host_stack("abort()"); }
+static void om_on_invalid_parameter(const wchar_t *e, const wchar_t *f, const wchar_t *file, unsigned line, uintptr_t r) {
+    (void)e; (void)f; (void)file; (void)line; (void)r;
+    om_host_stack("CRT invalid parameter");
+}
+
 static ImportFn om_prev(const char *name) {
     ImportFn f = import_lookup(name);
     if (!f) { printf("online menu: no handler for %s\n", name); guest_trap("online menu: missing handler", 0); }
@@ -274,5 +297,7 @@ static void online_menu_register(void) {
         {"nnsslConnectionGetVerifyCertError", om_ssl_GetVerifyCertError},
     };
     register_imports(defs, (int)(sizeof defs / sizeof defs[0]));
+    signal(SIGABRT, om_on_abort);
+    _set_invalid_parameter_handler(om_on_invalid_parameter);
     om_log("ON (phase 0, discovery): network and network service account modelled as available; nintendo.net names -> %s", g_om_server);
 }
