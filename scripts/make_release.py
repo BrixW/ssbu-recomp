@@ -147,7 +147,8 @@ def audit_exe_build(work, exe, llvm):
         return ['no linker map %s: cannot list the objects of the exe' % mp], {}
     sys.path.insert(0, work)
     import build                                                          # the staged tools/lifter/build.py
-    allowed = {n[:-2] + '.obj' for n in build.HOST_SOURCES + ['gamedll.c', 'menu_stub.c']}
+    # (objects are named by the source's file name only: runtime/rollback/<part>/x.c links as x.obj)
+    allowed = {os.path.basename(n)[:-2].lower() + '.obj' for n in build.HOST_SOURCES + ['gamedll.c', 'menu_stub.c']}
     # the settings menu (C++): menu.cpp and Dear ImGui's own four files, objects named <name>_cxx.obj by build.py
     allowed |= {os.path.splitext(os.path.basename(s))[0] + '_cxx.obj' for s in getattr(build, 'CXX_SOURCES', [])}
     # "Publics by Value" lines of link.exe's map end with the object: "boot.obj" for an object of the link line,
