@@ -83,6 +83,26 @@ typedef struct {
     uint32_t frames, desyncs;               /* fight frames to that frame; checksum mismatches seen in the match */
 } NetLadderResult;
 void net_ladder_result(const NetLadderResult *r);
+
+/* Arena (lobby 1.6, F1 > Arena, net_relay.c): a queue of players of this build and lobby code taking turns at 1-on-1
+ * rollback matches (Smash versus); the winner stays. During this player's turn a Smash (versus) match searches the lobby
+ * for the opponent of the turn by itself (net_session.c rbn_handshake). */
+enum { NET_ARENA_OUT = 0, NET_ARENA_WAITING, NET_ARENA_TURN, NET_ARENA_PLAYING };
+typedef struct { char name[33]; int streak; } NetArenaEntry;
+typedef struct {
+    int known;                              /* the lobby answered (0: not joined yet, or an older lobby without the arena) */
+    int in;                                 /* this player asked to be in the queue */
+    int status, place, streak, streak_limit, secs;   /* NET_ARENA_*, place in the queue (1 = next), wins in a row, the lobby's
+                                               limit (0 none), seconds in this status */
+    char opponent[33];                      /* (turn / playing) */
+    int has_match, match_state;             /* the match of the arena now: NET_ARENA_TURN (not started yet) or NET_ARENA_PLAYING */
+    NetArenaEntry match[2];
+    int nqueue;
+    NetArenaEntry queue[16];
+} NetArena;
+void net_arena_get(NetArena *out);          /* never blocks; while it is called the state is asked for every second */
+void net_arena_join(int in);                /* 1 = into the queue, 0 = out of the arena */
+int net_arena_turn(void);                   /* 1 = this player's turn (or match) in the arena now */
 #ifdef __cplusplus
 }
 #endif

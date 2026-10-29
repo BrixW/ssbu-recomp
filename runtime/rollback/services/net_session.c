@@ -360,7 +360,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
      * (online play off, lobby or LAN mode) is a local fight, untouched, like a room fight; the online rollback match comes from
      * a Local Wireless room's match (R3 lwr) or a room code (host / join). SSBU_RB_NET_FIND=1: the lobby search (test). */
     {   const char *e = getenv("SSBU_RB_NET_FIND"); int mode = net_online() > 0 ? net_mode() : -1;
-        if (!lwr /* (R3 lwr: a room match) */ && mode != 2 /* NET_MODE_HOST */ && mode != 3 /* NET_MODE_JOIN */ && !(e && e[0] == '1')) {
+        if (!lwr /* (R3 lwr: a room match) */ && mode != 2 /* NET_MODE_HOST */ && mode != 3 /* NET_MODE_JOIN */ && !(e && e[0] == '1') && !net_arena_turn() /* (arena: this player's turn) */) {
             InterlockedExchange(&g_hs_room, 1);
             printf("[rbnet] handshake %ld: no room code: a local fight, played as without rollback\n", (long)round);
             fflush(stdout);
@@ -368,7 +368,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
         } }
     int find = 0, phase = 1;
     {   int nnldn_role(void); const char *e = getenv("SSBU_RB_NET_FIND"); int mode = net_online() > 0 ? net_mode() : -1;
-        find = !nnldn_role() && (mode == 0 /* NET_MODE_LOBBY */ || mode == 1 /* NET_MODE_LAN */) && e && e[0] == '1';
+        find = !nnldn_role() && (mode == 0 /* NET_MODE_LOBBY */ || mode == 1 /* NET_MODE_LAN */) && ((e && e[0] == '1') || net_arena_turn());     /* (lobby 1.6: the arena's turn searches by itself) */
         if (find) { phase = 0; net_match_find_rb(); } }
     double limit = getenv("SSBU_RB_NET_HS_WAIT") ? atof(getenv("SSBU_RB_NET_HS_WAIT")) * 1000.0 : 120000.0;
     if (lwr) limit = getenv("SSBU_RB_NET_ROOM_WAIT") ? atof(getenv("SSBU_RB_NET_ROOM_WAIT")) * 1000.0 : 10000.0;     /* (R3 lwr) both games are at this set-up together */

@@ -35,3 +35,6 @@ void net_match_cancel(void) {}
 void net_match_get(NetMatch *o) { memset(o, 0, sizeof *o); o->state = MM_OFFLINE; o->players = o->searching = o->code_players = -1; }
 void net_ladder_get(NetLadder *o) { memset(o, 0, sizeof *o); o->state = NET_LADDER_OFF; o->last_outcome = -1; }   /* (ladder: off without online play) */
 void net_ladder_result(const NetLadderResult *r) { (void)r; }
+void net_arena_get(NetArena *o) { memset(o, 0, sizeof *o); }            /* (arena: nothing without online play) */
+void net_arena_join(int in) { (void)in; }
+int net_arena_turn(void) { return 0; }

@@ -1155,6 +1155,102 @@ static void mm_tick(uint64_t t) {                       /* (client thread, joine
         if (g_mm_kind != 2) menu_popup("Find an opponent", "This lobby server is an older version: it cannot find opponents.\nCreate a room yourself (Local Wireless > Create Room) or look at F1 > Online.");
     }
 }
+/* ---------------------------------------------------------------- Arena (lobby 1.6, F1 > Arena; tools/net/ssbu_lobby.py)
+ * The players who joined the arena wait in a queue at the lobby; the first two take their turn at a rollback match (Smash
+ * versus: rbn_handshake searches the lobby by itself during the turn, MATCH op 2, and the lobby pairs only the two), the
+ * winner stays. The client thread sends ARENA (op 1 = in the queue, 2 = only looking) every second while this player is
+ * in the arena or F1 > Arena is shown; the lobby answers each with ARENA_STATE and sends one by itself at each change.
+ *   24 ARENA        client: cookie u64, op u8 (0 leave, 1 join / stay in, 2 look only)
+ *   25 ARENA_STATE  lobby:  version u32, status u8, place u8, streak u8, streak limit u8, opponent name[32], seconds u16,
+ *                           match count u8 (+ name[32] x 2, streak u8 x 2, state u8), queue count u8 (+ (name[32], streak u8) each) */
+#define T_ARENA 24
+#define T_ARENA_STATE 25
+static SRWLOCK g_ar_lock = SRWLOCK_INIT;
+static NetArena g_ar;                                   /* (g_ar_lock) the lobby's last ARENA_STATE */
+static volatile LONG g_ar_in, g_ar_leave;               /* in the queue (op 1 every second); leaves left to send */
+static volatile LONG64 g_ar_watch;                      /* when F1 > Arena last asked (op 2 while it is shown) */
+static uint64_t g_ar_tx;                                /* (client thread) */
+void net_arena_join(int in) {
+    if (!net_online()) return;
+    InterlockedExchange(&g_ar_in, in ? 1 : 0);
+    InterlockedExchange(&g_ar_leave, in ? 0 : 3);
+    g_ar_tx = 0;
+    say("arena: %s", in ? "joining the queue" : "leaving the arena");
+}
+void net_arena_get(NetArena *o) {
+    InterlockedExchange64(&g_ar_watch, (LONG64)ms_now());
+    AcquireSRWLockShared(&g_ar_lock);
+    *o = g_ar;
+    ReleaseSRWLockShared(&g_ar_lock);
+    o->in = (int)g_ar_in;
+    if (!g_joined) o->known = 0;
+}
+int net_arena_turn(void) {
+    AcquireSRWLockShared(&g_ar_lock);
+    int t = g_ar_in && g_ar.known && (g_ar.status == NET_ARENA_TURN || g_ar.status == NET_ARENA_PLAYING);
+    ReleaseSRWLockShared(&g_ar_lock);
+    return t;
+}
+static void arena_send(int op) {                        /* (client thread) */
+    uint8_t p[4 + 8 + 1];
+    hdr(p, T_ARENA);
+    s64(p + 4, g_cookie);
+    p[12] = (uint8_t)op;
+    tx(p, sizeof p, &g_lobby);
+}
+static void arena_tick(uint64_t t) {                    /* (client thread, joined) */
+    static int test = -1;                               /* TEST SWITCH SSBU_ARENA_TEST=1 (default off): into the queue by itself */
+    if (test < 0) { const char *e = getenv("SSBU_ARENA_TEST"); test = e && e[0] == '1'; if (test) { say("arena: TEST: joining the queue by itself (SSBU_ARENA_TEST=1)"); net_arena_join(1); } }
+    if (g_ar_leave > 0) {
+        if (t - g_ar_tx >= 300) { arena_send(0); g_ar_tx = t; InterlockedDecrement(&g_ar_leave); }
+        return;
+    }
+    int watched = t - (uint64_t)g_ar_watch < 2000;
+    if ((!g_ar_in && !watched) || t - g_ar_tx < 1000) return;
+    arena_send(g_ar_in ? 1 : 2);
+    g_ar_tx = t;
+}
+static void arena_name(const uint8_t *p, char *out) {
+    for (int k = 0; k < NAME_LEN; k++) out[k] = p[k] && p[k] < 0x20 ? '?' : (char)p[k];
+    out[NAME_LEN] = 0;
+}
+static void arena_state(const uint8_t *p, int n) {      /* (client thread) an ARENA_STATE body */
+    if (n < 4 + 4 + NAME_LEN + 2 + 1) return;
+    NetArena a; memset(&a, 0, sizeof a);
+    a.known = 1;
+    a.status = p[4]; a.place = p[5]; a.streak = p[6]; a.streak_limit = p[7];
+    arena_name(p + 8, a.opponent);
+    a.secs = g16(p + 8 + NAME_LEN);
+    int o = 8 + NAME_LEN + 2;
+    if (p[o] && o + 1 + 2 * NAME_LEN + 3 <= n) {
+        a.has_match = 1;
+        arena_name(p + o + 1, a.match[0].name); arena_name(p + o + 1 + NAME_LEN, a.match[1].name);
+        a.match[0].streak = p[o + 1 + 2 * NAME_LEN]; a.match[1].streak = p[o + 2 + 2 * NAME_LEN]; a.match_state = p[o + 3 + 2 * NAME_LEN];
+        o += 1 + 2 * NAME_LEN + 3;
+    } else o += 1;
+    if (o < n) {
+        int q = p[o++];
+        for (int i = 0; i < q && i < 16 && o + NAME_LEN + 1 <= n; i++, o += NAME_LEN + 1) { arena_name(p + o, a.queue[i].name); a.queue[i].streak = p[o + NAME_LEN]; a.nqueue = i + 1; }
+    }
+    AcquireSRWLockExclusive(&g_ar_lock);
+    int was = g_ar.known ? g_ar.status : NET_ARENA_OUT;
+    g_ar = a;
+    ReleaseSRWLockExclusive(&g_ar_lock);
+    if (!g_ar_in || a.status == was) return;
+    if (a.status == NET_ARENA_TURN) {
+        char t[256];
+        snprintf(t, sizeof t, "Your turn against %s!\nGo to Smash (versus), choose your fighter and start: the match is found by itself.", a.opponent);
+        say("arena: our turn against %s", a.opponent);
+        menu_popup("Arena", t);
+    } else if (a.status == NET_ARENA_PLAYING) say("arena: playing against %s", a.opponent);
+    else if (a.status == NET_ARENA_WAITING) say("arena: in the queue, place %d", a.place);
+    else if (a.status == NET_ARENA_OUT && was != NET_ARENA_OUT) {     /* (taken out by the lobby: a turn not started in time) */
+        InterlockedExchange(&g_ar_in, 0);
+        say("arena: taken out of the arena by the lobby");
+        menu_popup("Arena", "You are out of the arena: your turn was not started in time.\nF1 > Arena to join the queue again.");
+    }
+}
+
 static void mm_state(const uint8_t *p, uint64_t t) {    /* (client thread) a MATCH_STATE body */
     uint32_t id = g32(p);
     int st = p[4], role = p[5], flags = p[6];
@@ -1612,6 +1708,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         if (g_joined && t - (uint64_t)g_rooms_wanted < 5000 && t - g_rooms_sent >= 2000) rooms_ask(t);     /* O1: while someone looks */
         if (g_joined) mm_tick(t);                                                                         /* O2 */
         if (g_joined) ladder_tick(t);                                                                     /* ladder: a match result until acknowledged */
+        if (g_joined) arena_tick(t);                                                                      /* arena (lobby 1.6) */
         struct sockaddr_in from;
         int flen = sizeof from;
         int n = recvfrom(g_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -1655,6 +1752,9 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             break;
         case T_MATCH_STATE:
             if (n >= 4 + 49 && g_joined) mm_state(buf + 4, ms_now());
+            break;
+        case T_ARENA_STATE:
+            if (g_joined) arena_state(buf + 4, n - 4);
             break;
         case T_LISTING:
             if (n >= 12 + NI_SIZE && g_joined) {

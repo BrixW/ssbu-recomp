@@ -45,6 +45,19 @@ losses u16 + place u16 + text[32] (the ladder name, or why not ranked). After ea
     python ssbu_lobby.py --ladder-db ladder.db [--ladder-open]        the lobby with the ladder (web: /ladder on --status-port)
     python ssbu_lobby.py --ladder-db ladder.db --ladder-invite <name>  prints a one-use invitation code and exits
 
+Arena (lobby 1.6, F1 > Arena): the players of one build and lobby code who joined the arena wait in a queue; the first two
+take their turn at a 1-on-1 rollback match (Smash versus: their MATCH op 2 searches are paired only with each other, the
+one ahead in the queue is player 1) while the others wait. When the match is over (RESULT of either game: the winner by
+stocks, then damage) the winner stays and plays the next in the queue, the loser goes to the back; after --arena-streak
+wins in a row (default 3, 0 = no limit) the winner goes to the back too. No result (a draw, a disconnection), a turn not
+started in ARENA_TURN_FOR s or a match longer than ARENA_PLAY_FOR s: both go to the back.
+    24 ARENA        client: cookie u64, op u8 (0 leave, 1 join / stay in, 2 look only)
+    25 ARENA_STATE  lobby:  version u32, status u8 (0 out, 1 waiting, 2 your turn, 3 playing), place u8 (waiting: 1 = next),
+                            streak u8, streak limit u8, opponent name[32], seconds in this status u16, then the match: count
+                            u8 (0 / 1) + (name[32] x 2, streak u8 x 2, state u8: 2 turn, 3 playing), then the queue: count u8
+                            + count x (name[32], streak u8)
+A game polls (op 1 or 2) every second while it is in the arena or shows it; the lobby also sends ARENA_STATE at each change.
+
 Python 3.8+, standard library only. No encryption: run it for people you know."""
 import argparse
 import json
@@ -68,13 +81,16 @@ except (ImportError, OSError):   # (ladder.py not installed next to it: no ladde
     ladder_mod = None
 
 PROTO = 1
-LOBBY_VERSION = "1.5"
+LOBBY_VERSION = "1.6"
 (JOIN, WELCOME, REJECT, PING, PONG, DATA, LEAVE, LIST, LISTING, LIST_END,
  PEERS, PUNCH, DIRECT, BCAST) = range(1, 15)
 RB = 16          # online rollback messages between two games (recomp-study/net_relay.c T_RB, rb_net.c)
 ROOMS, ROOM_INFO, ROOMS_END = 17, 18, 19     # O1 room browser (net_relay.c): every room of this lobby code, any build
 MATCH, MATCH_STATE = 20, 21                  # O2 matchmaking (net_relay.c): find an opponent of the same build and code
 RESULT, RESULT_ACK = 22, 23                  # 1.5 ladder: a rollback match's result (net_relay.c, ladder_report.c)
+ARENA, ARENA_STATE = 24, 25                  # 1.6 arena: a queue of players taking turns at 1-on-1 rollback matches
+AR_OUT, AR_WAITING, AR_TURN, AR_PLAYING = range(4)
+ARENA_TURN_FOR, ARENA_PLAY_FOR, ARENA_WATCH_FOR, ARENA_LIST = 120.0, 900.0, 3.0, 16
 LD_UNRANKED, LD_RANKED, LD_UNKNOWN = 0, 1, 2
 OUT_WAIT, OUT_OK, OUT_DRAW, OUT_DISPUTED, OUT_UNRANKED = range(5)
 RESULT_LEN = 4 + 8 + 8 + 4 + 4 + 4 + 16 + 2 + 4 + 4 + 4
@@ -161,6 +177,22 @@ class Client:
         self.rb_peer = 0          # 1.4: the player of its last rollback match (RB to it is relayed on the public code)
         self.ladder_id = None     # 1.5: its ladder id when it is ranked
         self.ladder_why = ""      # (its ladder name, or why it is not ranked)
+        self.arena_streak = 0     # 1.6: wins in a row in the arena
+        self.arena_seen = None    # 1.6: when it last asked for the arena's state (it is shown the changes for ARENA_WATCH_FOR s)
+
+
+class Arena:
+    """1.6: the arena of one build and lobby code: the queue and the match being played (or about to be)."""
+    def __init__(self):
+        self.queue = []           # Clients waiting, the next first
+        self.pair = None          # [player 1, player 2] taking their turn, or None
+        self.playing = False      # the pair's games exchange rollback messages
+        self.at = 0.0             # since when the pair is in its state
+        self.version = 0
+        self.last_seed = None     # the last match whose result was taken (both games send it)
+
+    def members(self):
+        return list(self.queue) + (list(self.pair) if self.pair else [])
 
 
 class Match:
@@ -184,8 +216,10 @@ class Room:
 
 
 class Lobby:
-    def __init__(self, sock, verbose, search_for=SEARCH_FOR, match_for=MATCH_FOR, ladder=None):
+    def __init__(self, sock, verbose, search_for=SEARCH_FOR, match_for=MATCH_FOR, ladder=None, arena_streak=3):
         self.sock, self.verbose, self.ladder = sock, verbose, ladder
+        self.arenas = {}          # 1.6: part (build, code) -> Arena
+        self.arena_streak = arena_streak
         self.search_for, self.match_for = search_for, match_for
         self.by_at, self.by_ip, self.rooms = {}, {}, {}
         self.next_ip = SUBNET + 2
@@ -242,6 +276,7 @@ class Lobby:
         self.say("room of %s closed (%s)" % (room.owner.name, why))
 
     def drop(self, c, why):
+        self.arena_leave(c, why)
         if c.match is not None:
             other = c.match.other(c)
             c.match = None
@@ -329,11 +364,15 @@ class Lobby:
                 m.rb_seen.add(c.ip)
                 if len(m.rb_seen) == 2:
                     h, g = m.host, m.guest
+                    self.arena_playing(h, g, now)
                     self.ladder_open_set(h, g)
                     self.match_end(h, MS_TOGETHER, "playing a rollback match with %s" % g.name)
                     self.match_end(g, MS_TOGETHER, "playing a rollback match with %s" % h.name)
         elif kind == RESULT and len(p) >= RESULT_LEN and struct.unpack_from(">Q", p, 4)[0] == c.cookie:
+            self.arena_result(c, p, now)
             self.on_result(c, p)
+        elif kind == ARENA and len(p) >= 13 and struct.unpack_from(">Q", p, 4)[0] == c.cookie:
+            self.on_arena(c, p[12], now)
         elif kind == DATA and len(p) >= 16:
             self.on_data(c, p, 4, now, ())
         elif kind == BCAST and len(p) >= 5:
@@ -633,6 +672,14 @@ class Lobby:
         c.search_id, c.search_since, c.final, c.kind = sid, now, None, op
         self.say("match: %s searches an opponent%s (build %s)" % (c.name, " for a rollback match" if op == KIND_ROLLBACK else "", c.part[0].decode("ascii", "replace")))
         waiting = [x for x in self.by_at.values() if x is not c and x.part == c.part and x.search_since is not None and x.match is None and x.kind == op]
+        a = self.arenas.get(c.part)
+        pair = a.pair if a is not None and op == KIND_ROLLBACK else None
+        if pair and c in pair:                      # 1.6 arena: a player taking its turn meets only its opponent of the turn
+            waiting = [x for x in waiting if x is (pair[1] if c is pair[0] else pair[0])]
+        elif a is not None and c in a.members():   # (in the queue: its turn has not come; the box says it searches)
+            waiting = []
+        elif a is not None:                         # (a player outside the arena never takes one of the arena's)
+            waiting = [x for x in waiting if x not in a.members()]
         if not waiting:
             return self.match_send(c, now)
         o = min(waiting, key=lambda x: x.search_since)
@@ -640,6 +687,8 @@ class Lobby:
         def hosts_open(x):
             return op == KIND_ROOM and x.room is not None and x.room.is_open()
         host = c if hosts_open(c) and not hosts_open(o) else o   # the one with an open room hosts, else the one that waited longer
+        if pair and c in pair:
+            host = pair[0]                          # (the arena: the one ahead in the queue, or the winner who stays, is player 1)
         m = Match(host, o if host is c else c, now)
         for x in (c, o):
             x.match, x.search_since = m, None
@@ -679,6 +728,142 @@ class Lobby:
             if now - r.updated > ROOM_TIMEOUT:
                 self.close_room(r, "no advertisement for %d s" % ROOM_TIMEOUT)
         self.ladder_sweep()
+        for a in list(self.arenas.values()):
+            if a.pair and not a.playing and now - a.at > ARENA_TURN_FOR:
+                # (a turn not started in time: whoever did not even search is away and leaves the arena; the other keeps its place)
+                away = [x for x in a.pair if x.search_since is None and x.match is None]
+                if not away or len(away) == 2:
+                    for x in away:
+                        self.arena_leave(x, "did not start its turn in %d s" % ARENA_TURN_FOR, now)
+                    if a.pair:
+                        self.arena_end(a, None, "the turn of %s and %s was not started in %d s" % (a.pair[0].name, a.pair[1].name, ARENA_TURN_FOR), now)
+                else:
+                    self.arena_leave(away[0], "did not start its turn in %d s" % ARENA_TURN_FOR, now)
+            elif a.pair and a.playing and now - a.at > ARENA_PLAY_FOR:
+                self.arena_end(a, None, "no result of the match of %s and %s in %d s" % (a.pair[0].name, a.pair[1].name, ARENA_PLAY_FOR), now)
+
+    # ---- 1.6 arena
+    def arena_status(self, a, c):
+        if a is not None and a.pair and c in a.pair:
+            return AR_PLAYING if a.playing else AR_TURN
+        return AR_WAITING if a is not None and c in a.queue else AR_OUT
+
+    def arena_send(self, c, now):
+        """ARENA_STATE to c (see the top of this file)."""
+        a = self.arenas.get(c.part)
+        st = self.arena_status(a, c)
+        place, opp, since = 0, b"", now
+        if st == AR_WAITING:
+            place = a.queue.index(c) + 1
+        elif st in (AR_TURN, AR_PLAYING):
+            opp = (a.pair[1] if c is a.pair[0] else a.pair[0]).name.encode("utf-8", "replace")
+            since = a.at
+
+        def nm(x):
+            return x.name.encode("utf-8", "replace")[:NAME_LEN].ljust(NAME_LEN, b"\0")
+        out = hdr(ARENA_STATE) + struct.pack(">IBBBB", a.version if a else 0, st, min(place, 255), min(c.arena_streak, 255), min(self.arena_streak, 255))
+        out += opp[:NAME_LEN].ljust(NAME_LEN, b"\0") + struct.pack(">H", max(0, min(int(now - since), 65535)))
+        if a is not None and a.pair:
+            out += bytes((1,)) + nm(a.pair[0]) + nm(a.pair[1]) + bytes((min(a.pair[0].arena_streak, 255), min(a.pair[1].arena_streak, 255),
+                                                                     AR_PLAYING if a.playing else AR_TURN))
+        else:
+            out += bytes((0,))
+        q = a.queue[:ARENA_LIST] if a is not None else []
+        out += bytes((len(q),)) + b"".join(nm(x) + bytes((min(x.arena_streak, 255),)) for x in q)
+        self.send(out, c.at)
+
+    def arena_changed(self, a, now):
+        a.version += 1
+        for x in self.by_at.values():               # its players, and whoever looks at it
+            if self.arenas.get(x.part) is a and (x in a.members() or (x.arena_seen is not None and now - x.arena_seen <= ARENA_WATCH_FOR)):
+                self.arena_send(x, now)
+
+    def on_arena(self, c, op, now):
+        """ARENA from a game: op 0 leave, 1 join (or stay in), 2 only look."""
+        a = self.arenas.get(c.part)
+        if op == 1 and (a is None or c not in a.members()):
+            if a is None:
+                a = self.arenas[c.part] = Arena()
+            a.queue.append(c)
+            c.arena_streak = 0
+            self.say("arena: %s joined the queue (%d waiting)" % (c.name, len(a.queue)))
+            self.arena_next(a, now)
+            self.arena_changed(a, now)
+        elif op == 0:
+            self.arena_leave(c, "left the arena", now)
+        c.arena_seen = now
+        self.arena_send(c, now)
+
+    def arena_leave(self, c, why, now=None):
+        a = self.arenas.get(c.part)
+        if a is None or c not in a.members():
+            return
+        now = time.monotonic() if now is None else now
+        if a.pair and c in a.pair:
+            other = a.pair[1] if c is a.pair[0] else a.pair[0]
+            a.pair, a.playing = None, False
+            a.queue.insert(0, other)                # (the other player keeps its place at the front, and its streak)
+            self.say("arena: %s left its turn (%s): %s is next again" % (c.name, why, other.name))
+        else:
+            a.queue.remove(c)
+            self.say("arena: %s left the queue (%s)" % (c.name, why))
+        c.arena_streak = 0
+        self.arena_next(a, now)
+        self.arena_changed(a, now)
+        self.arena_send(c, now)
+
+    def arena_next(self, a, now):
+        """No match on: the first two of the queue take their turn."""
+        if a.pair is None and len(a.queue) >= 2:
+            a.pair, a.playing, a.at = [a.queue.pop(0), a.queue.pop(0)], False, now
+            self.say("arena: %s's turn against %s (%d waiting)" % (a.pair[0].name, a.pair[1].name, len(a.queue)))
+
+    def arena_playing(self, h, g, now):
+        a = self.arenas.get(h.part)
+        if a is not None and a.pair and h in a.pair and g in a.pair and not a.playing:
+            a.playing, a.at = True, now
+            self.say("arena: %s and %s are playing" % (h.name, g.name))
+            self.arena_changed(a, now)
+
+    def arena_end(self, a, winner, why, now):
+        """The pair's match is over: the winner (None: no winner) stays, unless at the streak limit."""
+        p1, p2 = a.pair
+        a.pair, a.playing = None, False
+        if winner is None:
+            for x in (p1, p2):
+                x.arena_streak = 0
+                a.queue.append(x)
+            self.say("arena: %s: %s and %s go to the back of the queue" % (why, p1.name, p2.name))
+        else:
+            loser = p2 if winner is p1 else p1
+            loser.arena_streak = 0
+            a.queue.append(loser)
+            winner.arena_streak += 1
+            if self.arena_streak and winner.arena_streak >= self.arena_streak:
+                self.say("arena: %s beat %s: %d wins in a row, the limit: both to the back" % (winner.name, loser.name, winner.arena_streak))
+                winner.arena_streak = 0
+                a.queue.append(winner)
+            else:
+                self.say("arena: %s beat %s (%d in a row) and stays" % (winner.name, loser.name, winner.arena_streak))
+                a.queue.insert(0, winner)
+        self.arena_next(a, now)
+        self.arena_changed(a, now)
+
+    def arena_result(self, c, p, now):
+        """RESULT of a game of the pair: who won (stocks left, then damage). Both games send it: the first one counts."""
+        a = self.arenas.get(c.part)
+        if a is None or not a.pair or c not in a.pair:
+            return
+        seed, peer, slot, rule_kind, stock, flags = struct.unpack_from(">QIBBBB", p, 12)
+        s0, s1, d0, d1 = struct.unpack_from(">BBHH", p, 48)
+        other = a.pair[1] if c is a.pair[0] else a.pair[0]
+        if seed == a.last_seed or peer != other.ip or slot > 1:
+            return
+        a.last_seed = seed
+        win = 0 if s0 > s1 else 1 if s1 > s0 else 0 if d0 < d1 else 1 if d1 < d0 else None
+        if flags & 2 or win is None:                 # (a disconnection, or a draw: no winner)
+            return self.arena_end(a, None, "no winner (%s)" % ("disconnected" if flags & 2 else "a draw"), now)
+        self.arena_end(a, c if win == slot else other, "result", now)
 
 
 def status_json(lobby, started, now):
@@ -792,6 +977,7 @@ def main():
     ap.add_argument("--ladder-db", default="", help="the ranked ladder's sqlite file (ladder.py; empty: no ladder)")
     ap.add_argument("--ladder-open", action="store_true", help="ladder: any new player is ranked the first time it is seen (default: by invitation only)")
     ap.add_argument("--ladder-invite", metavar="NAME", help="ladder: print a one-use invitation code for a player called NAME, and exit")
+    ap.add_argument("--arena-streak", type=int, default=3, help="arena: wins in a row after which the winner goes to the back of the queue too (default 3, 0: no limit)")
     ap.add_argument("--ladder-stages", default="", help="ladder: the legal stages, comma-separated stage ids (match block + 0x420, hex or decimal; empty: any)")
     o = ap.parse_args()
     ladder = None
@@ -815,7 +1001,7 @@ def main():
         except (AttributeError, OSError):
             pass
     sock.bind((o.bind, o.port))
-    lobby = Lobby(sock, o.verbose, o.search_secs, o.match_secs, ladder)
+    lobby = Lobby(sock, o.verbose, o.search_secs, o.match_secs, ladder, o.arena_streak)
     lobby.say("lobby on UDP %s:%d (protocol SU %d)" % (o.bind, o.port, PROTO))
     if ladder is not None:
         lobby.say("ladder: %s (%s)" % (o.ladder_db, "open sign-up" if o.ladder_open else "by invitation"))

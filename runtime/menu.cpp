@@ -476,8 +476,8 @@ static uint64_t g_pad_prev;
 static long long g_closed_at, g_frame;
 static char g_pads[1024];
 static ULONGLONG g_pads_at;
-enum { SEC_DISPLAY, SEC_GRAPHICS, SEC_AUDIO, SEC_CONTROLS, SEC_EXPERIMENTAL, SEC_ROOMS, SEC_DLC, SEC_LANG, SEC_LOG, SEC_ABOUT, SEC_N };
-static const char *const k_sections[SEC_N] = {"Display", "Graphics", "Audio", "Controls", "Experimental", "Online", "Add-on content", "Language", "Log", "About"};
+enum { SEC_DISPLAY, SEC_GRAPHICS, SEC_AUDIO, SEC_CONTROLS, SEC_EXPERIMENTAL, SEC_ROOMS, SEC_ARENA, SEC_DLC, SEC_LANG, SEC_LOG, SEC_ABOUT, SEC_N };
+static const char *const k_sections[SEC_N] = {"Display", "Graphics", "Audio", "Controls", "Experimental", "Online", "Arena", "Add-on content", "Language", "Log", "About"};
 
 static ImGuiKey vk_key(int vk) {
     if (vk >= 'A' && vk <= 'Z') return (ImGuiKey)(ImGuiKey_A + (vk - 'A'));
@@ -1439,6 +1439,53 @@ static uint32_t sec_match(void) {
     return m.state == MM_MATCHED && m.role == MM_ROLE_JOIN ? m.peer : 0;
 }
 
+/* ------------------------------------------------------------------ Arena (lobby 1.6, net_relay.c net_arena_*)
+ * A queue at the lobby: the first two play a 1-on-1 rollback match (Smash versus), the winner stays, the others wait. */
+static void sec_arena(void) {
+    NetArena a;
+    net_arena_get(&a);
+    const ImVec4 green(0.45f, 0.9f, 0.45f, 1), amber(1, 0.8f, 0.2f, 1), gold(1.0f, 0.75f, 0.25f, 1);
+    NetStats ns;
+    net_stats_get(&ns);
+    if (ns.state != NET_CONNECTED) { help("Not connected to a lobby. Online play: F1 > Online (the arena needs a lobby: a lobby server or Same network)."); return; }
+    if (!a.known) { ImGui::TextDisabled("Asking the lobby..."); help("No answer after a few seconds: the lobby server is an older version without the arena (lobby 1.6 or newer)."); return; }
+    float bw = ImGui::GetFontSize() * 12;
+    ImGui::SetWindowFontScale(1.3f);
+    switch (a.in ? a.status : NET_ARENA_OUT) {
+    case NET_ARENA_WAITING: ImGui::TextColored(amber, a.place == 1 ? "You are next." : "In the queue: place %d.", a.place); break;
+    case NET_ARENA_TURN: ImGui::TextColored(green, "YOUR TURN against %s!", a.opponent); break;
+    case NET_ARENA_PLAYING: ImGui::TextColored(green, "Playing against %s.", a.opponent); break;
+    default: ImGui::Text("You are not in the arena."); break;
+    }
+    ImGui::SetWindowFontScale(1.0f);
+    if (a.in && a.status == NET_ARENA_TURN) help("Go to Smash (versus), choose your fighter and start: the game finds your opponent by itself (a box over the game shows it). Rollback on.");
+    else if (a.in && a.status == NET_ARENA_WAITING) help("Wait for your turn: a message appears over the game when it comes. Do not start a Smash (versus) match before it.");
+    if (a.in && a.streak) ImGui::TextColored(gold, "%d win%s in a row", a.streak, a.streak == 1 ? "" : "s");
+    if (!a.in) { if (ImGui::Button("Join the queue##arena", ImVec2(bw, 0))) net_arena_join(1); }
+    else if (ImGui::Button("Leave the arena##arena", ImVec2(bw, 0))) net_arena_join(0);
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Match");
+    if (a.has_match) {
+        ImGui::Text("%s", a.match[0].name);
+        if (a.match[0].streak) { ImGui::SameLine(); ImGui::TextColored(gold, "(%d)", a.match[0].streak); }
+        ImGui::SameLine(); ImGui::TextDisabled("vs"); ImGui::SameLine(); ImGui::Text("%s", a.match[1].name);
+        if (a.match[1].streak) { ImGui::SameLine(); ImGui::TextColored(gold, "(%d)", a.match[1].streak); }
+        ImGui::SameLine(); ImGui::TextDisabled(a.match_state == NET_ARENA_PLAYING ? "  playing" : "  starting");
+    } else ImGui::TextDisabled("No match: two players in the queue are needed.");
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Queue (%d)", a.nqueue);
+    for (int i = 0; i < a.nqueue; i++) {
+        ImGui::Text("%2d. %s", i + 1, a.queue[i].name);
+        if (a.queue[i].streak) { ImGui::SameLine(); ImGui::TextColored(gold, "(%d)", a.queue[i].streak); }
+    }
+    if (!a.nqueue) ImGui::TextDisabled("Nobody waiting.");
+    ImGui::Separator();
+    char rule[200];
+    if (a.streak_limit) snprintf(rule, sizeof rule, "The winner stays and plays the next in the queue; after %d wins in a row the winner goes to the back of the queue too. The loser goes to the back.", a.streak_limit);
+    else snprintf(rule, sizeof rule, "The winner stays and plays the next in the queue; the loser goes to the back.");
+    help(rule);
+}
+
 /* ------------------------------------------------------------------ O1: Online rooms (net_relay.c net_rooms_get) */
 static void sec_rooms(void) {
     static NetRoom rooms[32];
@@ -1572,6 +1619,7 @@ static void draw_menu(int cw, int ch) {
     case SEC_CONTROLS: sec_controls(); break;
     case SEC_EXPERIMENTAL: sec_experimental(); break;
     case SEC_ROOMS: sec_rooms(); break;
+    case SEC_ARENA: sec_arena(); break;
     case SEC_DLC: sec_dlc(); break;
     case SEC_LANG: sec_lang(); break;
     case SEC_LOG: sec_log(); break;
