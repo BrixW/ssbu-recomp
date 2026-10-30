@@ -202,7 +202,7 @@ $settings = @(
     @{ Page = 'Controls'; F = 'C'; S = 'general'; K = 'gamecube_style'; Label = 'GameCube adapter controllers'; Kind = 'choice'; Values = @('native', 'pro'); Def = 'native'
        Help = 'For the GameCube adapter (Nintendo WUP-028, Mayflash in Switch mode). native: the game sees real GameCube controllers. pro: they are shown as Pro Controllers (try it if one misbehaves).' }
     @{ Page = 'Controls'; F = 'C'; S = 'keyboard'; K = 'player'; Label = 'Keyboard is player'; Kind = 'choice'; Values = @('auto', '1', '2', '3', '4', '5', '6', '7', '8', 'none'); Def = 'auto'
-       Help = 'auto: the first free player after the controllers found at start (no controller: the keyboard is player 1). none: the keyboard does not play.' }
+       Help = 'auto: player 1, together with the controller of player 1 (either one plays, whenever the controller connects). 2: a second player on the keyboard. none: the keyboard does not play.' }
 )
 $keyHelp = 'A letter or digit, LEFT UP RIGHT DOWN ENTER BACKSPACE SPACE TAB ESC SHIFT CTRL ALT F1..F12, NUM0..NUM9, or none.'
 $keys = @(@('A', 'Z'), @('B', 'X'), @('X', 'C'), @('Y', 'V'), @('L', 'Q'), @('R', 'E'), @('ZL', 'A'), @('ZR', 'S'), @('PLUS', 'ENTER'), @('MINUS', 'BACKSPACE'),
