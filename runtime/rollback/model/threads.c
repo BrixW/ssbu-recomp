@@ -239,6 +239,9 @@ static int live_running(void *fiber) {                 /* the host fiber is the 
     for (int i = 0; i < g_guest_fibers.live_count; i++) if (g_live_fib[i] && g_live_fib[i] == (uint64_t)(uintptr_t)fiber) return i + 1;
     return 0;
 }
+/* (2026-10-30, os_r1_fibers_reap) the current host fiber of every guest thread read again now; then r1_fiber_running(f) */
+void r1_live_fibers_refresh(void) { live_rsps(); }
+int r1_fiber_running(void *fiber) { return live_running(fiber) != 0; }
 static int live_on_stack(const uint8_t *blk) {          /* a fiber block (saved copy): +0x20 DeallocationStack, +0x10 StackBase */
     uint64_t lo = *(const uint64_t *)(blk + 0x20), hi = *(const uint64_t *)(blk + 0x10);
     for (int i = 0; i < g_guest_fibers.live_count; i++) if (g_guest_fibers.live_rsp[i] >= lo && g_guest_fibers.live_rsp[i] < hi) return i + 1;

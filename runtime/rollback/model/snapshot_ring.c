@@ -468,6 +468,17 @@ void r1_ring_release(void) {                              /* every slot dropped:
     for (int i = 0; i < g_rg_count; i++) rg_slot_drop(rg_slot(i), 1);
     g_rg_count = 0; g_rg_head = 0;
 }
+/* (2026-10-30) a host fiber a state the ring still holds (or the last fibers_save) names: a load could give it back, so
+ * os_r1_fibers_reap must not delete it (rollback_controller.c rbg_fibers_reap) */
+int r1_ring_fiber_in_use(void *fiber) {
+    uint64_t f = (uint64_t)(uintptr_t)fiber;
+    for (int i = 0; i < g_rg_count; i++) {
+        RgSlot *s = rg_slot(i);
+        for (int k = 0; k < s->nfib; k++) if (s->fib[k].fiber == fiber || s->fib[k].obj[0] == f) return 1;
+    }
+    for (int k = 0; k < g_guest_fibers.count; k++) if (g_guest_fibers.table[k].fiber == fiber || g_guest_fibers.table[k].obj[0] == f) return 1;
+    return 0;
+}
 /* (R3 hs16, test) the metadata parts of captures / loads, ms (printed with SSBU_RB_HOLD_PROF) */
 static double g_mp[9], g_mp_b[2]; static long long g_mp_n[2];
 void rg_meta_prof_report(void) {

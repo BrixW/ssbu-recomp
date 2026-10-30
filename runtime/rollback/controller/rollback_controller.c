@@ -16,6 +16,11 @@
 #include "../model/game_state_internal.h"
 #include <psapi.h>
 static void rb_mem_report(const char *when); static int g_mem_nprev;      /* (below, at rbg_fight_off) */
+/* (2026-10-30) the host fibers os_threads.c keeps for ring loads, deleted once nothing can use them: not a state the ring
+ * holds (snapshot_ring.c), not the fiber a guest thread runs now (threads.c, read again first) */
+int os_r1_fibers_reap(int (*in_use)(void *fiber)); int r1_ring_fiber_in_use(void *fiber); void r1_live_fibers_refresh(void); int r1_fiber_running(void *fiber);
+static int rbg_fiber_in_use(void *f) { return r1_fiber_running(f) || r1_ring_fiber_in_use(f); }
+static void rbg_fibers_reap(void) { r1_live_fibers_refresh(); os_r1_fibers_reap(rbg_fiber_in_use); }
 /* Functions and variables of other runtime files that only this file uses: */
 void rbn_start(long long f0);
 int rbn_started(void);
@@ -360,6 +365,7 @@ static void rbg_step_body(Ctx *c) {
             }
         }
     }
+    if (g_rbg_real % 120 == 0) rbg_fibers_reap();      /* every 2 s of real frames: the kept host fibers nothing can use any more */
     /* the next pass is a real one (frame i + 1): pending wrong guesses first, then the other player, then the tick */
     double tw = now_ms();
     if (g_rbg_tick0 > 0 && g_rbg_nw < RBG_NT) { g_rbg_work[g_rbg_nw] = (float)(tw - g_rbg_tick0); g_rbg_wcyc[g_rbg_nw] = (float)((rgs_cyc_now() - g_rbg_cyc_go) / 1e6); g_rbg_wk[g_rbg_nw] = (unsigned char)(g_rbg_tick_k > 255 ? 255 : g_rbg_tick_k); g_rbg_nw++; }
@@ -577,6 +583,7 @@ void rbg_fight_off(void) {
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
     g_rbg_noring = 0;
     LOG("r1: RB NET: match %d over: ring emptied, session reset for the next match\n", rbn_match_number());
+    rbg_fibers_reap();                                  /* (the ring is empty: only running fibers and live objects keep theirs) */
     { char w[48]; snprintf(w, sizeof w, "match %d over", rbn_match_number()); rb_mem_report(w); }
     { char mk[24]; snprintf(mk, sizeof mk, "match%dover", g_rbg_in_match == 1 ? rbn_match_number() : 0); if (g_rbg_in_match == 1) input_mark(mk); else input_mark("localmatchover"); }
     g_rbg_in_match = 0; g_rbg_ff_first = -1;
