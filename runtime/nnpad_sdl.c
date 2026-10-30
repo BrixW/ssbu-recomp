@@ -66,6 +66,8 @@ static Dev g_dev[MAXDEV];
 static struct { char guid[40]; int slot; } g_mem[32];
 static int g_mem_n;
 static int g_kb_slot = -3;                  /* resolved lazily */
+static volatile LONG g_kb_gen;             /* +1 each time the keyboard's slot changes after it was resolved (nnhid reads it again) */
+static int env_kb(void);
 static ULONGLONG g_init_ms;
 static LARGE_INTEGER g_qpf, g_last_poll;
 static ULONGLONG g_last_cfg_check;
@@ -161,7 +163,7 @@ static const char *const g_default_ini =
 "\r\n"
 "[keyboard]\r\n"
 "; auto = the first free player slot after the pads found at start (so a machine with one pad has pad = player 1, keyboard = player 2,\r\n"
-"; and without any pad the keyboard is player 1); 1..8 = that player (merged with the pad of that player); none = no keyboard.\r\n"
+"; and without any pad the keyboard is player 1; a pad that connects later takes the keyboard's slot if it is lower); 1..8 = that player (merged with the pad of that player); none = no keyboard.\r\n"
 "; The environment variable SSBU_KEYBOARD_PLAYER (0 = none, 1..8) overrides this line. The keyboard counts only while the game window has the focus.\r\n"
 "player = auto\r\n"
 "; Keys: a letter or digit, LEFT UP RIGHT DOWN ENTER BACKSPACE SPACE TAB ESC SHIFT CTRL ALT F1..F12, NUM0..NUM9, or 0x<virtual key code>; none = unbound.\r\n"
@@ -449,6 +451,13 @@ static void dev_add(SDL_JoystickID id) {
     }
     d->wireless = SDL_GetJoystickConnectionState(d->js) == SDL_JOYSTICK_CONNECTION_WIRELESS;
     d->slot = assign_slot(d);
+    if (d->slot > g_kb_slot && g_kb_slot >= 0 && g_cfg.kb_player == -2 && env_kb() < 0 && !d->gca && !g_cfg.pguid[d->slot][0] && slot_usable(g_kb_slot, d->guid)) {
+        /* keyboard "auto": a pad that shows up after the keyboard took the first free slot (turned on after the game started, a
+         * wireless pad still waking up) takes the keyboard's slot and the keyboard moves to the pad's, as when the pad is found at start */
+        int t = g_kb_slot; g_kb_slot = d->slot; d->slot = t;
+        InterlockedIncrement(&g_kb_gen);
+        say("nn::pad: keyboard moves to player %d for the pad\n", g_kb_slot + 1);
+    }
     if (d->slot >= 0) { remember(d->guid, d->slot); apply_player_index(d); }
     say("nn::pad: connected \"%s\" (%s, %s%s) GUID %s -> %s", d->name, d->gp ? "gamepad" : "joystick WITHOUT mapping (guessed layout)", d->gp ? type_name(d->gtype) : "raw",
         d->has_gyro ? ", gyro" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
@@ -789,6 +798,7 @@ int nnpad_keyboard_player(void) {
     unlock();
     return r;
 }
+int nnpad_kb_gen(void) { return (int)g_kb_gen; }
 int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return idx >= 0 && idx < 24 ? g_cfg.kb_vk[idx] : 0;
@@ -1356,6 +1366,20 @@ int nnpad_selftest(const NnHidHooks *h) {
     for (int i = 0; i < 8; i++) { if (id[i] && js[i]) { SDL_CloseJoystick(js[i]); SDL_DetachVirtualJoystick(id[i]); } }
     settle();
     check(h->style(0) == 0 && h->style(7) == 0, "all pads detached: no player present");
+
+    /* ---- keyboard "auto" took player 1 (no pad at start): a pad that connects later takes player 1, the keyboard its slot */
+    {
+        Sleep(1100); write_text(path, "[keyboard]\r\nplayer = auto\r\n"); Sleep(1100); nnpad_poll(1);
+        _putenv_s("SSBU_KEYBOARD_PLAYER", "");
+        lock(); g_kb_slot = 0; unlock();
+        int gen = nnpad_kb_gen();
+        id[0] = vj_make(0, 0x100, 1, 0); settle(); js[0] = SDL_OpenJoystick(id[0]);
+        lock(); Dev *d = dev_of(0); int pad1 = d && d->id == id[0], kb = g_kb_slot; unlock();
+        check(pad1 && kb > 0 && nnpad_kb_gen() != gen, "keyboard auto on player 1, a pad connects later: the pad is player 1, the keyboard the slot the pad got");      /* (the unmapped joystick above is still on a slot) */
+        SDL_CloseJoystick(js[0]); SDL_DetachVirtualJoystick(id[0]); js[0] = NULL; id[0] = 0; settle();
+        lock(); g_kb_slot = -1; unlock();
+        _putenv_s("SSBU_KEYBOARD_PLAYER", "0");
+    }
     h->test_mode(0);
     printf("pad self-test: %d passed, %d failed\n", g_t_pass, g_t_fail);
     printf("PAD SELFTEST %s (%d/%d)\n", g_t_fail ? "FAILED" : "PASSED", g_t_pass, g_t_pass + g_t_fail);

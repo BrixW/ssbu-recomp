@@ -590,6 +590,11 @@ static void fill_pad(uint64_t out, uint32_t id, int kind) {
                    if (r1_on() && r1_poll(mark_seen("fight") ? nt : 0)) nt = 0;                  /* R1 re-run: the sequence waits, the recorded values are given (R1 run-ahead: the speculative poll) */
                    fight_shot_poll(nt); if (mark_seen("fight")) l1_ticks += nt;
                    for (int n = nt; n > 0; n--) seq_tick(); }     /* S11: 1 per poll; SSBU_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
+    if (sdl_on()) {      /* the keyboard gave its slot to a pad that connected after the game started (nnpad_sdl.c dev_add) */
+        static int kb_gen;
+        int gen = nnpad_kb_gen();
+        if (gen != kb_gen) { kb_gen = gen; g_keyboard_player = nnpad_keyboard_player(); printf("nn::hid: keyboard = player %d\n", g_keyboard_player + 1); }
+    }
     if (!player_connected(id)) return;
     static const struct { int vk, bit; } map[] = {
         {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},
