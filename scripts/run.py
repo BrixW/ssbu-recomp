@@ -116,11 +116,72 @@ def auto_update(gini):
     print('=' * 78, flush=True)
     rc = subprocess.run([sys.executable, '-u', os.path.join(REPO, 'scripts', 'install.py'), '--no-gui', '--no-shortcuts'],
                         cwd=REPO).returncode
-    if rc:
+    if rc and runtime_only_update(os.path.join(os.path.dirname(os.path.dirname(gini)), 'work')):
+        print('\nUpdate installed (the game program only).\n')
+    elif rc:
         print('\nThe update did not finish (code %d). The game starts anyway; "Install SSBU.bat" > Resume finishes it.\n' % rc)
     else:
         print('\nUpdate installed.\n')
     return True
+
+
+def runtime_only_update(work):
+    """(fork, 2026-10-30) The installer stopped (a tester's copy had no extracted dump left and the game files had moved: its
+    "Find your game files" step cannot pass), but a new prebuilt runtime changes only the exe and its DLLs, which need no
+    game files. The package install.py names is downloaded and checked (its SHA-256; it fits this copy of the project; its
+    game-data interface is the one of the game DLL built here, build\\work\\game_data.h) and its .exe / .dll files are copied
+    into build\\work, the old exe kept as ssbu_native_previous.exe. True when done; on any doubt False (nothing changed)."""
+    import hashlib
+    import zipfile
+    import setup
+    import update
+    try:
+        with open(os.path.join(REPO, 'scripts', 'install.py'), encoding='utf-8') as f:
+            m = re.search(r"RUNTIME_RELEASE = \('([^']+)',\s*'([0-9a-f]{64})'\)", f.read())
+        if not m or not os.path.isfile(os.path.join(work, 'ssbu_game_eh_o1.dll')):
+            return False
+        url, sha = m.group(1), m.group(2)
+        dst = os.path.join(REPO, 'deps', url.rsplit('/', 1)[-1])
+        if not (os.path.isfile(dst) and hashlib.sha256(open(dst, 'rb').read()).hexdigest() == sha):
+            print('Downloading the game program only: %s' % url, flush=True)
+            data = update.http(url, timeout=300)
+            if hashlib.sha256(data).hexdigest() != sha:
+                print('The download does not match its SHA-256: not used.')
+                return False
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst + '.part', 'wb') as f:
+                f.write(data)
+            os.replace(dst + '.part', dst)
+        man = setup.read_manifest(dst)
+        why = setup.runtime_mismatch(man) if man else 'not a runtime package'
+        if why:
+            print('The game program cannot be installed alone: %s' % why)
+            return False
+        with open(os.path.join(work, 'game_data.h'), encoding='utf-8', errors='replace') as f:
+            built = re.search(r'#define GAME_DATA_VERSION (\d+)', f.read())
+        if not built or int(built.group(1)) != man.get('game_data_version'):
+            print('The game program cannot be installed alone: the game here was built for another game-data interface '
+                  '(%s, the package %s): "Install SSBU.bat" > Resume is needed.' % (built.group(1) if built else '?', man.get('game_data_version')))
+            return False
+        files = {n: v for n, v in man['files'].items() if n.lower().endswith(('.exe', '.dll'))}
+        exe = os.path.join(work, 'ssbu_native.exe')
+        with zipfile.ZipFile(dst) as z:
+            for n, v in files.items():
+                data = z.read(n)
+                if hashlib.sha256(data).hexdigest() != v['sha256']:
+                    print('%s in the package does not match its manifest: not installed.' % n)
+                    return False
+            if os.path.isfile(exe):
+                shutil.copy2(exe, os.path.join(work, 'ssbu_native_previous.exe'))
+            for n in files:
+                with open(os.path.join(work, n + '.new'), 'wb') as f:
+                    f.write(z.read(n))
+                os.replace(os.path.join(work, n + '.new'), os.path.join(work, n))
+        print('Installed %s from %s (the previous exe is ssbu_native_previous.exe).' % (', '.join(sorted(files)), os.path.basename(dst)))
+        return True
+    except Exception as e:                            # a download, a locked file, a bad zip: the installed game is played
+        print('The game program could not be installed alone (%s).' % e)
+        return False
 
 
 def ensure_firewall(exe, build, gini):
