@@ -74,6 +74,55 @@ PLAY_DEFAULTS = {
 }
 
 
+def ensure_firewall(exe, build, gini):
+    """(fork, 2026-10-30) An inbound Windows Firewall rule for the game, made once with one administrator prompt. Without it
+    a friend's Windows drops the lobby's beacon and the other games' packets on the Radmin network (usually a Public network):
+    their game makes a lobby of its own, the others move to it, everything is relayed through that PC (ping 150 ms, ten
+    times the rollbacks; testers' logs 2026-10-29). The rule is named "SSBU native" like the one of "Instalar fix 60fps.bat";
+    a refused prompt is remembered in <build>\\firewall_refused.txt and not asked again (delete the file to be asked again).
+    graphics.ini firewall = off turns the check off."""
+    if ini_get(gini, 'firewall') in ('off', '0', 'no', 'false'):
+        return
+    refused = os.path.join(build, 'firewall_refused.txt')
+
+    def has_rule():
+        try:
+            out = subprocess.run(['netsh', 'advfirewall', 'firewall', 'show', 'rule', 'name=SSBU native', 'verbose'],
+                                 capture_output=True, timeout=15).stdout.decode('mbcs', 'replace')
+        except (OSError, subprocess.SubprocessError):
+            return None                               # netsh missing or stuck: nothing is asked
+        return os.path.normcase(exe) in os.path.normcase(out)
+
+    have = has_rule()
+    if have is None or have:
+        return
+    try:
+        with open(refused, encoding='utf-8') as f:
+            if os.path.normcase(f.read().strip()) == os.path.normcase(exe):
+                return
+    except OSError:
+        pass
+    print('The Windows Firewall has no rule for the game yet: without it the other players may not reach you (disconnects,\n'
+          'high ping, error 2618). Windows now asks for administrator permission ONCE to add it. Press "Yes".')
+    inner = ("New-NetFirewallRule -DisplayName 'SSBU native' -Direction Inbound -Program '%s' -Action Allow -Profile Any | Out-Null"
+             % exe.replace("'", "''"))
+    outer = ("Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','%s'"
+             % inner.replace("'", "''"))
+    try:
+        subprocess.run(['powershell', '-NoProfile', '-Command', outer], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if has_rule():
+        print('Firewall rule added.')
+        return
+    print('The firewall rule was not added (the permission was refused). Not asked again; to be asked again delete\n  %s' % refused)
+    try:
+        with open(refused, 'w', encoding='utf-8') as f:
+            f.write(exe)
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--userdata', help='the save folder (required, except with --play)')
@@ -227,6 +276,8 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition('=')
         env[k] = v
+    if a.play and os.name == 'nt' and not (a.linux or a.mac) and env.get('SSBU_ONLINE', '') not in ('off', '0', 'no', 'false'):
+        ensure_firewall(os.path.abspath(exe), a.build, gini)
     os.makedirs(a.userdata, exist_ok=True)
     os.makedirs(os.path.join(a.build, 'cache'), exist_ok=True)      # the runtime creates ..\cache\vk below it but not the folder itself (found 2026-10-13: with SSBU_VK_PREP=0 on a clean build nothing was saved)
     cmd = [exe, os.path.join(a.build, 'binaries', state.get('game_version', '13.0.4'), 'main.elf'), str(a.seconds)]
