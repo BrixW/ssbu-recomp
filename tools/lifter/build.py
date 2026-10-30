@@ -252,7 +252,12 @@ def link_dll(objs, dll, rsp, implib=True, fltused=False):
     if TARGET_LINUX:          # a .so: -z now resolves everything at load, as a DLL is
         return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-soname,' + os.path.basename(dll), '-Wl,-z,now'], capture_output=True, text=True, errors='replace')
     if not NOCRT:
-        return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True, errors='replace')
+        # clang passes link.exe the objects on ONE response-file line, at most 131,071 characters (LNK1170): the game DLL's
+        # 1,161 absolute paths under a long install folder passed it, so name them relative to their common folder
+        base = os.path.commonpath(objs)
+        with open(rsp, 'w') as f:
+            f.write('\n'.join('"%s"' % os.path.relpath(o, base).replace('\\', '/') for o in objs))
+        return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], cwd=base, capture_output=True, text=True, errors='replace')
     os.makedirs(libdir, exist_ok=True)
     libs = [lld_def_lib(os.path.join(NOCRT_DIR, n + '.def'), os.path.join(libdir, n + '.lib')) for n in ('ucrtbase_min', 'ntdll_min')]
     argv = [LLD_LINK, '/dll', '/noentry', '/nodefaultlib', '/machine:x64', '/out:' + dll, '@' + rsp] + libs
