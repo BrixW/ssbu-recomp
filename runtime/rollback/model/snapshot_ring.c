@@ -668,6 +668,12 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     nvn_r1_cb_save();
     rg_meta_capture(s, c);
     ls_new_base();                                          /* R4: the windows read-only again, the learned set emptied */
+    {   /* (2026-10-30) SSBU_RB_AUDIO_OFF for this match too: it was set only at the first base (r1_ring_capture) and cleared at
+         * every fight's end (ring_simulation.c), so from the second match of a session on the audio threads ran beside the
+         * ring (the sound came back; main thread 9 -> 12.5 ms a frame, every hold and load waited for them): the second match
+         * and the later ones stuttered, the first did not (testers, 2026-10-30) */
+        const char *e = getenv("SSBU_RB_AUDIO_OFF");
+        if (e && e[0] && e[0] != '0' && !g_rb_audio_off) { InterlockedExchange(&g_rb_audio_off, 1); LOG("r1: RING rebase: SSBU_RB_AUDIO_OFF: the audio threads stop at their next SDK call until the fight is over\n"); } }
     unpark();
     g_rg_caps++;
     LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f, copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
