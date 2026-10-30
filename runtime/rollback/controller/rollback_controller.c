@@ -14,6 +14,8 @@
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "../model/game_state_internal.h"
+#include <psapi.h>
+static void rb_mem_report(const char *when); static int g_mem_nprev;      /* (below, at rbg_fight_off) */
 /* Functions and variables of other runtime files that only this file uses: */
 void rbn_start(long long f0);
 int rbn_started(void);
@@ -260,6 +262,7 @@ static void rbg_step_body(Ctx *c) {
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
         if (!g_rbg_work) { g_rbg_work = calloc(RBG_NT, sizeof *g_rbg_work); g_rbg_gap = calloc(RBG_NT, sizeof *g_rbg_gap); g_rbg_wcyc = calloc(RBG_NT, sizeof *g_rbg_wcyc); g_rbg_wk = calloc(RBG_NT, 1); }
+        if (g_mem_nprev < 0) rb_mem_report("first match start");      /* (the baseline of the per-match memory report) */
         LOG("r1: RB NET: match start, base state = frame %lld (fight frame %lld); pacing %s; re-run skip mask %d, lite mask %d%s\n", i, g_session.fight_frame, g_rbg_pace ? "60 Hz" : "off", g_rgs_skip, g_rgs_lite, g_rgs_lastlite ? " (the last re-run pass too)" : "");
         {   /* start barrier: both games begin frame 1 together (the one that finished loading first waits here, at frame 0,
              * instead of stalling seconds at frame 8 with states it might have to roll back to: rnh2 / rnh3 hung after that) */
@@ -508,6 +511,60 @@ void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     *b = p.buttons; *lx = p.lx; *ly = p.ly; *rx = p.rx; *ry = p.ry;
 }
 
+/* (2026-10-30) the process's private memory grew by 5-7 GB with every online match of a session (12 GB after one, 26-29 GB
+ * after three, on two PCs) and the ring's own buffers do not explain it. At the start of the first match and at the end of
+ * each one: the committed private memory per allocation (a VirtualQuery walk, grouped by allocation base) and every
+ * allocation that grew, appeared, shrank or went by 32 MB or more since the last report. SSBU_RB_MEMLOG=0: off. */
+typedef struct { uintptr_t base; size_t com; } MemAlloc;
+static MemAlloc *g_mem_prev; static int g_mem_nprev = -1;
+static void rb_mem_report(const char *when) {
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_MEMLOG"); on = !(e && e[0] == '0'); }
+    enum { CAP = 1 << 16 };
+    static MemAlloc *cur; static MemAlloc top[8];
+    if (!on) return;
+    if (!cur) cur = malloc(CAP * sizeof *cur);
+    if (!g_mem_prev) g_mem_prev = malloc(CAP * sizeof *g_mem_prev);
+    if (!cur || !g_mem_prev) return;
+    double t0 = now_ms();
+    int ncur = 0; size_t total = 0;
+    MEMORY_BASIC_INFORMATION m; uint8_t *a = NULL;
+    while (VirtualQuery(a, &m, sizeof m) == sizeof m) {
+        if (m.State == MEM_COMMIT && m.Type == MEM_PRIVATE) {
+            uintptr_t b = (uintptr_t)m.AllocationBase;
+            if (ncur && cur[ncur - 1].base == b) cur[ncur - 1].com += m.RegionSize;
+            else if (ncur < CAP) { cur[ncur].base = b; cur[ncur].com = m.RegionSize; ncur++; }
+            total += m.RegionSize;
+        }
+        uint8_t *next = (uint8_t *)m.BaseAddress + m.RegionSize;
+        if (next <= a) break;
+        a = next;
+    }
+    PROCESS_MEMORY_COUNTERS_EX pc; memset(&pc, 0, sizeof pc); pc.cb = sizeof pc;
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pc, sizeof pc);
+    memset(top, 0, sizeof top);
+    for (int i = 0; i < ncur; i++) for (int k = 0; k < 8; k++) if (cur[i].com > top[k].com) { memmove(top + k + 1, top + k, (7 - k) * sizeof *top); top[k] = cur[i]; break; }
+    char buf[900]; int o = 0;
+    for (int k = 0; k < 8 && top[k].com; k++) o += snprintf(buf + o, sizeof buf - (size_t)o, " %llx:%.0f", (unsigned long long)top[k].base, top[k].com / 1048576.0);
+    LOG("r1: MEM %s: private %.0f MB (process), %.0f MB committed private in %d allocations (walk %.0f ms); largest (base:MB):%s\n",
+        when, pc.PrivateUsage / 1048576.0, total / 1048576.0, ncur, now_ms() - t0, buf);
+    if (g_mem_nprev >= 0) {          /* both lists are in address order: a merge */
+        const size_t BIG = 32u << 20; int i = 0, j = 0, shown = 0; long long grown = 0;
+        while (i < ncur || j < g_mem_nprev) {
+            uintptr_t b; size_t now = 0, was = 0;
+            if (j >= g_mem_nprev || (i < ncur && cur[i].base < g_mem_prev[j].base)) { b = cur[i].base; now = cur[i++].com; }
+            else if (i >= ncur || g_mem_prev[j].base < cur[i].base) { b = g_mem_prev[j].base; was = g_mem_prev[j++].com; }
+            else { b = cur[i].base; now = cur[i++].com; was = g_mem_prev[j++].com; }
+            long long d = (long long)now - (long long)was;
+            if (d >= (long long)BIG || -d >= (long long)BIG) {
+                grown += d;
+                if (shown++ < 40) LOG("r1: MEM   %llx: %.0f -> %.0f MB (%+.0f)%s\n", (unsigned long long)b, was / 1048576.0, now / 1048576.0, d / 1048576.0, !was ? " NEW" : !now ? " GONE" : "");
+            }
+        }
+        LOG("r1: MEM %s: %d allocations changed by 32 MB or more, %+.0f MB in all\n", when, shown, grown / 1048576.0);
+    }
+    memcpy(g_mem_prev, cur, (size_t)ncur * sizeof *cur); g_mem_nprev = ncur;
+}
+
 /* (hs12) r1_ring.c rgs_step, every safe point while no fight is on: the end of a match (once): its report, the ring
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 void rbg_fight_off(void) {
@@ -520,6 +577,7 @@ void rbg_fight_off(void) {
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
     g_rbg_noring = 0;
     LOG("r1: RB NET: match %d over: ring emptied, session reset for the next match\n", rbn_match_number());
+    { char w[48]; snprintf(w, sizeof w, "match %d over", rbn_match_number()); rb_mem_report(w); }
     { char mk[24]; snprintf(mk, sizeof mk, "match%dover", g_rbg_in_match == 1 ? rbn_match_number() : 0); if (g_rbg_in_match == 1) input_mark(mk); else input_mark("localmatchover"); }
     g_rbg_in_match = 0; g_rbg_ff_first = -1;
     g_rbg_rb = 0; memset(g_rbg_k, 0, sizeof g_rbg_k); g_rbg_rerun = g_rbg_miss = g_rbg_stalls = g_rbg_capfail = g_rbg_capskip = g_rbg_lastlocal = g_rbg_real = g_rbg_gone = 0;
