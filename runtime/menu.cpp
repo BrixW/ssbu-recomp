@@ -64,7 +64,8 @@ const char *nnpad_kb_label(int idx); void nnpad_vk_name(int vk, char *o, int n);
 int nnaoc_owned(const int **list);                                   /* nnmisc.c */
 long long nvn_front_presents(void); void nvn_front_osk_redraw(void); /* nvn_gl.c */
 const char *nvn_vk_device_name(void);                                /* nvn_vk_menu.c */
-int osk_active(void);                                                /* osk.c */
+const char *ssbu_version(void);                                      /* boot.c */
+int osk_active(void);                                               /* osk.c */
 int osk_run(const wchar_t *header, const wchar_t *guide, const wchar_t *initial, int max_len, int min_len, int password, wchar_t *out);      /* osk.c */
 extern "C" void display_refresh_info(double *hz, int *lock_k);      /* display.c */
 int net_online(void); int net_mode(void); const char *net_room_code(void); const char *net_lan_code(void); const char *net_upnp_result(void);      /* net_relay.c */
@@ -1563,7 +1564,7 @@ static void sec_about(void) {
 #else
     ImGui::Text("SSBU native: Super Smash Bros. Ultimate, statically recompiled for Linux");
 #endif
-    ImGui::Text("Runtime built %s %s (study tree)", __DATE__, __TIME__);
+    ImGui::Text("Version %s (runtime built %s %s)", ssbu_version(), __DATE__, __TIME__);
     ImGui::Text("Renderer: Vulkan on %s", nvn_vk_device_name());
     ImGui::Text("Settings menu: Dear ImGui %s (MIT licence, Omar Cornut and contributors)", ImGui::GetVersion());
     ImGui::Text("graphics.ini: %s", gfx_options()->path);

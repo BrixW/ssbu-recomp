@@ -8,6 +8,7 @@
 """
 import concurrent.futures
 import os
+import re
 import subprocess
 import sys
 import time
@@ -328,6 +329,9 @@ def game_import_lib(objdir):
 def compile_host(job):
     src, obj = job
     flags = CXX_FLAGS if src.endswith('.cpp') else HOST_FLAGS
+    ver = os.environ.get('RECOMP_VERSION', '')       # scripts/make_release.py: boot.c ssbu_version()
+    if src.endswith('boot.c') and re.fullmatch(r'[0-9A-Za-z.+-]{1,40}', ver):
+        flags = flags + ['-DSSBU_VERSION="%s"' % ver]
     r = subprocess.run([CLANG, '-c'] + flags + [src, '-o', obj], capture_output=True, text=True)
     return src, r.returncode, (r.stdout + r.stderr)[-3000:]
 

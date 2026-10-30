@@ -1529,19 +1529,49 @@ static SOCKET beacon_socket(void) {
     yes = TRUE; setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, (const char *)&yes, sizeof yes);
     return s;
 }
-static int beacon_read(const uint8_t *p, int n, uint64_t *id, uint16_t *port) {   /* 1: a lobby of our code and build */
-    if (n < 4 + 8 + 2 + NAME_LEN + BUILD_LEN || p[0] != 'S' || p[1] != 'U' || p[2] != PROTO || p[3] != T_BEACON) return 0;
+/* After build[40] the beacon may carry 'V' + the lobby game's runtime version[24] (boot.c ssbu_version; an older game sends
+ * none and reads only the part before). Different versions still play together; the player is told which one is older. */
+#define BEACON_BASE (4 + 8 + 2 + NAME_LEN + BUILD_LEN)
+#define VER_LEN 24
+static void version_check(const char *theirs) {      /* (beacon thread) the version of the network's lobby game */
+    const char *ssbu_version(void), *mine = ssbu_version();
+    static char last[VER_LEN + 1];
+    static uint64_t next;
+    if (!theirs[0] || !strcmp(theirs, "dev") || !strcmp(mine, "dev") || !strcmp(theirs, mine)) { last[0] = 0; return; }
+    uint64_t t = ms_now();
+    if (!strcmp(theirs, last) && t < next) return;   /* told again every 30 s while it lasts */
+    snprintf(last, sizeof last, "%s", theirs); next = t + 30000;
+    char text[400];
+    if (strcmp(theirs, mine) > 0)
+        snprintf(text, sizeof text, "Your game is OLDER than the lobby's (the player who opened first).\nYours: %s\nLobby: %s\n"
+                 "Close the game and open Play SSBU.bat: it updates by itself.", mine, theirs);
+    else
+        snprintf(text, sizeof text, "The lobby's game (the player who opened first) is OLDER than yours.\nYours: %s\nLobby: %s\n"
+                 "That player should close the game and open Play SSBU.bat: it updates by itself.", mine, theirs);
+    say("version: the lobby's game is %s, this one %s", theirs, mine);
+    menu_popup("Different version", text);
+}
+static int beacon_read(const uint8_t *p, int n, uint64_t *id, uint16_t *port, char *ver) {   /* 1: a lobby of our code and build */
+    ver[0] = 0;
+    if (n < BEACON_BASE || p[0] != 'S' || p[1] != 'U' || p[2] != PROTO || p[3] != T_BEACON) return 0;
     char code[NAME_LEN + 1] = "", build[BUILD_LEN + 1] = "";
     memcpy(code, p + 14, NAME_LEN); memcpy(build, p + 14 + NAME_LEN, BUILD_LEN);
     if (strcmp(code, g_code)) return 0;     /* O1: any build (it used to be ours only): its lobby lists the rooms of every build, the
                                                * joins stay within one build (the lobby parts players by build and code) */
     (void)build;
+    if (n >= BEACON_BASE + 1 + VER_LEN && p[BEACON_BASE] == 'V') {
+        int k = 0;
+        for (; k < VER_LEN && p[BEACON_BASE + 1 + k]; k++) ver[k] = p[BEACON_BASE + 1 + k] >= 0x21 && p[BEACON_BASE + 1 + k] < 0x7f ? (char)p[BEACON_BASE + 1 + k] : '?';
+        ver[k] = 0;
+    }
     *id = g64(p + 4); *port = g16(p + 12);
     return *id != 0 && *port != 0;
 }
 static DWORD WINAPI beacon_thread(LPVOID unused) {    /* sends our lobby's beacon; hears the others' (one lobby per network) */
     (void)unused;
-    uint8_t p[4 + 8 + 2 + NAME_LEN + BUILD_LEN] = {0}, r[256];
+    const char *ssbu_version(void);
+    uint8_t p[BEACON_BASE + 1 + VER_LEN] = {0}, r[256];
+    char ver[VER_LEN + 1];
     struct sockaddr_in grp = {0}, bc = {0};
     grp.sin_family = bc.sin_family = AF_INET;
     grp.sin_port = bc.sin_port = htons(VNET_BEACON_PORT);
@@ -1553,13 +1583,15 @@ static DWORD WINAPI beacon_thread(LPVOID unused) {    /* sends our lobby's beaco
         if (mine && t - last >= 1000) {
             hdr(p, T_BEACON); s64(p + 4, mine); s16(p + 12, g_lan_lobby_port);
             memcpy(p + 14, g_code, strlen(g_code)); memcpy(p + 14 + NAME_LEN, g_build, strlen(g_build));
+            p[BEACON_BASE] = 'V'; strncpy((char *)p + BEACON_BASE + 1, ssbu_version(), VER_LEN);
             sendto(g_beacon, (const char *)p, sizeof p, 0, (struct sockaddr *)&grp, sizeof grp);
             sendto(g_beacon, (const char *)p, sizeof p, 0, (struct sockaddr *)&bc, sizeof bc);
             last = t;
         }
         struct sockaddr_in from; int fl = sizeof from; uint64_t id; uint16_t port;
         int n = recvfrom(g_beacon, (char *)r, sizeof r, 0, (struct sockaddr *)&from, &fl);
-        if (n <= 0 || !beacon_read(r, n, &id, &port) || id == mine) continue;
+        if (n <= 0 || !beacon_read(r, n, &id, &port, ver) || id == mine) continue;
+        if (!mine && (!g_switch.cur || id == g_switch.cur)) version_check(ver);      /* the lobby this game is in (or going to) */
         /* another lobby on this network: the one with the smaller id stays; ours goes if nobody but us is in it and we are
          * in no Local Wireless room (otherwise both stay: their rooms are listed by each lobby to its own players) */
         int players = 0, rooms = 0;
@@ -1734,6 +1766,8 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             g_last_pong = ms_now();
             last_ping = 0;
             if (!g_joined) { char a[16]; say("joined the lobby %s:%u as 10.13.%u.%u (code %s)", ip_text(ntohl(g_lobby.sin_addr.s_addr), a), ntohs(g_lobby.sin_port), g_ip >> 8 & 255, g_ip & 255, g_code); }
+            {   static int shown; const char *ssbu_version(void);      /* the version on screen once, to compare with the others' */
+                if (!g_joined && !shown) { char t[96]; shown = 1; snprintf(t, sizeof t, "Version %s", ssbu_version()); menu_popup("Online: connected", t); } }
             InterlockedExchange(&g_joined, 1);
             if (n > 24) { int reg = g_ld_registered; ladder_welcome(buf + 24, n - 24); if (reg && !g_ld_registered) send_join(); }   /* (ladder: an unknown id signs up at once) */
             break;
