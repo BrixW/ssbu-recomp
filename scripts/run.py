@@ -21,6 +21,7 @@ Options go to the game as environment variables (listed in BUILDING.md); --env N
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -72,6 +73,41 @@ PLAY_DEFAULTS = {
     'SSBU_RB_SIM_LITE': '0',
     'SSBU_RB_NET_LASTLITE': '0',
 }
+
+
+def auto_update(gini):
+    """(fork, 2026-10-30) "Play SSBU.bat" brings the game up to date by itself: when GitHub's main branch has a newer commit
+    than the one update.py last installed (build\\update_manifest.json), the installer runs as its Resume does (update.py,
+    the new prebuilt runtime, the build steps that changed) and run.py starts again with the new code. True when it ran
+    (the caller starts run.py again). One API call of a few hundred ms when nothing is new; no internet or a GitHub error:
+    the installed game is played. Not in a git checkout (a developer's own copy: update.py by hand), not after a restart
+    (SSBU_PLAY_UPDATED), and graphics.ini auto_update = off turns it off. Play SSBU.bat itself is never changed by it while it
+    runs: cmd.exe reads a .bat at its byte offset, so a rewritten launcher would run broken lines."""
+    if os.environ.get('SSBU_PLAY_UPDATED') or ini_get(gini, 'auto_update') in ('off', '0', 'no', 'false'):
+        return False
+    if os.path.exists(os.path.join(REPO, '.git')):
+        return False
+    import update
+    have = (update.read_manifest() or {}).get('commit')
+    try:
+        want = update.http('https://api.github.com/repos/%s/commits/%s' % (update.DEFAULT_REPO, update.DEFAULT_BRANCH),
+                           'application/vnd.github.sha', timeout=8).decode().strip()
+    except Exception as e:                            # no internet, GitHub down or its rate limit: play what is installed
+        print('Update check skipped (%s): playing the installed version.' % e)
+        return False
+    if not re.fullmatch(r'[0-9a-f]{40}', want) or want == have:
+        return False
+    print('=' * 78)
+    print('A new version of the game is on GitHub (%s): installing it before the game starts.' % want[:7])
+    print('This usually takes under a minute (longer when the game itself has to be built again). Do not close this window.')
+    print('=' * 78, flush=True)
+    rc = subprocess.run([sys.executable, '-u', os.path.join(REPO, 'scripts', 'install.py'), '--no-gui', '--no-shortcuts'],
+                        cwd=REPO).returncode
+    if rc:
+        print('\nThe update did not finish (code %d). The game starts anyway; "Install SSBU.bat" > Resume finishes it.\n' % rc)
+    else:
+        print('\nUpdate installed.\n')
+    return True
 
 
 def ensure_firewall(exe, build, gini):
@@ -141,6 +177,11 @@ def main():
     ap.add_argument('--mac', action='store_true', help='the native macOS build (default build folder build-macos, exe ssbu_native, '
                                                       'saves in ~/Library/Application Support/ssbu-recomp/userdata unless --userdata)')
     a = ap.parse_args()
+    if a.play and os.name == 'nt' and not (a.linux or a.mac or a.build) and \
+            auto_update(os.path.join(os.path.abspath(build_location.get()), 'config', 'graphics.ini')):
+        # the new run.py (and the rest) runs from here on; the launcher's own arguments again
+        return subprocess.run([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                              env=dict(os.environ, SSBU_PLAY_UPDATED='1')).returncode
     if sys.platform.startswith('linux') and not a.linux and not a.build and not os.path.exists(os.path.join(REPO, 'build', 'state.json')):
         a.linux = True
     if sys.platform == 'darwin' and not a.mac and not a.linux and not a.build and os.path.exists(os.path.join(REPO, 'build-macos', 'state.json')):
