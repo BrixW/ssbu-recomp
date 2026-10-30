@@ -46,6 +46,7 @@ static const uint64_t g_code_13_0_5[][2] = {         /* 13.0.4 -> 13.0.5 offsets
     {0x22b67d4, 0x22b67d4},     /* worker return address (newmodule_host.c) */
     {0x32384c0, 0x3238a70}, /* fighter picture path (newmodule_host.c) */
     {0x3261d60, 0x3262310}, /* name_id getter (newmodule_host.c) */
+    {0x353cf40, 0x353d4f0},     /* a job's run (call_trace.c, SSBU_TRACE_JOBS only), 112 bytes in both */
     {0x353e330, 0x353e8e0},     /* path -> file index (newmodule_host.c) */
     {0x35444c0, 0x3544a70},     /* resource service inflate thread: start (loose_files.c) */
     {0x3544d88, 0x3545338}, /* inflate thread call site (loose_files.c) */
@@ -117,6 +118,7 @@ static const uint64_t g_code_13_0_5[][2] = {         /* 13.0.4 -> 13.0.5 offsets
     {0x392dd80, 0x392e330},     /* jemalloc realloc (rb_learned.c) */
     {0x392e590, 0x392eb40},     /* free_default (the game's free) */
     {0x392e8a0, 0x392ee50},     /* jemalloc malloc_size (rb_learned.c) */
+    {0x3963010, 0x39635c0},     /* sound engine command queue step (debug_mode.c, the audio pump), 5,540 bytes in both */
     {0x39a3e70, 0x39a4420},     /* zstd: free stream (nvn_vk_store.c) */
     {0x39a4040, 0x39a45f0},     /* zstd: decompress stream (nvn_vk_store.c) */
     {0x39bfb30, 0x39c00e0}, /* raw copy of uncompressed files (loose_files.c) */
