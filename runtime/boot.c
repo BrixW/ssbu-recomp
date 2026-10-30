@@ -272,6 +272,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     }
 
     { void debug_mode_init(void); debug_mode_init(); }       /* debug_mode.c: test-only fast mode, nothing without SSBU_* variables */
+    { void unlock_all_init(void); unlock_all_init(); }       /* unlock_all.c: graphics.ini unlock_all = on */
     printf("[phase 3] nnMain\n");
     trace_printf("=== phase 3: nnMain\n");
     call_guest(&c, NN_MAIN);

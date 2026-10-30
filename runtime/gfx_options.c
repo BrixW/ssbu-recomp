@@ -25,6 +25,8 @@ static int g_gfx_stats;                              /* U1: stats_overlay = off 
 int gfx_stats_overlay(void) { gfx_options(); return g_gfx_stats; }
 int gfx_volume(void) { gfx_options(); return g_gfx_volume; }
 const char *gfx_language(void) { gfx_options(); return g_gfx_language; }
+static int g_gfx_unlock_all;                         /* unlock_all = off | on (unlock_all.c) */
+int gfx_unlock_all(void) { gfx_options(); return g_gfx_unlock_all; }
 
 static const char *const k_default_ini =
 "; graphics.ini: display and rendering options of the native build (read once at start by gfx_options.c).\r\n"
@@ -147,7 +149,14 @@ static const char *const k_default_ini =
 "\r\n"
 "; language = auto | ja | en-US | en-GB | fr | fr-CA | de | it | es | es-419 | zh-Hans | zh-Hant | ko | nl | ru\r\n"
 ";   auto: the Windows display language. SSBU_LANGUAGE=<code> wins. Read at start.\r\n"
-"language = auto\r\n";
+"language = auto\r\n"
+"\r\n"
+"; unlock_all = off | on\r\n"
+";   on: every fighter of the base roster and every stage is available at once, for going straight to competitive\r\n"
+";   play, and no challenger fights interrupt. Nothing is written into the save; off again = as before. Downloadable\r\n"
+";   fighters are not touched (owning them unlocks them). Spirits, music and other rewards stay as in the game.\r\n"
+";   13.0.4 only. SSBU_UNLOCK_ALL=1 / 0 wins. Read at start.\r\n"
+"unlock_all = off\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -220,6 +229,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "menu")) g_gfx_menu = !_stricmp(val, "on") || !strcmp(val, "1");      /* U1 (menu.cpp) */
         else if (!_stricmp(key, "volume")) { g_gfx_volume = -1; if (_stricmp(val, "auto")) { int v = atoi(val); g_gfx_volume = v < 0 ? 0 : v > 100 ? 100 : v; } }
         else if (!_stricmp(key, "language")) { g_gfx_language[0] = 0; if (_stricmp(val, "auto")) snprintf(g_gfx_language, sizeof g_gfx_language, "%s", val); }
+        else if (!_stricmp(key, "unlock_all")) g_gfx_unlock_all = !_stricmp(val, "on") || !strcmp(val, "1");      /* unlock_all.c */
         else unknown++;
     }
     if (f) fclose(f);
