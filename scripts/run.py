@@ -95,10 +95,23 @@ def auto_update(gini):
     except Exception as e:                            # no internet, GitHub down or its rate limit: play what is installed
         print('Update check skipped (%s): playing the installed version.' % e)
         return False
-    if not re.fullmatch(r'[0-9a-f]{40}', want) or want == have:
+    # the code may be new already ("Update only" in the installer window runs update.py alone) while the prebuilt runtime
+    # it names was never downloaded and installed: install.py keeps the package in deps\ once it used it
+    pending = None
+    try:
+        with open(os.path.join(REPO, 'scripts', 'install.py'), encoding='utf-8') as f:
+            m = re.search(r"RUNTIME_RELEASE = \('([^']+)'", f.read())
+        if m and not os.path.isfile(os.path.join(REPO, 'deps', m.group(1).rsplit('/', 1)[-1])):
+            pending = m.group(1).rsplit('/', 1)[-1]
+    except OSError:
+        pass
+    if not re.fullmatch(r'[0-9a-f]{40}', want) or (want == have and not pending):
         return False
     print('=' * 78)
-    print('A new version of the game is on GitHub (%s): installing it before the game starts.' % want[:7])
+    if want != have:
+        print('A new version of the game is on GitHub (%s): installing it before the game starts.' % want[:7])
+    else:
+        print('The new game program (%s) is not installed yet: installing it before the game starts.' % pending)
     print('This usually takes under a minute (longer when the game itself has to be built again). Do not close this window.')
     print('=' * 78, flush=True)
     rc = subprocess.run([sys.executable, '-u', os.path.join(REPO, 'scripts', 'install.py'), '--no-gui', '--no-shortcuts'],
