@@ -7,8 +7,9 @@
  *
  * The function, 0x7101797640 (13.0.4), found by the new-fighter roster work (mods\mods_n4_src\n4_roster.cpp, runs U3, U5,
  * U7): x0 = a ui_chara id (0xc1 << 56 | hash40("ui_chara_<name>"), sometimes with a database row in bits 40..47), w1 = a
- * mode, w2 = an option; the answer is bit 0 of w0. Its 13.0.5 address is not known (docs/VERSIONS.md), so on 13.0.5 the
- * switch does nothing and says so.
+ * mode, w2 = an option; the answer is bit 0 of w0. Every address here is a 13.0.4 one passed through GA(); their 13.0.5
+ * counterparts are in hostrt.c g_code_13_0_5 (2026-10-30: each function the same size with every word equal, PC-relative
+ * fields masked; the six save getters did not move).
  *
  * Downloadable fighters are left alone: owning one is what makes it available (build\config\dlc.txt, nnmisc.c), and a
  * "yes" for one whose files are not installed would put a fighter on the screen that cannot load.
@@ -112,7 +113,7 @@ static void kind_hook(Ctx *c, void *user) {
 static void roster_hook(Ctx *c, void *user) {
     (void)user;
     uint64_t out = c->x[0], lr = c->x[30];
-    int quiet = lr == RA_MILESTONE;
+    int quiet = lr == GA(RA_MILESTONE);
     g_quiet += quiet;
     g_orig_roster(c);
     g_quiet -= quiet;
@@ -127,13 +128,12 @@ void unlock_all_init(void) {
     g_on = e && *e ? atoi(e) > 0 : gfx_unlock_all();
     g_log = l && atoi(l) > 0;
     if (!g_on && !g_log) return;
-    if (g_game_build != GAME_13_0_4) { printf("unlock_all: not available on this game build (its address is known for 13.0.4 only): nothing unlocked\n"); return; }
     static const char *const dlc[] = {"packun", "jack", "brave", "buddy", "dolly", "master", "tantan", "pickel", "edge", "eflame_first",
                                       "elight_first", "eflame_only", "elight_only", "demon", "trail"};      /* the downloadable fighters' ui_chara names */
     for (size_t i = 0; i < sizeof dlc / sizeof dlc[0]; i++) { char n[48]; snprintf(n, sizeof n, "ui_chara_%s", dlc[i]); g_dlc[g_ndlc++] = hash40(n); }
     const char *ks = getenv("SSBU_UNLOCK_KINDS");
     if (ks && *ks) g_kinds = (unsigned)strtoul(ks, NULL, 16);
-    int ok = hook_install(FN_AVAILABLE, available_hook, NULL, &g_orig) && hook_install(FN_ROSTER, roster_hook, NULL, &g_orig_roster);
-    for (int k = 0; k < NKIND && ok; k++) ok = hook_install(g_kind[k].addr, kind_hook, (void *)(intptr_t)k, &g_kind[k].orig) != 0;
+    int ok = hook_install(GA(FN_AVAILABLE), available_hook, NULL, &g_orig) && hook_install(GA(FN_ROSTER), roster_hook, NULL, &g_orig_roster);
+    for (int k = 0; k < NKIND && ok; k++) ok = hook_install(GA(g_kind[k].addr), kind_hook, (void *)(intptr_t)k, &g_kind[k].orig) != 0;
     printf("unlock_all: %s (kinds %x; hooks: %s)\n", g_on ? "on" : "logging only", g_kinds, ok ? "installed" : hook_error());
 }

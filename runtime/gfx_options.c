@@ -155,7 +155,7 @@ static const char *const k_default_ini =
 ";   on: every fighter of the base roster and every stage is available at once, for going straight to competitive\r\n"
 ";   play, and no challenger fights interrupt. Nothing is written into the save; off again = as before. Downloadable\r\n"
 ";   fighters are not touched (owning them unlocks them). Spirits, music and other rewards stay as in the game.\r\n"
-";   13.0.4 only. SSBU_UNLOCK_ALL=1 / 0 wins. Read at start.\r\n"
+";   13.0.4 and 13.0.5. SSBU_UNLOCK_ALL=1 / 0 wins. Read at start.\r\n"
 "unlock_all = off\r\n";
 
 #define GFX_LOW_SCALE 0.5f

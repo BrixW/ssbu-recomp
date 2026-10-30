@@ -165,7 +165,7 @@ $settings = @(
        Help = 'auto = the Windows display language. Without your console''s firmware fonts, Japanese, Korean and Chinese text is shown as empty boxes: pick a Latin-alphabet language then.' }
 
     @{ Page = 'Competitive'; F = 'G'; S = ''; K = 'unlock_all'; Label = 'Unlock fighters and stages'; Kind = 'choice'; Values = $onoff; Def = 'off'
-       Help = 'on: every fighter of the base roster and every stage is available at once, and no challenger fights interrupt after a match. Nothing is written into your save (turn it off and the game is as before). Downloadable fighters are not touched: owning them unlocks them. Spirits, music and other rewards stay as in the game. Game version 13.0.4 only.' }
+       Help = 'on: every fighter of the base roster and every stage is available at once, and no challenger fights interrupt after a match. Nothing is written into your save (turn it off and the game is as before). Downloadable fighters are not touched: owning them unlocks them. Spirits, music and other rewards stay as in the game. Game versions 13.0.4 and 13.0.5.' }
     @{ Page = 'Competitive'; F = 'G'; S = ''; K = 'latency'; Label = 'Input latency'; Kind = 'choice'; Values = @('normal', 'low', 'lowest'); Def = 'normal'
        Help = 'low / lowest shorten the time between a button press and the picture. lowest needs a steady 60 fps on your PC. Vulkan only.' }
     @{ Page = 'Competitive'; F = 'G'; S = ''; K = 'runahead'; Label = 'Run-ahead (experimental)'; Kind = 'choice'; Values = $onoff; Def = 'off'
